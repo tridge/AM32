@@ -8,11 +8,6 @@
 
 #include <version.h>
 
-#if !defined(USE_PA2) && !defined(USE_PB4)
-//#define USE_PB4
-#define USE_PA2
-#endif
-
 /* Includes ------------------------------------------------------------------*/
 #include <stdbool.h>
 #include <stdio.h>
@@ -23,24 +18,71 @@
 //#define USE_ADC_INPUT      // will go right to application and ignore eeprom
 //#define UPDATE_EEPROM_ENABLE
 
+// use this to check the clock config for the MCU (with a logic
+// analyser on the input pin)
+//#define BOOTLOADER_TEST_CLOCK
+
+// when there is no app fw yet, disable jump()
+//#define DISABLE_JUMP
+
 #include <string.h>
 
 #define STM32_FLASH_START 0x08000000
-#define FIRMWARE_RELATIVE_START 0x1000
 
-#ifdef SIXTY_FOUR_KB_MEMORY
-#define EEPROM_RELATIVE_START 0xf800
-#else
-#define EEPROM_RELATIVE_START 0x7c00
+#ifndef FIRMWARE_RELATIVE_START
+#define FIRMWARE_RELATIVE_START 0x1000
 #endif
 
+#ifdef USE_PA2
+#define input_pin        GPIO_PIN(2)
+#define input_port       GPIOA
+#define PIN_NUMBER       2
+#define PORT_LETTER      0
+#elif defined(USE_PB4)
+#define input_pin         GPIO_PIN(4)
+#define input_port        GPIOB
+#define PIN_NUMBER        4
+#define PORT_LETTER       1
+#elif defined(USE_PA15)
+#define input_pin         GPIO_PIN(15)
+#define input_port        GPIOA
+#define PIN_NUMBER        15
+#define PORT_LETTER       0
+#else
+#error "Bootloader comms pin not defined"
+#endif
+
+#include <blutil.h>
+
+#ifndef BOARD_FLASH_SIZE
+#error "must define BOARD_FLASH_SIZE"
+#endif
+
+/*
+  currently only support 32, 64 or 128 k flash
+ */
+#if BOARD_FLASH_SIZE == 32
+#define EEPROM_START_ADD (STM32_FLASH_START+0x7c00)
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x00,0x1f,0x06,0x06,0x01,0x30};
+#define ADDRESS_SHIFT 0
+
+#elif BOARD_FLASH_SIZE == 64
+#define EEPROM_START_ADD (STM32_FLASH_START+0xf800)
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x35,0x06,0x06,0x01,0x30};
+#define ADDRESS_SHIFT 0
+
+#elif BOARD_FLASH_SIZE == 128
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x2B,0x06,0x06,0x01,0x30};
+#define EEPROM_START_ADD (STM32_FLASH_START+0x1f800)
+#define ADDRESS_SHIFT 2 // addresses from the bl client are shifted 2 bits before being used
+
+#else
+#error "unsupported BOARD_FLASH_SIZE"
+#endif
 
 typedef void (*pFunction)(void);
 
-#define APPLICATION_ADDRESS     (uint32_t)(STM32_FLASH_START + FIRMWARE_RELATIVE_START) // 4k
-
-#define EEPROM_START_ADD         (uint32_t)(STM32_FLASH_START + EEPROM_RELATIVE_START)
-#define FLASH_END_ADD           (uint32_t)(STM32_FLASH_START + 0x7FFF)               // 32 k
+#define APPLICATION_ADDRESS     (uint32_t)(STM32_FLASH_START + FIRMWARE_RELATIVE_START)
 
 
 #define CMD_RUN             0x00
@@ -57,25 +99,8 @@ typedef void (*pFunction)(void);
 #define CMD_SET_ADDRESS     0xFF
 #define CMD_SET_BUFFER      0xFE
 
-
-#ifdef USE_PA2
-#define input_pin     GPIO_PINS_2
-#define input_port       GPIOA
-#define PIN_NUMBER       2
-#define PORT_LETTER      0
-#endif
-
-#ifdef USE_PB4
-#define input_pin       GPIO_PINS_4
-#define input_port        GPIOB
-#define PIN_NUMBER        4
-#define PORT_LETTER       1
-#endif
-
-#include <blutil.h>
-
 static uint16_t low_pin_count;
-static char receviedByte;
+static char receiveByte;
 static int count;
 static char messagereceived;
 static uint16_t invalid_command;
@@ -86,11 +111,7 @@ static int received;
 
 
 static uint8_t pin_code = PORT_LETTER << 4 | PIN_NUMBER;
-#ifdef SIXTY_FOUR_KB_MEMORY
-static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x35,0x06,0x06,0x01,0x30};
-#else
-static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x00,0x1f,0x06,0x06,0x01,0x30};      // stm32 device info
-#endif
+
 
 
 static uint8_t rxBuffer[258];
@@ -109,17 +130,14 @@ static uint8_t calculated_crc_high_byte;
 static uint16_t payload_buffer_size;
 static char incoming_payload_no_command;
 
-static uint32_t JumpAddress;
-static pFunction JumpToApplication;
-
 /* USER CODE BEGIN PFP */
 static void serialwriteChar(char data);
 static void sendString(uint8_t data[], int len);
-static void recieveBuffer();
+static void receiveBuffer();
 
-#define BAUDRATE              19200
-#define BITTIME          1000000/BAUDRATE
-#define HALFBITTIME       500000/BAUDRATE
+#define BAUDRATE      19200
+#define BITTIME          52 // 1000000/BAUDRATE
+#define HALFBITTIME      26 // 500000/BAUDRATE
 
 static void delayMicroseconds(uint32_t micros)
 {
@@ -133,18 +151,35 @@ static void delayMicroseconds(uint32_t micros)
  */
 static void jump()
 {
-    __disable_irq();
-    JumpAddress = *(__IO uint32_t*) (APPLICATION_ADDRESS + 4);
+#ifndef DISABLE_JUMP
     uint8_t value = *(uint8_t*)(EEPROM_START_ADD);
     if (value != 0x01) {      // check first byte of eeprom to see if its programmed, if not do not jump
 	invalid_command = 0;
 	return;
     }
-    bl_timer_disable();
-    JumpToApplication = (pFunction) JumpAddress;
-
-    __set_MSP(*(__IO uint32_t*) APPLICATION_ADDRESS);
-    JumpToApplication();
+    /*
+      first word of the app is the stack pointer - make sure that it is in range
+     */
+    const uint32_t *app = (uint32_t*)(STM32_FLASH_START + FIRMWARE_RELATIVE_START);
+    const uint32_t ram_start = 0x20000000;
+    const uint32_t ram_limit_kb = 64;
+    const uint32_t ram_end = ram_start+ram_limit_kb*1024;
+    if (app[0] < ram_start || app[0] > ram_end) {
+	invalid_command = 0;
+	return;
+    }
+    /*
+      2nd word is the entry point of the main app. Ensure that is in range
+     */
+    const uint32_t flash_limit_kb = 256;
+    if (app[1] < APPLICATION_ADDRESS || app[1] > APPLICATION_ADDRESS+flash_limit_kb*1024) {
+	// outside a 256k range, really unlikely to be a valid
+	// application, don't jump
+	invalid_command = 0;
+	return;
+    }
+    jump_to_application();
+#endif
 }
 
 
@@ -320,7 +355,7 @@ static void decodeInput()
 
 	// will send Ack 0x30 and read input after transfer out callback
 	invalid_command = 0;
-	address = STM32_FLASH_START + (rxBuffer[2] << 8 | rxBuffer[3]);
+	address = STM32_FLASH_START + ((rxBuffer[2] << 8 | rxBuffer[3]) << ADDRESS_SHIFT);
 	send_ACK();
 
 	return;
@@ -458,7 +493,7 @@ static void serialreadChar()
 
     delayMicroseconds(HALFBITTIME); //wait till the stop bit time begins
     messagereceived = 1;
-    receviedByte = rxbyte;
+    receiveByte = rxbyte;
 }
 
 
@@ -492,7 +527,7 @@ static void sendString(uint8_t *data, int len)
     }
 }
 
-static void recieveBuffer()
+static void receiveBuffer()
 {
     count = 0;
     messagereceived = 0;
@@ -523,7 +558,6 @@ static void recieveBuffer()
 	}
     }
     decodeInput();
-	
 }
 
 #ifdef UPDATE_EEPROM_ENABLE
@@ -550,7 +584,6 @@ static void checkForSignal()
 	if(!gpio_read(input_pin)){
 	    low_pin_count++;
 	}else{
-
 	}
 
 	delayMicroseconds(10);
@@ -599,14 +632,36 @@ static void checkForSignal()
     }
 }
 
+#ifdef BOOTLOADER_TEST_CLOCK
+/*
+  this should provide a 2ms low followed by a 1ms high if the clock is correct
+ */
+static void test_clock(void)
+{
+    setTransmit();
+    while (1) {
+	gpio_clear(input_pin);
+	bl_timer_reset();
+	while (bl_timer_us() < 2000) ;
+	gpio_set(input_pin);
+	bl_timer_reset();
+	while (bl_timer_us() < 1000) ;
+    }
+}
+#endif // BOOTLOADER_TEST_CLOCK
+
 int main(void)
 {
     bl_clock_config();
     bl_timer_init();
     bl_gpio_init();
 
+#ifdef BOOTLOADER_TEST_CLOCK
+    test_clock();
+#endif
+
     checkForSignal();
-	 
+
     gpio_mode_set_input(input_pin, GPIO_PULL_NONE);
 		
 #ifdef USE_ADC_INPUT  // go right to application
@@ -620,7 +675,7 @@ int main(void)
 #endif
 
     while (1) {
-	  recieveBuffer();
+	  receiveBuffer();
 	  if (invalid_command > 100) {
 	      jump();
 	  }

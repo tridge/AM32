@@ -6,8 +6,19 @@
  */
 #pragma once
 
-#define GPIO_PINS_2 (1U<<2)
-#define GPIO_PINS_4 (1U<<4)
+/*
+  36k ram
+ */
+#define RAM_BASE 0x20000000
+#define RAM_SIZE 36*1024
+#define STACK_TOP RAM_BASE+RAM_SIZE
+
+/*
+  64k flash. NOTE: some boards have 128k flash, we need 2 bootloaders
+ */
+#define BOARD_FLASH_SIZE 64
+
+#define GPIO_PIN(n) (1U<<(n))
 
 #define GPIO_PULL_NONE LL_GPIO_PULL_NO
 #define GPIO_PULL_UP   LL_GPIO_PULL_UP
@@ -20,27 +31,29 @@ uint32_t SystemCoreClock = 8000000U;
 
 static inline void gpio_mode_set_input(uint32_t pin, uint32_t pull_up_down)
 {
+    LL_GPIO_SetPinMode(input_port, pin, LL_GPIO_MODE_INPUT);
     LL_GPIO_SetPinPull(input_port, pin, pull_up_down);
 }
 
 static inline void gpio_mode_set_output(uint32_t pin, uint32_t output_mode)
 {
     LL_GPIO_SetPinMode(input_port, pin, LL_GPIO_MODE_OUTPUT);
+    LL_GPIO_SetPinOutputType(input_port, pin, output_mode);
 }
 
 static inline void gpio_set(uint32_t pin)
 {
-    input_port->BSRR = pin;
+    LL_GPIO_SetOutputPin(input_port, pin);
 }
 
 static inline void gpio_clear(uint32_t pin)
 {
-    input_port->BRR = pin;
+    LL_GPIO_ResetOutputPin(input_port, pin);
 }
 
 static inline bool gpio_read(uint32_t pin)
 {
-    return (input_port->IDR & pin) != 0;
+    return LL_GPIO_IsInputPinSet(input_port, pin);
 }
 
 #define BL_TIMER TIM2
@@ -55,7 +68,7 @@ static inline void bl_timer_init(void)
     /* Peripheral clock enable */
     LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_TIM2);
 
-    TIM_InitStruct.Prescaler = 47;
+    TIM_InitStruct.Prescaler = 63;
     TIM_InitStruct.CounterMode = LL_TIM_COUNTERMODE_UP;
     TIM_InitStruct.Autoreload = 0xFFFFFFFF;
     TIM_InitStruct.ClockDivision = LL_TIM_CLOCKDIVISION_DIV1;
@@ -64,6 +77,9 @@ static inline void bl_timer_init(void)
     LL_TIM_SetClockSource(BL_TIMER, LL_TIM_CLOCKSOURCE_INTERNAL);
     LL_TIM_SetTriggerOutput(BL_TIMER, LL_TIM_TRGO_RESET);
     LL_TIM_DisableMasterSlaveMode(BL_TIMER);
+
+    LL_TIM_SetCounterMode(BL_TIMER, LL_TIM_COUNTERMODE_UP);
+    LL_TIM_EnableCounter(BL_TIMER);
 }
 
 /*
@@ -76,12 +92,12 @@ static inline void bl_timer_disable(void)
 
 static inline uint32_t bl_timer_us(void)
 {
-    return BL_TIMER->CNT;
+    return LL_TIM_GetCounter(BL_TIMER);
 }
 
 static inline void bl_timer_reset(void)
 {
-    BL_TIMER->CNT = 0;
+    LL_TIM_SetCounter(BL_TIMER, 0);
 }
 
 /*
@@ -150,4 +166,27 @@ static inline bool bl_was_software_reset(void)
  */
 void SystemInit()
 {
+}
+
+/*
+  jump from the bootloader to the application code
+ */
+static inline void jump_to_application(void)
+{
+    __disable_irq();
+    bl_timer_disable();
+    const uint32_t app_address = STM32_FLASH_START + FIRMWARE_RELATIVE_START;
+    const uint32_t *app_data = (const uint32_t *)app_address;
+    const uint32_t stack_top = app_data[0];
+    const uint32_t JumpAddress = app_data[1];
+
+    // setup vector table
+    SCB->VTOR = app_address;
+
+    // setup sp, msp and jump
+    asm volatile(
+        "mov sp, %0	\n"
+        "msr msp, %0	\n"
+        "bx	%1	\n"
+	: : "r"(stack_top), "r"(JumpAddress) :);
 }

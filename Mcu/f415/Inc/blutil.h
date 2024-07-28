@@ -3,27 +3,43 @@
  */
 #pragma once
 
+/*
+  32k ram
+ */
+#define RAM_BASE 0x20000000
+#define RAM_SIZE 32*1024
+#define STACK_TOP RAM_BASE+RAM_SIZE
+
+/*
+  use 32k flash
+ */
+#define BOARD_FLASH_SIZE 32
+
+
+#define GPIO_PIN(n) (1U<<(n))
+
 static inline void gpio_mode_set_input(uint32_t pin, uint32_t pull_up_down)
 {
-    if (pin < 8) {
+    if (pin < GPIO_PIN(8)) {
 	const uint32_t pin4 = (pin*pin*pin*pin);
-	input_port->cfglr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*(GPIO_MODE_INPUT | pull_up_down));
+	input_port->cfglr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*pull_up_down);
     } else {
-	pin = (pin-8);
+	pin >>= 8U;
 	const uint32_t pin4 = (pin*pin*pin*pin);
-	input_port->cfghr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*(GPIO_MODE_INPUT | pull_up_down));
+	input_port->cfghr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*pull_up_down);
     }
 }
 
 static inline void gpio_mode_set_output(uint32_t pin, uint32_t output_mode)
 {
-    if (pin < 8) {
+    const uint32_t output_normal_strength = 2U;
+    if (pin < GPIO_PIN(8)) {
 	const uint32_t pin4 = (pin*pin*pin*pin);
-	input_port->cfglr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*(GPIO_MODE_OUTPUT | output_mode));
+	input_port->cfglr = (input_port->cfglr & ~(pin4*0xfU)) | (pin4*(output_normal_strength | output_mode));
     } else {
-	pin = (pin-8);
+	pin >>= 8U;
 	const uint32_t pin4 = (pin*pin*pin*pin);
-	input_port->cfghr = (input_port->cfghr & ~(pin4*0xfU)) | (pin4*(GPIO_MODE_OUTPUT | output_mode));
+	input_port->cfghr = (input_port->cfghr & ~(pin4*0xfU)) | (pin4*(output_normal_strength | output_mode));
     }
 }
 
@@ -141,6 +157,7 @@ static inline void bl_clock_config(void)
 
 static inline void bl_gpio_init(void)
 {
+    crm_periph_clock_enable(CRM_GPIOA_PERIPH_CLOCK, TRUE);
     crm_periph_clock_enable(CRM_GPIOB_PERIPH_CLOCK, TRUE);
     crm_periph_clock_enable(CRM_IOMUX_PERIPH_CLOCK , TRUE);
     gpio_pin_remap_config(SWJTAG_GMUX_010, TRUE);	//   pb4 GPIO
@@ -188,4 +205,24 @@ static inline bool bl_was_software_reset(void)
  */
 void SystemInit()
 {
+}
+
+/*
+  jump from the bootloader to the application code
+ */
+static inline void jump_to_application(void)
+{
+    __disable_irq();
+    bl_timer_disable();
+    const uint32_t app_address = STM32_FLASH_START + FIRMWARE_RELATIVE_START;
+    const uint32_t *app_data = (const uint32_t *)app_address;
+    const uint32_t stack_top = app_data[0];
+    const uint32_t JumpAddress = app_data[1];
+
+    // setup sp, msp and jump
+    asm volatile(
+        "mov sp, %0	\n"
+        "msr msp, %0	\n"
+        "bx	%1	\n"
+	: : "r"(stack_top), "r"(JumpAddress) :);
 }

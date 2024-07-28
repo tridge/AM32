@@ -5,7 +5,7 @@ TARGETS_$(MCU) := $(call get_targets,$(MCU))
 
 HAL_FOLDER_$(MCU) := $(HAL_FOLDER)/$(call lc,$(MCU))
 
-MCU_$(MCU) := -mfloat-abi=soft -mthumb -march=armv8-m.main
+MCU_$(MCU) := -mfloat-abi=soft -mthumb -mcpu=cortex-m23
 LDSCRIPT_$(MCU) := $(wildcard $(HAL_FOLDER_$(MCU))/*.ld)
 
 SRC_BASE_DIR_$(MCU) := \
@@ -32,4 +32,4 @@ SRC_$(MCU) := $(foreach dir,$(SRC_DIR_$(MCU)),$(wildcard $(dir)/*.[cs]))
 SRC_$(MCU)_BL := $(foreach dir,$(SRC_BASE_DIR_$(MCU)),$(wildcard $(dir)/*.[cs])) \
 	$(HAL_FOLDER_$(MCU))/Src/eeprom.c \
 	$(HAL_FOLDER_$(MCU))/Src/system_gd32e23x.c \
-	$(wildcard $(HAL_FOLDER_$(MCU))/*_it.c)
+	$(wildcard $(HAL_FOLDER_$(MCU))/Src/*_it.c)
