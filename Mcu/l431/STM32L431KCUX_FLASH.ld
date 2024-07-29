@@ -45,9 +45,11 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Memories definition */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 64K
-  RAM2    (xrw)    : ORIGIN = 0x10000000,   LENGTH = 16K
-  FLASH    (rx)    : ORIGIN = 0x8001000,   LENGTH = 128K
+ RAM          (xrw)  : ORIGIN = 0x20000000, LENGTH = 64K
+ FLASH         (rx)  : ORIGIN = 0x08001000, LENGTH = 122K
+ EEPROM        (rx)  : ORIGIN = 0x0801f800, LENGTH = 1K
+ FLASH_VERSION (rx)  : ORIGIN = ORIGIN(EEPROM) - 48, LENGTH = 16
+ FILE_NAME     (rx)  : ORIGIN = ORIGIN(EEPROM) - 32, LENGTH = 32
 }
 
 /* Sections */
@@ -129,6 +131,21 @@ SECTIONS
     PROVIDE_HIDDEN (__fini_array_end = .);
     . = ALIGN(4);
   } >FLASH
+
+  .firmware_version :
+  {
+    . = ALIGN(4);
+	KEEP (*(.firmware_info))
+    . = ALIGN(4);
+  } >FLASH_VERSION
+
+  /* The file name */
+  .file_name :
+  {
+    . = ALIGN(4);
+	KEEP (*(.file_name))
+    . = ALIGN(4);
+  } >FILE_NAME
 
   /* Used by the startup to initialize data */
   _sidata = LOADADDR(.data);
