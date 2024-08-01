@@ -3,6 +3,19 @@
  */
 #pragma once
 
+/*
+  16k ram
+ */
+#define RAM_BASE 0x20000000
+#define RAM_SIZE 16*1024
+#define STACK_TOP RAM_BASE+RAM_SIZE
+
+/*
+  use 32k of flash
+ */
+#define BOARD_FLASH_SIZE 32
+
+
 #define GPIO_PIN(n) (1U<<(n))
 
 #define GPIO_PULL_NONE GPIO_PUPD_NONE
@@ -87,4 +100,27 @@ static inline void bl_gpio_init(void)
 static inline bool bl_was_software_reset(void)
 {
     return (RCU_RSTSCK & RCU_RSTSCK_SWRSTF) != 0;
+}
+
+/*
+  jump from the bootloader to the application code
+ */
+static inline void jump_to_application(void)
+{
+    __disable_irq();
+    bl_timer_disable();
+    const uint32_t app_address = STM32_FLASH_START + FIRMWARE_RELATIVE_START;
+    const uint32_t *app_data = (const uint32_t *)app_address;
+    const uint32_t stack_top = app_data[0];
+    const uint32_t JumpAddress = app_data[1];
+
+    // setup vector table
+    SCB->VTOR = app_address;
+
+    // setup sp, msp and jump
+    asm volatile(
+        "mov sp, %0	\n"
+        "msr msp, %0	\n"
+        "bx	%1	\n"
+	: : "r"(stack_top), "r"(JumpAddress) :);
 }

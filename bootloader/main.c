@@ -28,35 +28,10 @@
 #include <string.h>
 
 #define STM32_FLASH_START 0x08000000
+
+#ifndef FIRMWARE_RELATIVE_START
 #define FIRMWARE_RELATIVE_START 0x1000
-
-#ifdef SIXTY_FOUR_KB_MEMORY
-#define EEPROM_RELATIVE_START 0xf800
-#else
-#define EEPROM_RELATIVE_START 0x7c00
 #endif
-
-typedef void (*pFunction)(void);
-
-#define APPLICATION_ADDRESS     (uint32_t)(STM32_FLASH_START + FIRMWARE_RELATIVE_START) // 4k
-
-#define EEPROM_START_ADD         (uint32_t)(STM32_FLASH_START + EEPROM_RELATIVE_START)
-#define FLASH_END_ADD           (uint32_t)(STM32_FLASH_START + 0x7FFF)               // 32 k
-
-
-#define CMD_RUN             0x00
-#define CMD_PROG_FLASH      0x01
-#define CMD_ERASE_FLASH     0x02
-#define CMD_READ_FLASH_SIL  0x03
-#define CMD_VERIFY_FLASH    0x03
-#define CMD_VERIFY_FLASH_ARM 0x04
-#define CMD_READ_EEPROM     0x04
-#define CMD_PROG_EEPROM     0x05
-#define CMD_READ_SRAM       0x06
-#define CMD_READ_FLASH_ATM  0x07
-#define CMD_KEEP_ALIVE      0xFD
-#define CMD_SET_ADDRESS     0xFF
-#define CMD_SET_BUFFER      0xFE
 
 #ifdef USE_PA2
 #define input_pin        GPIO_PIN(2)
@@ -79,6 +54,51 @@ typedef void (*pFunction)(void);
 
 #include <blutil.h>
 
+#ifndef BOARD_FLASH_SIZE
+#error "must define BOARD_FLASH_SIZE"
+#endif
+
+/*
+  currently only support 32, 64 or 128 k flash
+ */
+#if BOARD_FLASH_SIZE == 32
+#define EEPROM_START_ADD 0x7c00
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x00,0x1f,0x06,0x06,0x01,0x30};
+#define ADDRESS_SHIFT 0
+
+#elif BOARD_FLASH_SIZE == 64
+#define EEPROM_START_ADD 0xf800
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x35,0x06,0x06,0x01,0x30};
+#define ADDRESS_SHIFT 0
+
+#elif BOARD_FLASH_SIZE == 128
+static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x2B,0x06,0x06,0x01,0x30};
+#define EEPROM_START_ADD 0x1f800
+#define ADDRESS_SHIFT 2 // addresses from the bl client are shifted 2 bits before being used
+
+#else
+#error "unsupported BOARD_FLASH_SIZE"
+#endif
+
+typedef void (*pFunction)(void);
+
+#define APPLICATION_ADDRESS     (uint32_t)(STM32_FLASH_START + FIRMWARE_RELATIVE_START)
+
+
+#define CMD_RUN             0x00
+#define CMD_PROG_FLASH      0x01
+#define CMD_ERASE_FLASH     0x02
+#define CMD_READ_FLASH_SIL  0x03
+#define CMD_VERIFY_FLASH    0x03
+#define CMD_VERIFY_FLASH_ARM 0x04
+#define CMD_READ_EEPROM     0x04
+#define CMD_PROG_EEPROM     0x05
+#define CMD_READ_SRAM       0x06
+#define CMD_READ_FLASH_ATM  0x07
+#define CMD_KEEP_ALIVE      0xFD
+#define CMD_SET_ADDRESS     0xFF
+#define CMD_SET_BUFFER      0xFE
+
 static uint16_t low_pin_count;
 static char receiveByte;
 static int count;
@@ -91,11 +111,7 @@ static int received;
 
 
 static uint8_t pin_code = PORT_LETTER << 4 | PIN_NUMBER;
-#ifdef SIXTY_FOUR_KB_MEMORY
-static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x64,0x35,0x06,0x06,0x01,0x30};
-#else
-static uint8_t deviceInfo[9] = {0x34,0x37,0x31,0x00,0x1f,0x06,0x06,0x01,0x30};      // stm32 device info
-#endif
+
 
 
 static uint8_t rxBuffer[258];
@@ -113,9 +129,6 @@ static uint8_t calculated_crc_low_byte;
 static uint8_t calculated_crc_high_byte;
 static uint16_t payload_buffer_size;
 static char incoming_payload_no_command;
-
-static uint32_t JumpAddress;
-static pFunction JumpToApplication;
 
 /* USER CODE BEGIN PFP */
 static void serialwriteChar(char data);
@@ -139,18 +152,12 @@ static void delayMicroseconds(uint32_t micros)
 static void jump()
 {
 #ifndef DISABLE_JUMP
-    __disable_irq();
-    JumpAddress = *(__IO uint32_t*) (APPLICATION_ADDRESS + 4);
     uint8_t value = *(uint8_t*)(EEPROM_START_ADD);
     if (value != 0x01) {      // check first byte of eeprom to see if its programmed, if not do not jump
 	invalid_command = 0;
 	return;
     }
-    bl_timer_disable();
-    JumpToApplication = (pFunction) JumpAddress;
-
-    __set_MSP(*(__IO uint32_t*) APPLICATION_ADDRESS);
-    JumpToApplication();
+    jump_to_application();
 #endif
 }
 
@@ -327,7 +334,7 @@ static void decodeInput()
 
 	// will send Ack 0x30 and read input after transfer out callback
 	invalid_command = 0;
-	address = STM32_FLASH_START + (rxBuffer[2] << 8 | rxBuffer[3]);
+	address = STM32_FLASH_START + ((rxBuffer[2] << 8 | rxBuffer[3]) << ADDRESS_SHIFT);
 	send_ACK();
 
 	return;
