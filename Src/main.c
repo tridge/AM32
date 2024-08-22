@@ -240,6 +240,10 @@ an settings option)
 #include "crsf.h"
 #endif
 
+#if DRONECAN_SUPPORT
+#include "DroneCAN/DroneCAN.h"
+#endif
+
 #include <version.h>
 
 void zcfoundroutine(void);
@@ -296,6 +300,7 @@ fastPID stallPid = { // 1khz loop time
     .output_limit = 50000
 };
 
+EEprom_t eepromBuffer;
 uint32_t eeprom_address = EEPROM_START_ADD;
 char set_hysteris = 0;
 uint16_t prop_brake_duty_cycle = 0;
@@ -597,7 +602,7 @@ float doPidCalculations(struct fastPID* pidnow, int actual, int target)
 
 void loadEEpromSettings()
 {
-		//*eepromBuffer = *(EEprom_t*)(eeprom_address);
+                //*eepromBuffer = *(EEprom_t*)(eeprom_address);
     read_flash_bin(eepromBuffer.buffer, eeprom_address, sizeof(eepromBuffer.buffer));
 
     if (eepromBuffer.advance_level > 3) {
@@ -2167,6 +2172,9 @@ int main(void)
 
 #ifdef BRUSHED_MODE
         runBrushedLoop();
+#endif
+#if DRONECAN_SUPPORT
+	DroneCAN_update();
 #endif
     }
 }
