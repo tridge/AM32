@@ -8,6 +8,7 @@
 
 #include "eeprom.h"
 #include <string.h>
+#include <targets.h>
 
 #define page_size 0x800                   // 2 kb for l431
 uint32_t FLASH_FKEY1 =0x45670123;
@@ -84,6 +85,11 @@ void save_flash_nolib(uint8_t *data, int length, uint32_t add){
     SET_BIT(flash->CR, FLASH_CR_LOCK);
 }
 
+void read_flash_bin(uint8_t*  data , uint32_t add, int out_buff_len) {
+    memcpy_ram(data, (const void*)add, out_buff_len);
+}
+
+#ifdef DRONECAN_SUPPORT
 /*
   pointer to the start of application flash
  */
@@ -114,9 +120,4 @@ void flash_upgrade(const uint8_t *data, uint32_t length)
     // reboot to start new fw
     NVIC_SystemReset();
 }
-
-
-
-void read_flash_bin(uint8_t*  data , uint32_t add, int out_buff_len) {
-    memcpy_ram(data, (const void*)add, out_buff_len);
-}
+#endif // DRONECAN_SUPPORT
