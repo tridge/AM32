@@ -80,6 +80,7 @@
 #define USE_SERIAL_TELEMETRY
 #define EEPROM_START_ADD (uint32_t)0x0800F800
 #define DRONECAN_SUPPORT 1
+#define USE_HSE_CLOCK
 #endif
 
 #ifdef  REF_L431

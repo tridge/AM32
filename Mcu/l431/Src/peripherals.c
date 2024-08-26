@@ -59,6 +59,22 @@ void initAfterJump()
 
 void SystemClock_Config(void)
 {
+#ifdef USE_HSE_CLOCK
+    /*
+      setup for HSE clock
+     */
+    LL_UTILS_ClkInitTypeDef clkconf;
+    clkconf.AHBCLKDivider = 1;
+    clkconf.APB1CLKDivider = 1;
+    clkconf.APB2CLKDivider = 1;
+
+    LL_UTILS_PLLInitTypeDef pllconf;
+    pllconf.PLLM = 3; // for 24MHz HSE
+    pllconf.PLLN = 20;
+    pllconf.PLLR = 2;
+    LL_PLL_ConfigSystemClock_HSE(HSE_VALUE, LL_UTILS_HSEBYPASS_OFF,
+				 &pllconf, &clkconf);
+#else
   LL_FLASH_SetLatency(LL_FLASH_LATENCY_4);
   while(LL_FLASH_GetLatency()!= LL_FLASH_LATENCY_4)
   {
@@ -103,6 +119,7 @@ void SystemClock_Config(void)
 //  {
 //    Error_Handler();
 //  }
+#endif // USE_HSE_CLOCK
 }
 
 #ifdef USE_COMP_1
