@@ -17,9 +17,9 @@ PROVIDE( _resv_size = __resv_size );
 
 MEMORY
 {  
-        RESET_FLASH(rx)   : ORIGIN = 0x00000000, LENGTH = 192
-        FLASH_VERSION(rx) : ORIGIN = 0x000000C0, LENGTH = 16
-        FLASH (rx)     : ORIGIN = 0x000000D0, LENGTH = 57K
+        RESET_FLASH(rx)   : ORIGIN = 0x00001000, LENGTH = 192
+        FLASH_VERSION(rx) : ORIGIN = 0x000010C0, LENGTH = 16
+        FLASH (rx)     : ORIGIN = 0x000010D0, LENGTH = 56K - 0xD0
         FILE_NAME (rx) : ORIGIN = 0x0000f800 - 32, LENGTH = 32
 	RAM (xrw)     : ORIGIN = 0x20000000, LENGTH = 20K
 }
