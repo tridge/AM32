@@ -359,8 +359,6 @@ uint16_t low_cell_volt_cutoff = 330; // 3.3volts per cell
 
 const char filename[30] __attribute__((section(".file_name"))) = FILE_NAME;
 
-char firmware_name[12] = FIRMWARE_NAME;
-
 uint8_t EEPROM_VERSION;
 // move these to targets folder or peripherals for each mcu
 char RC_CAR_REVERSE = 0; // have to set bidirectional, comp_pwm off and stall
