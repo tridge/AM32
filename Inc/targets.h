@@ -812,19 +812,6 @@
 #endif
 
 
-/*****************************************************CH32V203 targets
- * ************************************************/
-#ifdef AIRBOT_V20x
-#define USE_MAKE
-//#define USE_PA2_AS_COMP
-#define FIRMWARE_NAME "AIRBOT_V203 "
-#define FILE_NAME "AIRBOT_PA0_V203"
-#define DEAD_TIME 75
-#define HARDWARE_GROUP_CH_A
-#define USE_SERIAL_TELEMETRY
-#endif
-
-
 #ifdef PB450_F051
 #define FILE_NAME "PB450_F051"
 #define FIRMWARE_NAME "PB450_F051  "
@@ -1595,6 +1582,16 @@
 
 #define CURRENT_ADC_CHANNEL LL_ADC_CHANNEL_5
 #define VOLTAGE_ADC_CHANNEL LL_ADC_CHANNEL_7
+#endif
+
+/*****************************************************CH32V203 targets
+ * ************************************************/
+#ifdef AIRBOT_V203
+//#define USE_PA2_AS_COMP
+#define FIRMWARE_NAME "AIRBOT_V203"
+#define FILE_NAME "AIRBOT_V203"
+#define DEAD_TIME 75
+#define HARDWARE_GROUP_CH_A
 #endif
 
 #ifndef FIRMWARE_NAME
@@ -2902,7 +2899,6 @@
 #define PHASE_C_COMP 0x400000D1 // pa5
 #endif
 
-<<<<<<< HEAD
 #ifdef     HARDWARE_GROUP_L4_A
 
 #define    MCU_L431
@@ -3078,8 +3074,8 @@
 
 #define CURRENT_ADC_CHANNEL         LL_ADC_CHANNEL_8
 #define VOLTAGE_ADC_CHANNEL         LL_ADC_CHANNEL_11
-=======
 
+#endif
 
 #ifdef HARDWARE_GROUP_CH_A
 
@@ -3108,7 +3104,6 @@
 #define PHASE_C_GPIO_HIGH       GPIO_Pin_8
 #define PHASE_C_GPIO_PORT_HIGH  GPIOA
 
->>>>>>> 6a534d8 (porting for CH32V203)
 
 #endif
 
@@ -3296,7 +3291,6 @@
 #define COM_TIMER_IRQ TMR1_TRG_HALL_TMR11_IRQn
 #endif
 
-<<<<<<< HEAD
 #ifdef MCU_L431
 #define STMICRO
 #define CPU_FREQUENCY_MHZ   80
@@ -3327,15 +3321,12 @@
 #endif
 
 
-=======
-
-
 #ifdef MCU_CH32V203
 #define WCH
 #define NEED_INPUT_READY
 #define ERASED_FLASH_BYTE    0x39
 #define CPU_FREQUENCY_MHZ    48                      //PWM freq is 48MHz, CPU freq is 96MHz
-#define EEPROM_START_ADD     (uint32_t)0x08007C00
+#define EEPROM_START_ADD     (uint32_t)0x0800f800
 #define INTERVAL_TIMER       TIM4
 #define TEN_KHZ_TIMER        SysTick
 #define UTILITY_TIMER        NULL                      //for delay unimportant
@@ -3358,9 +3349,6 @@
 
 #endif
 
-
-
->>>>>>> 6a534d8 (porting for CH32V203)
 #ifndef LOOP_FREQUENCY_HZ
 #define LOOP_FREQUENCY_HZ 20000
 #endif
