@@ -181,7 +181,7 @@ static uint64_t micros64(void)
 {
     static uint64_t base_us;
     static uint16_t last_cnt;
-    uint16_t cnt = UTILITY_TIMER->CNT;
+    uint16_t cnt = UTILITY_TIMER->cval;
     if (cnt < last_cnt) {
 	base_us += 0x10000;
     }
@@ -611,7 +611,7 @@ static void handle_file_read_response(CanardInstance* ins, CanardRxTransfer* tra
 
     uint32_t len = pkt.data.len;
     len = (len+7U) & ~7U;
-    save_flash_nolib(pkt.data.data, len, (uint32_t)&_flash_update[fwupdate.offset]);
+    //save_flash_nolib(pkt.data.data, len, (uint32_t)&_flash_update[fwupdate.offset]);
 
     fwupdate.offset += pkt.data.len;
 
@@ -619,7 +619,7 @@ static void handle_file_read_response(CanardInstance* ins, CanardRxTransfer* tra
 	/* firmware updare done */
 	can_printf("Firmwate update complete\n");
 	fwupdate.node_id = 0;
-	flash_upgrade(&_flash_update[0], fwupdate.offset); // this jumps to new firmware
+        //flash_upgrade(&_flash_update[0], fwupdate.offset); // this jumps to new firmware
 	return;
     }
 

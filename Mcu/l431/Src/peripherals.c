@@ -12,9 +12,6 @@
 #include "ADC.h"
 #include "serial_telemetry.h"
 #include "targets.h"
-#if DRONECAN_SUPPORT
-#include <DroneCAN.h>
-#endif
 
 extern char bemf_timeout;
 

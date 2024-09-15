@@ -27,4 +27,13 @@ CFLAGS_$(MCU) += \
 	 -D$(PART) \
 	 -DUSE_STDPERIPH_DRIVER
 
+CFLAGS_$(MCU) += \
+	-ISrc/DroneCAN \
+	-ISrc/DroneCAN/libcanard \
+	-ISrc/DroneCAN/dsdl_generated/include
+
+SRC_DIR_$(MCU) += Src/DroneCAN \
+		Src/DroneCAN/dsdl_generated/src \
+		Src/DroneCAN/libcanard
+
 SRC_$(MCU) := $(foreach dir,$(SRC_DIR_$(MCU)),$(wildcard $(dir)/*.[cs]))

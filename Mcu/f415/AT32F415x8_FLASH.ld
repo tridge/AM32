@@ -31,11 +31,12 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Specify the memory areas */
 MEMORY
 {
-FLASH (rx)      : ORIGIN = 0x08001000, LENGTH = 27K
-FLASH_VERSION (rx)  : ORIGIN = 0x08007C00 - 48, LENGTH = 16
-FILE_NAME     (rx)  : ORIGIN = 0x08007C00 - 32, LENGTH = 32
-EEPROM        (rx)  : ORIGIN = 0x08007C00, LENGTH = 1K
-RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 32K
+ RAM          (xrw)  : ORIGIN = 0x20000000, LENGTH = 64K
+ FLASH         (rx)  : ORIGIN = 0x08001000, LENGTH = 57K
+ EEPROM        (rx)  : ORIGIN = 0x0800f800, LENGTH = 2K
+ FLASH_VERSION (rx)  : ORIGIN = ORIGIN(EEPROM) - 48, LENGTH = 16
+ FILE_NAME     (rx)  : ORIGIN = ORIGIN(EEPROM) - 32, LENGTH = 32
+ FLASH_UPDATE  (rx)  : ORIGIN = 0x08010000, LENGTH = 57K /* for DroneCAN fw update */
 }
 
 /* Define output sections */
