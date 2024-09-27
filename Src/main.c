@@ -781,6 +781,9 @@ void loadEEpromSettings()
 #ifdef GIGADEVICES
             TIMER_CCHP(TIMER0) |= dead_time_override;
 #endif
+#ifdef WCH
+            TIM1->BDTR |= dead_time_override;
+#endif
         }
 
         if (eepromBuffer[43] >= 70 && eepromBuffer[43] <= 140) {
