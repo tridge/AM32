@@ -118,6 +118,7 @@ extern char use_can_input;
 
 extern void saveEEpromSettings(void);
 extern void loadEEpromSettings(void);
+static void set_input(uint16_t input);
 
 /*
   the set of parameters to present to the user over DroneCAN
@@ -324,8 +325,11 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             return;
 	}
 
-	// make dir_reversed change work without reboot
-	forward = 1 - dir_reversed;
+        if ((char*)p->ptr == &dir_reversed) {
+            // make dir_reversed change work without reboot
+            forward = 1 - dir_reversed;
+            set_input(0);
+        }
     }
 
     /*
