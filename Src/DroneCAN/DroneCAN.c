@@ -114,6 +114,8 @@ static struct {
     uint32_t count;
 } current;
 
+extern char use_can_input;
+
 extern void saveEEpromSettings(void);
 extern void loadEEpromSettings(void);
 
@@ -491,6 +493,7 @@ static void set_input(uint16_t input)
     newinput = (dronecan_armed || !settings.require_arming)? input : 0;
     last_can_input = newinput;
     inputSet = 1;
+    use_can_input = 1;
     transfercomplete();
     setInput();
 }

@@ -565,6 +565,7 @@ uint16_t input = 0;
 uint16_t newinput = 0;
 char inputSet = 0;
 char dshot = 0;
+char use_can_input = 0;
 char servoPwm = 0;
 uint32_t zero_crosses;
 
@@ -1047,7 +1048,7 @@ void setInput()
 {
 
     if (bi_direction) {
-        if (dshot == 0) {
+        if (dshot == 0 || use_can_input == 0) {
             if (RC_CAR_REVERSE) {
                 if (newinput > (1000 + (servo_dead_band << 1))) {
                     if (forward == dir_reversed) {
@@ -1124,7 +1125,7 @@ void setInput()
             }
         }
 
-        if (dshot) {
+        if (dshot || use_can_input) {
             if (newinput > 1047) {
 
                 if (forward == dir_reversed) {
