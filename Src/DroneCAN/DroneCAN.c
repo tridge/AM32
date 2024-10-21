@@ -1037,7 +1037,7 @@ static void send_ESCStatus(void)
     current.count = 0;
 
     pkt.temperature = C_TO_KELVIN(degrees_celsius);
-    pkt.rpm = (e_rpm * 100) / ((uint8_t)motor_poles);
+    pkt.rpm = (e_rpm * 100) / ((uint8_t)motor_poles) * 2;
     pkt.power_rating_pct = 0; // how do we get this?
     pkt.esc_index = settings.esc_index;
 
