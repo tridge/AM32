@@ -8,6 +8,7 @@
 
 #if DRONECAN_SUPPORT
 
+#include "eerpom_params.h"
 #include "peripherals.h"
 #include "serial_telemetry.h"
 #include <common.h>
@@ -37,11 +38,6 @@
 
 // use set input at 1kHz
 #define TARGET_PERIOD_US 1000U
-
-#define EEPROM_MOTOR_KV_INDEX 26
-#define EEPROM_INPUT_TYPE_INDEX 26
-#define EEPROM_TUNE_INDEX 48
-#define EEPROM_TUNE_MAX_LEN 128
 
 static CanardInstance canard;
 static uint8_t canard_memory_pool[CANARD_POOL_SIZE];
@@ -78,7 +74,7 @@ const struct {
   DroneCAN uses a chunk of eeprom storage starting at offset 176
   for DroneCAN specific settings
  */
-enum eeprom_offset {
+enum dronecan_eeprom_offset {
         EEPROM_FIRST_CAN = 176,
         EEPROM_CAN_NODE = 176,
         EEPROM_ESC_INDEX = 177,
@@ -157,6 +153,11 @@ extern char brake_on_stop;
 extern char auto_advance;
 extern uint32_t commutation_interval;
 extern uint8_t auto_advance_level;
+extern uint16_t low_cell_volt_cutoff;
+extern uint8_t TEMPERATURE_LIMIT;
+extern char LOW_VOLTAGE_CUTOFF;
+extern uint16_t CURRENT_LIMIT;
+extern char RC_CAR_REVERSE;
 
 static uint16_t last_can_input;
 static struct {
@@ -181,29 +182,48 @@ static const struct parameter {
     uint8_t eeprom_index;
 } parameters[] = {
         // list of settable parameters
+        // dronecan specific parameters
         { "CAN_NODE",               T_UINT8, 0, 127, 0, &settings.can_node, EEPROM_CAN_NODE},
         { "ESC_INDEX",              T_UINT8, 0, 32,  0, &settings.esc_index, EEPROM_ESC_INDEX},
-        { "DIR_REVERSED",           T_BOOL,  0, 1,   0, &dir_reversed, 0 },
-        { "MOTOR_KV",               T_UINT16,20, 10220, 2000, &motor_kv, EEPROM_MOTOR_KV_INDEX},
-        { "BI_DIRECTIONAL",         T_BOOL,  0, 1,   0, &bi_direction, 0 },
-        { "MOTOR_POLES",            T_UINT8, 2, 36,  14, &motor_poles, 27 },
-        { "REQUIRE_ARMING",         T_BOOL,  0, 1,   1, &settings.require_arming, EEPROM_REQUIRE_ARMING},
         { "TELEM_RATE",             T_UINT8, 0, 200, 25, &settings.telem_rate, EEPROM_TELEM_RATE },
+        { "REQUIRE_ARMING",         T_BOOL,  0, 1,   1, &settings.require_arming, EEPROM_REQUIRE_ARMING},
         { "REQUIRE_ZERO_THROTTLE",  T_BOOL,  0, 1,   1, &settings.require_zero_throttle, EEPROM_REQUIRE_ZERO_THROTTLE },
+        { "INPUT_FILTER_HZ",        T_UINT8, 0, 100, 0, &settings.filter_hz, EEPROM_FILTER_HZ},
+        { "DEBUG_RATE",             T_UINT8, 0, 200, 0, &settings.debug_rate, EEPROM_DEBUG_RATE},
+
+        // basic parameters
+        // eeprom_layout_version, dir_reversed, bi_direction, use_sin_start, comp_pwm, VARIABLE_PWM, stuck_rotor_protection, advance_level
+        // will be set by saveEEpromSettings
+        // motor_kv, low_cell_volt_cutoff, STARTUP_TUNE, CURRENT_LIMIT value need to adjust to dronecan gui tool
+        // motor_kv 1k/V
+        // CURRENT_LIMIT A, range 0 ~ 200, 255 to disable
+        // TEMPERATURE_LIMIT degrees celsius, range 70 ~ 141, 255 to disable 
+        // low_cell_volt_cutoff 10mV, range 250 ~ 350
+        // STARTUP_TUNE RTTTL string
+
+        { "DIR_REVERSED",           T_BOOL,  0, 1,   0, &dir_reversed, 0 },
+        { "MOTOR_KV",               T_UINT16,20, 10220, 2000, &motor_kv, EEPROM_MOTOR_KV},
+        { "BI_DIRECTIONAL",         T_BOOL,  0, 1,   0, &bi_direction, 0 },
+        { "MOTOR_POLES",            T_UINT8, 2, 36,  14, &motor_poles, EEPROM_MOTOR_POLES},
+        { "BEEP_VOLUME",            T_UINT8, 0, 11,  5, NULL, EEPROM_BEEP_VOLUME},
         { "VARIABLE_PWM",           T_BOOL,  0, 1,   1, &VARIABLE_PWM, 0},
-        { "PWM_FREQUENCY",          T_UINT8, 8, 48,  24, &settings.pwm_frequency, 24},
+        { "PWM_FREQUENCY",          T_UINT8, 8, 48,  24, &settings.pwm_frequency, EEPROM_PWM_FREQUENCY},
         { "USE_SIN_START",          T_BOOL,  0, 1,   0, &use_sin_start, 0},
         { "COMP_PWM",               T_BOOL,  0, 1,   1, &comp_pwm, 0},
         { "STUCK_ROTOR_PROTECTION", T_BOOL,  0, 1,   1, &stuck_rotor_protection, 0},
         { "ADVANCE_LEVEL",          T_UINT8, 0, 4,   2, &advance_level, 0},
-        { "AUTO_ADVANCE",           T_BOOL,  0, 1,   0, &auto_advance, 47},
-        { "BRAKE_ON_STOP",          T_BOOL,  0, 1,   1, &brake_on_stop, 28},
-        { "DRIVING_BRAKE_STRENGTH", T_UINT8, 1, 10,  10, &driving_brake_strength, 42},
-        { "DRAG_BRAKE_STRENGTH",    T_UINT8, 1, 10,  10, &drag_brake_strength, 41},
-        { "INPUT_FILTER_HZ",        T_UINT8, 0, 100, 0, &settings.filter_hz, EEPROM_FILTER_HZ},
-        { "DEBUG_RATE",             T_UINT8, 0, 200, 0, &settings.debug_rate, EEPROM_DEBUG_RATE},
-        { "INPUT_SIGNAL_TYPE",      T_UINT8, 0, 5,   0, &settings.input_type, 46},
-        { "STARTUP_TUNE",           T_STRING,0, 4,   0, NULL, EEPROM_TUNE_INDEX},
+        { "AUTO_ADVANCE",           T_BOOL,  0, 1,   0, &auto_advance, EEPROM_AUTO_ADVANCE},
+        { "STARTUP_POWER",          T_UINT8, 50,150, 10, NULL, EEPROM_STARTUP_POWER},
+        { "CURRENT_LIMIT",          T_UINT16, 0,255, 204,&CURRENT_LIMIT, EEPROM_CURRENT_LIMIT},
+        { "TEMPERATURE_LIMIT",      T_UINT8, 70,255, 255,&TEMPERATURE_LIMIT, EEPROM_TEMPERATURE_LIMIT},
+        { "LOW_VOLTAGE_CUTOFF",     T_BOOL,  0, 1,   0,  &LOW_VOLTAGE_CUTOFF, EEPROM_LOW_VOLTAGE_CUTOFF},
+        { "LOW_VOLTAGE_THRESHOLD",  T_UINT16, 250, 350, 300, &low_cell_volt_cutoff, EEPROM_LOW_VOLTAGE_THRESHOLD},
+        { "RC_CAR_REVERSE",         T_BOOL,  0, 1,   0,  &RC_CAR_REVERSE, EEPROM_RC_CAR_REVERSING},
+        { "BRAKE_ON_STOP",          T_BOOL,  0, 1,   1, &brake_on_stop, EEPROM_BRAKE_ON_STOP},
+        { "DRIVING_BRAKE_STRENGTH", T_UINT8, 1, 10,  10, &driving_brake_strength, EEPROM_RUNNING_BRAKE_LEVEL},
+        { "DRAG_BRAKE_STRENGTH",    T_UINT8, 1, 10,  10, &drag_brake_strength, EEPROM_BRAKE_STRENGTH},
+        { "INPUT_SIGNAL_TYPE",      T_UINT8, 0, 5,   5, &settings.input_type, EEPROM_ESC_PROTOCOL},
+        { "STARTUP_TUNE",           T_STRING,0, 4,   0, NULL, EEPROM_STARTUP_MELODY},
 };
 
 /*
@@ -385,14 +405,25 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
 	case T_UINT8:
 	    *(uint8_t *)p->ptr = req.value.integer_value;
 	    if (p->eeprom_index != 0) {
-		eepromBuffer[p->eeprom_index] = *(uint8_t *)p->ptr;
+            if (p->ptr == NULL) {
+		        eepromBuffer[p->eeprom_index] = req.value.integer_value;
+            } else {
+		    eepromBuffer[p->eeprom_index] = *(uint8_t *)p->ptr;
+            }
+            
 	    }
             break;
 	case T_UINT16:
 	    *(uint16_t *)p->ptr = req.value.integer_value;
-	    if (p->eeprom_index == EEPROM_MOTOR_KV_INDEX) {
-	        eepromBuffer[EEPROM_MOTOR_KV_INDEX] = (uint8_t)((*(uint16_t *)p->ptr - 20) / 40);
-	    }
+	    if (p->eeprom_index == EEPROM_MOTOR_KV) {
+	        eepromBuffer[EEPROM_MOTOR_KV] = (uint8_t)((*(uint16_t *)p->ptr - 20) / 40);
+	    } else if (p->eeprom_index == EEPROM_LOW_VOLTAGE_THRESHOLD) {
+            eepromBuffer[EEPROM_LOW_VOLTAGE_THRESHOLD] = (uint8_t)(*(uint16_t *)p->ptr - 250);
+        } else if (p->eeprom_index == EEPROM_STARTUP_POWER) {
+            eepromBuffer[EEPROM_STARTUP_POWER] = (uint8_t)(*(uint16_t *)p->ptr - 250);
+        } else if (p->eeprom_index == EEPROM_CURRENT_LIMIT) {
+            eepromBuffer[EEPROM_CURRENT_LIMIT] = (uint8_t)(*(uint16_t *)p->ptr / 2);
+        }
             break;
 	case T_BOOL:
 	    *(uint8_t *)p->ptr = req.value.boolean_value?1:0;
@@ -402,12 +433,12 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             break;
 	case T_STRING:
 	    if (req.value.union_tag == UAVCAN_PROTOCOL_PARAM_VALUE_STRING_VALUE) {
-	        if (p->eeprom_index == EEPROM_TUNE_INDEX) {
+	        if (p->eeprom_index == EEPROM_STARTUP_MELODY) {
 	            for (size_t i = 0; i < EEPROM_TUNE_MAX_LEN; i++) {
 	                if (i < req.value.string_value.len) {
-	                    eepromBuffer[EEPROM_TUNE_INDEX + i] = req.value.string_value.data[i];
+	                    eepromBuffer[EEPROM_STARTUP_MELODY + i] = req.value.string_value.data[i];
 	                }  else {
-	                    eepromBuffer[EEPROM_TUNE_INDEX + i] = 0xFF;
+	                    eepromBuffer[EEPROM_STARTUP_MELODY + i] = 0xFF;
 	                }
 	            }
 	        }
@@ -438,7 +469,13 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
 	switch (p->vtype) {
 	case T_UINT8:
 	    pkt.value.union_tag = UAVCAN_PROTOCOL_PARAM_VALUE_INTEGER_VALUE;
-            pkt.value.integer_value = *(uint8_t *)p->ptr;
+            if (p->ptr == NULL) {
+                pkt.value.integer_value = eepromBuffer[p->eeprom_index];
+                /* code */
+            } else {
+                pkt.value.integer_value = *(uint8_t *)p->ptr;
+            }
+            
             pkt.default_value.union_tag = UAVCAN_PROTOCOL_PARAM_VALUE_INTEGER_VALUE;
             if (p->eeprom_index != 0 && p->eeprom_index < sizeof(default_settings)) {
                 pkt.default_value.integer_value = default_settings[p->eeprom_index];
@@ -462,10 +499,10 @@ static void handle_param_GetSet(CanardInstance* ins, CanardRxTransfer* transfer)
             break;
 	case T_STRING:
 	    pkt.value.union_tag = UAVCAN_PROTOCOL_PARAM_VALUE_STRING_VALUE;
-	    if (p->eeprom_index == EEPROM_TUNE_INDEX) {
+	    if (p->eeprom_index == EEPROM_STARTUP_MELODY) {
 	        pkt.value.string_value.len = EEPROM_TUNE_MAX_LEN;
 	        for (size_t i=0; i < EEPROM_TUNE_MAX_LEN; i++) {
-	            pkt.value.string_value.data[i] = eepromBuffer[EEPROM_TUNE_INDEX + i];
+	            pkt.value.string_value.data[i] = eepromBuffer[EEPROM_STARTUP_MELODY + i];
 	        }
 	    }
             break;
