@@ -16,6 +16,10 @@ display code:
   motor_kv       byte 26  rpm/V   = raw * 40 + 20
   current_limit  byte 44  amps    = raw * 2
   cell cutoff    byte 37  volts   = (raw + 250) / 100
+  abs cutoff     byte 8   volts   = raw * 0.5
+                          Inc/eeprom.h: "voltage level 1 to 100 in 0.5v
+                          increments"; the firmware compares against
+                          raw * 50 in centivolts (Src/main.c)
   everything else is stored as displayed
 '''
 
@@ -28,7 +32,7 @@ FIELDS = [
     (5,  'max_ramp',                '',      None),
     (6,  'minimum_duty_cycle',      '',      None),
     (7,  'disable_stick_calibration', '',    None),
-    (8,  'absolute_voltage_cutoff', '',      None),
+    (8,  'absolute_voltage_cutoff', 'V',     lambda v: v * 0.5),
     (9,  'current_P',               '',      None),
     (10, 'current_I',               '',      None),
     (11, 'current_D',               '',      None),
