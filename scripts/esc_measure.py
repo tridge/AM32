@@ -142,11 +142,23 @@ class EscMeasure(object):
             self.aborted = reason
             print('ABORT: %s' % reason)
 
+    def _send_command(self):
+        cmd = [0] * self.args.esc_index + [int(self.throttle * 8191)]
+        self.node.broadcast(dronecan.uavcan.equipment.esc.RawCommand(cmd=cmd))
+
     def set_throttle(self, throttle):
         throttle = max(0.0, min(self.args.max_throttle, throttle))
-        if throttle != self.throttle:
-            self.rec.add('cmd', throttle=round(throttle, 4))
+        changed = throttle != self.throttle
         self.throttle = throttle
+        if not changed:
+            return
+        self.rec.add('cmd', throttle=round(throttle, 4))
+        # send it now rather than at the next tick of the stream
+        # schedule below: that wait is up to a full command period, and
+        # a phase analysis pairing rpm against the time the throttle was
+        # decided charges it to the ESC
+        self._send_command()
+        self.next_tx = self.clock.now() + 1.0 / self.args.rate
 
     def spin_for(self, duration):
         '''run the RawCommand stream and message pump for duration
@@ -160,8 +172,8 @@ class EscMeasure(object):
                 self.throttle = 0.0
             now = self.clock.now()
             if now >= self.next_tx:
-                cmd = [0] * self.args.esc_index + [int(self.throttle * 8191)]
-                self.node.broadcast(dronecan.uavcan.equipment.esc.RawCommand(cmd=cmd))
+                # keeps the stream alive while the throttle is held
+                self._send_command()
                 # absolute schedule, but never let a stalled clock build
                 # a burst backlog
                 self.next_tx = max(now, self.next_tx + period)

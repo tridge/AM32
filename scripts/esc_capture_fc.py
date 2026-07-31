@@ -97,7 +97,8 @@ class BetaflightBackend(object):
 
     def set_throttle(self, throttle):
         throttle = max(0.0, min(self.args.max_throttle, throttle))
-        if throttle != self.throttle:
+        changed = throttle != self.throttle
+        if changed:
             # log telemetry that arrived before this command first, so
             # the file stays in time order for the segmenting analyses.
             # The lock keeps the reader from stamping a sample into the
@@ -117,6 +118,14 @@ class BetaflightBackend(object):
                 self.throttle_change_wall = time.monotonic()
                 self.responded = False
         self.throttle = throttle
+        if changed:
+            # out now rather than at the next tick of the stream
+            # schedule below: that wait is up to a full command period,
+            # and a phase analysis pairing rpm against the time the
+            # throttle was decided charges it to the ESC
+            self._send_motor(self.throttle)
+            self.port.send(msp.MSP_MOTOR_TELEMETRY)
+            self.next_tx = self.clock.now() + 1.0 / self.args.rate
 
     def spin_for(self, duration):
         '''stream SET_MOTOR + telemetry polls for duration seconds.
