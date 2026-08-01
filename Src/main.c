@@ -333,7 +333,8 @@ char do_once_sinemode = 0;
 uint8_t auto_advance_level;
 volatile uint8_t zero_throttle_brake_active;
 volatile uint8_t temp_comp_pwm;
-uint8_t brake_countdown;
+volatile uint8_t brake_countdown;
+volatile uint32_t brake_tick_counter;
 
 //============================= Servo Settings ==============================
 uint16_t servo_low_threshold = 1100; // anything below this point considered 0
@@ -614,10 +615,15 @@ void loadEEpromSettings()
       eepromBuffer.current_I = 0; // 0-255
       eepromBuffer.current_D = 100; // 0-255
       eepromBuffer.active_brake_power = 0; // 1-5 percent duty cycle
-      eepromBuffer.brake_on_zero_throttle = 0;
       eepromBuffer.reserved_eeprom_3[0] = 0; //14-16  for crsf input
       eepromBuffer.reserved_eeprom_3[1] = 0;
       eepromBuffer.reserved_eeprom_3[2] = 0;
+    }
+    if(eepromBuffer.eeprom_version < 4){ // byte 13 was reserved before version 4
+      eepromBuffer.brake_on_zero_throttle = 0;
+    }
+    if(eepromBuffer.brake_on_zero_throttle > 9){ // reject anything a config tool never wrote
+      eepromBuffer.brake_on_zero_throttle = 0;   // eg the 0x30 left by the old name string
     }
     // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above 
     if (eepromBuffer.advance_level > 42 || (eepromBuffer.advance_level < 10 && eepromBuffer.advance_level > 3)){
@@ -1495,33 +1501,71 @@ void tenKhzRoutine()
              duty_cycle = last_duty_cycle;
             }
 
+        // temp_comp_pwm is the effective setting: it follows the stored
+        // one except while the zero throttle brake is overriding it, so
+        // live changes over DroneCAN or dshot programming, and the
+        // rc_car_reverse override applied after loadEEpromSettings(),
+        // all take effect without a separate update at each writer
+        if (!zero_throttle_brake_active) {
+            temp_comp_pwm = eepromBuffer.comp_pwm;
+        }
+        if (brake_countdown > 0) { // seconds, counted here so it cannot
+            brake_tick_counter++;  // disturb the telemetry interval
+            if (brake_tick_counter >= LOOP_FREQUENCY_HZ) {
+                brake_tick_counter = 0;
+                brake_countdown--;
+            }
+        }
+
         if ((armed && running) && input > 47) {
           if(zero_throttle_brake_active){
             zero_throttle_brake_active = 0;
             temp_comp_pwm = eepromBuffer.comp_pwm;
-          }else{
-            adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000) + 1;
-        }
+          }
+          adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000) + 1;
         } else {
-          if(running && input < 47){ // brake on zero throttle behavior while motor is still rotating
+          // only for a validated opt-in setting: everything else must
+          // reach the brake on stop handling below exactly as before.
+          // prop_brake_active wins: bi_direction and rc_car_reverse
+          // drive input to zero while the rotor slows for a reversal,
+          // and that braking must not be intercepted here
+          if(running && input < 47 && eepromBuffer.brake_on_zero_throttle && !prop_brake_active){ // brake on zero throttle behavior while motor is still rotating
             if(eepromBuffer.brake_on_zero_throttle == 1){   // coast on 0 throttle
-              temp_comp_pwm = 0;                            // tracks rpm until stopped 
+              temp_comp_pwm = 0;                            // tracks rpm until stopped
               zero_throttle_brake_active = 1;
             }
-              if(eepromBuffer.brake_on_zero_throttle == 2){   // motor brake on 0 throttle    
+              if(eepromBuffer.brake_on_zero_throttle == 2){   // motor brake on 0 throttle
               temp_comp_pwm = 1;                             // tracks rpm until stopped
               zero_throttle_brake_active = 1;
             }
-              if((eepromBuffer.brake_on_zero_throttle > 2) && (eepromBuffer.brake_on_zero_throttle < 10)){   // brake on 0 throttle after 2 + x seconds
+              if(eepromBuffer.brake_on_zero_throttle > 2 && eepromBuffer.brake_on_zero_throttle < 10){   // hand over to brake on stop after 2 + x seconds
+              // bounded here too: dshot programming writes an eeprom
+              // byte live, without going through the load time clamp
               if(zero_throttle_brake_active == 0){
-                brake_countdown = eepromBuffer.brake_on_zero_throttle - 2;  // brake countdown decremented in 10khz routine
-                tenkhzcounter = 10000; 
+                brake_countdown = eepromBuffer.brake_on_zero_throttle - 2;
+                brake_tick_counter = 0;
               }
-              if((brake_countdown == 0) && (zero_throttle_brake_active == 1)){
-                zero_crosses = 0;                          // after countdown forces the brake on stop behavior 
+              temp_comp_pwm = 0;                           // coast for the delay, whatever comp_pwm is stored
+              if(brake_countdown == 0 && zero_throttle_brake_active){
+                // force the stop, with the same cleanup the bemf
+                // timeout path does, since clearing running here means
+                // that path will skip it. Unlike that path this can
+                // fire between a zero cross and the commutation it
+                // scheduled, so the com timer has to be stopped too or
+                // PeriodElapsedCallback() commutates once more after
+                // the stop
+                zero_throttle_brake_active = 0;
+                temp_comp_pwm = eepromBuffer.comp_pwm;
+                maskPhaseInterrupts();
+                DISABLE_COM_TIMER_INT();
+                old_routine = 1;
+                zero_crosses = 0;
                 running = 0;                               // stops tracking rpm
+                commutation_interval = 5000;
+                zcfoundroutine();
+              }else{
+                zero_throttle_brake_active = 1;
               }
-              zero_throttle_brake_active = 1;
               }
               adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000);
           } else{  // input less than 47 and not running, normal brake on stop behavior
@@ -2020,9 +2064,6 @@ if(zero_crosses < 5){
         if (tenkhzcounter > LOOP_FREQUENCY_HZ) { // 1s sample interval 10000
             consumed_current += (actual_current << 16) / 360;
             tenkhzcounter = 0;
-            if(brake_countdown > 0){
-              brake_countdown--;
-            }
         }
 
 #ifndef BRUSHED_MODE
@@ -2262,7 +2303,6 @@ if(zero_crosses < 5){
               zero_throttle_brake_active = 0;   // reset zero throttle brake on back emf timeout (rotation stop)
               if(running){
                 bemf_timeout_happened++;
-                
                 temp_comp_pwm = eepromBuffer.comp_pwm;
                 maskPhaseInterrupts();
                 old_routine = 1;

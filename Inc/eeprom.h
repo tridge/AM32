@@ -22,8 +22,10 @@ typedef union EEprom_u {
         uint8_t current_I; //10 0-255
         uint8_t current_D; //11 0-255
         uint8_t active_brake_power; //12  1-5 percent duty cycle
-        uint8_t brake_on_zero_throttle; // brake behavior when throttle is 0 but motor is still rotating
-        char reserved_eeprom_3[3]; //13-16  
+        uint8_t brake_on_zero_throttle; //13  behavior when throttle is 0 but motor is still rotating
+                                        //    0 off, 1 coast, 2 brake, 3-9 coast for (value - 2)
+                                        //    seconds then hand over to brake_on_stop
+        char reserved_eeprom_3[3]; //14-16
         uint8_t dir_reversed; // 17
         uint8_t bi_direction; // 18
         uint8_t use_sine_start; // 19
