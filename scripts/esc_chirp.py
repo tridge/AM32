@@ -31,6 +31,7 @@ frequency; amplitude is the robust comparison.
 import argparse
 import json
 import math
+import os
 import time
 
 import esc_measure
@@ -578,6 +579,107 @@ def fit_numbers(log, max_freq=None, raw=None, progress=None):
     }
 
 
+def phase_lag(path, nbins, max_freq, min_amp=0.05):
+    '''phase lag of rpm behind throttle demand vs frequency.
+
+    demod() returns the wrapped rpm-vs-drive phase per frequency bin;
+    lag is its negation, unwrapped so it keeps growing past 180 deg,
+    which is what makes the millisecond view meaningful. A pure
+    transport delay is flat in ms and rising in degrees; a single pole
+    tends to 90 deg with the ms falling as 1/f.'''
+    import numpy as np
+    rows, cfg, toff = load_rows(path)
+    pts = demod(rows, cfg, toff, nbins=nbins)
+    pts = [p for p in pts if not max_freq or p['freq'] <= max_freq]
+    if not pts:
+        return None
+    pts.sort(key=lambda p: p['freq'])
+    amp = np.array([p['rpm_amp'] for p in pts])
+    # once the rpm response sinks towards the telemetry noise floor the
+    # coherent phase is meaningless, and one bad bin derails the unwrap
+    # for every bin above it. Drop those before unwrapping.
+    keep = amp >= min_amp * amp.max()
+    pts = [p for p, k in zip(pts, keep) if k]
+    if len(pts) < 3:
+        return None
+    f = np.array([p['freq'] for p in pts])
+    wrapped = np.radians([p['phase'] for p in pts])
+    lag_deg = -np.degrees(np.unwrap(wrapped))
+    lag_ms = lag_deg / 360.0 * 1000.0 / f
+    gain = np.array([p['gain'] for p in pts])
+    # a constant transport/processing delay is a straight line in
+    # degrees against frequency; its slope is that delay
+    slope, icept = np.polyfit(f, lag_deg, 1)
+    return f, lag_deg, lag_ms, gain, slope / 360.0 * 1000.0, icept
+
+
+def cmd_phase(args):
+    import matplotlib
+    if args.save:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    logs = [(args.log, 'tab:blue', 'tab:orange')]
+    if args.compare:
+        logs.append((args.compare, 'tab:cyan', 'tab:red'))
+
+    fig, (ax_t, ax_p) = plt.subplots(2, 1, figsize=(12, 9))
+    ax_rpm = ax_t.twinx()
+    ax_ms = ax_p.twinx()
+
+    for path, c_thr, c_rpm in logs:
+        rows, cfg, toff = load_rows(path)
+        name = os.path.basename(path)
+        thr = [(r['ct'], cfg['mid'] + cfg['amp'] * r['out'])
+               for r in rows if r['type'] == 'chirp'
+               and 0 <= r['ct'] <= cfg['duration']]
+        rpm = [(r['t'] - toff, r['rpm']) for r in rows if r['type'] == 'status'
+               and 0 <= r['t'] - toff <= cfg['duration']]
+        ax_t.plot([t for t, _ in thr], [v for _, v in thr], lw=0.7,
+                  color=c_thr, label='throttle %s' % name)
+        ax_rpm.plot([t for t, _ in rpm], [v for _, v in rpm], lw=0.5,
+                    color=c_rpm, alpha=0.8, label='rpm %s' % name)
+
+        res = phase_lag(path, args.bins, args.max_freq, args.min_amp)
+        if res is None:
+            print('%s: no usable frequency bins' % name)
+            continue
+        f, lag_deg, lag_ms, gain, delay_ms, icept = res
+        ax_p.semilogx(f, lag_deg, 'o-', color=c_thr,
+                      label='lag deg %s (fit %.1f ms)' % (name, delay_ms))
+        ax_p.semilogx(f, icept + f * delay_ms * 0.360, ':', color=c_thr,
+                      alpha=0.5, lw=1)
+        ax_ms.semilogx(f, lag_ms, 's--', color=c_rpm, alpha=0.8,
+                       label='lag ms %s' % name)
+        print('%s: %u bins %.2f-%.1f Hz | lag %.0f-%.0f deg | %.1f-%.1f ms '
+              '| constant-delay fit %.1f ms (intercept %.0f deg)'
+              % (name, len(f), f[0], f[-1], lag_deg[0], lag_deg[-1],
+                 lag_ms.min(), lag_ms.max(), delay_ms, icept))
+
+    ax_t.set_xlabel('time (s)')
+    ax_t.set_ylabel('throttle demand')
+    ax_rpm.set_ylabel('rpm')
+    ax_t.grid(alpha=0.3)
+    h1, l1 = ax_t.get_legend_handles_labels()
+    h2, l2 = ax_rpm.get_legend_handles_labels()
+    ax_t.legend(h1 + h2, l1 + l2, fontsize=8, loc='upper left')
+
+    ax_p.set_xlabel('frequency (Hz)')
+    ax_p.set_ylabel('phase lag (degrees)')
+    ax_ms.set_ylabel('phase lag (ms)')
+    ax_p.grid(alpha=0.3, which='both')
+    h1, l1 = ax_p.get_legend_handles_labels()
+    h2, l2 = ax_ms.get_legend_handles_labels()
+    ax_p.legend(h1 + h2, l1 + l2, fontsize=8, loc='upper left')
+
+    fig.tight_layout()
+    if args.save:
+        fig.savefig(args.save, dpi=110)
+        print('wrote %s' % args.save)
+    else:
+        plt.show()
+
+
 def cmd_fit(args):
     try:
         import numpy as np
@@ -865,6 +967,18 @@ def main():
     p.add_argument('--raw', default=None,
                    help='SITL --physics-log file: use its raw rpm instead of telemetry')
 
+    p = sub.add_parser('phase')
+    p.add_argument('log')
+    p.add_argument('--compare', default=None)
+    p.add_argument('--save', default=None, help='write a png instead of showing a window')
+    p.add_argument('--max-freq', type=float, default=None,
+                   help='ignore data above this frequency')
+    p.add_argument('--bins', type=int, default=40,
+                   help='log-spaced frequency bins (more helps phase unwrapping)')
+    p.add_argument('--min-amp', type=float, default=0.05,
+                   help='drop bins whose rpm amplitude is below this fraction '
+                        'of the peak (their phase is noise)')
+
     p = sub.add_parser('fit')
     p.add_argument('log')
     p.add_argument('--plot', default=None, help='write an envelope/fit png')
@@ -878,6 +992,8 @@ def main():
         cmd_run(args)
     elif args.cmd == 'plot':
         cmd_plot(args)
+    elif args.cmd == 'phase':
+        cmd_phase(args)
     elif args.cmd == 'fit':
         cmd_fit(args)
     else:
