@@ -15,18 +15,21 @@ through the real comparator. The firmware's own measured
 timing it derives and the motor it derives it from check out
 independently.
 
-Two targets run, one per F051 hardware group:
+**Any of the 52 F051 targets works**, with no per-target file to write -
+the platform is generated from `Inc/targets.h` on demand. They cover 8
+distinct hardware configurations, differing in capture timer, DMA
+channel, throttle pin, comparator map and bridge pin map. Five have been
+run end to end, one per configuration reachable with a built ELF:
 
-| target | group | capture | throttle pin | comparator A/B/C |
+| target | capture | throttle | comparator A/B/C | phase A high |
 |---|---|---|---|---|
-| `FD6288_F051` | `F0_A` | TIM15 + DMA1 ch5 | PA2 | PA5 / PA4 / PA0 |
-| `ARK_4IN1_F051` | `F0_B` | TIM3 + DMA1 ch4 | PB4 | PA0 / PA4 / PA5 |
+| `FD6288_F051` | TIM15 + ch5 | PA2 | PA5 / PA4 / PA0 | PA10 |
+| `ARK_4IN1_F051` | TIM3 + ch4 | PB4 | PA0 / PA4 / PA5 | PA10 |
+| `RAZOR32_F051` | TIM15 + ch5 | PA2 | PA4 / PA5 / PA0 | PA9 |
+| `DIATONE_F051` | TIM3 + ch4 | PB4 | PA5 / PA0 / PA4 | PA10 |
+| `PB054_F051` | TIM3 + ch4 | PB4 | PA0 / PA5 / PA4 | PA10 |
 
-Both arm and spin. ARK passed on its first run with no model changes,
-which is the useful signal: the second hardware group exercises a
-different capture timer, a different DMA channel, a different input pin
-and a swapped comparator map, and the peripheral models needed nothing
-target specific beyond what the overlay states.
+All five arm and spin, and none needed a change to any peripheral model.
 
 Calibration and sweep work stays in the SITL, on speed grounds - see
 below.
@@ -36,50 +39,79 @@ below.
 Renode is not vendored; install it into the gitignored `tools/` tree the
 same way the ARM toolchain is installed, then:
 
-    renode --disable-xwt --console \
-      -e "\$repo=@/path/to/repo; \$elf=@/path/to/repo/obj/AM32_FD6288_F051_2.20.elf; include @/path/to/repo/Mcu/Renode/scripts/targets/FD6288_F051.resc"
+Renode is not vendored; install it into the gitignored `tools/` tree the
+same way the ARM toolchain is installed. Then, for any F051 target:
 
-Paths must be absolute: the harness runs from a scratch directory, as
-the SITL suite does.
+    python3 Mcu/Renode/gen_target.py FD6288_F051 --run
 
-The test runner takes `--target`, defaulting to `FD6288_F051`, and picks
-the matching ELF out of `obj/`:
+That generates the platform and drops you in the Renode monitor. Add
+`--exec` to script it instead of sitting at the prompt, `--eeprom` to
+supply a settings image, `--list` to see what can be emulated.
+
+The test runner takes the same `--target` and picks the matching ELF out
+of `obj/`:
 
     python3 Mcu/Renode/run_renode_tests.py --target ARK_4IN1_F051
 
+Paths must be absolute if you drive Renode directly: the harness runs
+from a scratch directory, as the SITL suite does.
+
 ## What is here
 
+    gen_target.py                   builds a platform for any F051 target out
+                                    of Inc/targets.h
     platforms/stm32f051_base.repl   MCU-common. Vendored from Renode's
                                     platforms/cpus/stm32f0.repl (Antmicro, MIT -
                                     header retained) and edited
-    platforms/targets/*.repl        per-target overlay: capture timer, DMA
-                                    channel, comparator phase map, throttle pin
     peripherals/stm32/              our peripheral models, GPL-3, loaded at
                                     runtime with `include @...cs`; no Renode
                                     rebuild needed
-    scripts/targets/*.resc          entry point, one per target
-    scripts/am32_f051.resc          the part they share
+    scripts/am32_f051.resc          shared by every generated target script
 
-### Per-target overlays
+### Adding a target
 
-A target overlay `using`s the base and adds what differs. It may only
-**add**: redeclaring a name the base already has fails with "Variable
-'x' was already declared". That single rule decides the split, because
-TIM3 and TIM15 swap roles between hardware groups - `HARDWARE_GROUP_F0_A`
-captures the throttle on TIM15 and leaves TIM3 general purpose, `F0_B`
-does the reverse. Neither can be given a default in the base, so the
-base declares neither and each overlay declares both.
+Nothing to add. `gen_target.py` reads the target out of `Inc/targets.h`
+and writes the `.repl` and `.resc` into `obj/renode/`; the test harness
+generates into its own scratch directory. If a target builds, it should
+emulate.
 
-The comparator phase map is a constructor parameter for the same reason.
-`COMP->CSR[6:4]` selects PA4, PA5 or PA0, but which is phase A, B or C
-differs per group (`PHASE_x_COMP` in `Inc/targets.h`). A wrong map is
-silent - the firmware commutates against the wrong phase and simply runs
-badly - so it is stated per target rather than defaulted.
+**`targets.h` is not parsed - it is preprocessed.** It is nested
+`#ifdef` several levels deep with `#ifndef` fallbacks at the end, so a
+parser here would drift from what the compiler actually sees. Instead
+the real preprocessor runs over a stub that defines the target and the
+resolved macros are read back with `-dM`. That costs ~66ms, which is
+what makes generating on demand better than checking 52 platform files
+into the tree and letting them rot.
+
+Generating rather than hand-writing also removes a class of silent
+error, because three things vary per target and **none of them fail
+loudly when wrong**:
+
+- the **comparator map**. `COMP->CSR[6:4]` selects PA4, PA5 or PA0, but
+  which is phase A, B or C differs per target - six permutations across
+  the F051 range. Wrong, and the firmware commutates against the wrong
+  phase and merely runs badly.
+- the **bridge pin map**. Most targets put phase A on PA10/PB1, but a
+  third of them rotate the phases across the same six pins.
+- the **capture timer and DMA channel**, TIM15 + channel 5 or TIM3 +
+  channel 4.
+
+### How a generated overlay fits the base
+
+It `using`s the base and adds what differs. It may only **add**:
+redeclaring a name the base already has fails with "Variable 'x' was
+already declared". That rule decides what the base can contain, because
+TIM3 and TIM15 swap roles between hardware groups - one captures the
+throttle while the other stays general purpose. Neither can have a
+default in the base, so the base declares neither and the overlay
+declares both. The comparator and the bridge are absent from the base
+for the same reason: their maps are required constructor arguments, and
+a default would be silently wrong for the targets that differ.
 
 The target name cannot be turned into a platform path inside a `.resc`:
 the monitor expands a path variable at the start of a path but leaves a
-second one later in the same path as a literal. Hence one small `.resc`
-per target that sets `$platform` and includes the common script.
+second one later in the same path as a literal, with no error. Hence a
+generated `.resc` per target that sets `$platform` outright.
 
 ### Why the platform file is vendored rather than included
 
