@@ -34,7 +34,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class AM32_STM32F0_SysCfgComp : IDoubleWordPeripheral, IKnownSize,
-                                           INumberedGPIOOutput
+                                           INumberedGPIOOutput, IAM32Comparator
     {
         // phaseXInmsel is the CSR[6:4] code the target's PHASE_X_COMP
         // selects; see Inc/targets.h COMP_PA0/PA4/PA5.

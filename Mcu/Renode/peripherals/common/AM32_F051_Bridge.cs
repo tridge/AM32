@@ -48,16 +48,46 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AM32_F051_Bridge : IDoubleWordPeripheral, IKnownSize
     {
         // gpio bases default to the F0 map; the G0 puts its ports at
-        // 0x50000000 instead, so the platform states them there
+        // 0x50000000 instead, so the platform states them there.
+        //
+        // On an "enable" topology target the two pins per phase are the
+        // gate driver's PWM and ENABLE rather than a high and low side;
+        // see PhaseMode for what each combination means. The pins are
+        // still passed as High (=PWM) and Low (=ENABLE) so the platform
+        // shape is the same either way.
         public AM32_F051_Bridge(IMachine machine, string phaseAHigh, string phaseALow,
                                 string phaseBHigh, string phaseBLow,
                                 string phaseCHigh, string phaseCLow, uint batchUs = 2,
-                                ulong gpioABase = 0x48000000, ulong gpioBBase = 0x48000400)
+                                ulong gpioABase = 0x48000000, ulong gpioBBase = 0x48000400,
+                                ulong gpioCBase = 0x48000800,
+                                uint timerHz = 48000000,
+                                bool invertedLow = false, bool invertedHigh = false,
+                                string topology = "highlow")
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
-            this.gpioABase = gpioABase;
-            this.gpioBBase = gpioBBase;
+            gpioBase = new[] { gpioABase, gpioBBase, gpioCBase };
+            this.invertedLow = invertedLow;
+            // no AM32 target defines USE_INVERTED_HIGH today, so rather
+            // than model it untested, refuse loudly if one appears
+            if(invertedHigh)
+            {
+                throw new RecoverableException(
+                    "USE_INVERTED_HIGH is not modelled by the bridge");
+            }
+            if(topology != "highlow" && topology != "enable")
+            {
+                throw new RecoverableException(string.Format(
+                    "topology '{0}' is not 'highlow' or 'enable'", topology));
+            }
+            enableBridge = topology == "enable";
+            if(timerHz == 0)
+            {
+                throw new RecoverableException("timerHz must not be zero");
+            }
+            // one TIM1 tick in picoseconds: 20833 at 48MHz on the F0,
+            // 15625 at 64MHz on the G0
+            tickPs = (uint)(1000000000000ul / timerHz);
 
             phases = new[]
             {
@@ -101,7 +131,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     throw new RecoverableException("set LibraryPath before ConfigPath");
                 }
-                am32sim_init(value ?? "");
+                configPath = value ?? "";
+                am32sim_init(configPath);
                 started = true;
                 batch.Enabled = true;
             }
@@ -179,10 +210,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return i[phase];
         }
 
+        // A machine reset must put the motor back at standstill and keep
+        // driving it, not switch the physics off: the firmware reboots
+        // itself on signal loss while armed, and a bridge that stayed
+        // dead after that would report a frozen rotor and zero sensors
+        // for the rest of the run.
         public void Reset()
         {
             batch.Enabled = false;
             started = false;
+            timer = null;
+            comp = null;
+            if(loaded && configPath != null)
+            {
+                am32sim_init(configPath);
+                started = true;
+                batch.Enabled = true;
+            }
         }
 
         private void Tick()
@@ -194,7 +238,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(timer == null)
             {
                 timer = machine.GetPeripheralsOfType<AM32_STM32_AdvancedTimer>().FirstOrDefault();
-                comp = machine.GetPeripheralsOfType<AM32_STM32F0_SysCfgComp>().FirstOrDefault();
+                comp = machine.GetPeripheralsOfType<IAM32Comparator>().FirstOrDefault();
                 if(timer == null || comp == null)
                 {
                     this.Log(LogLevel.Error, "no TIM1 or COMP in the platform; bridge disabled");
@@ -203,10 +247,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            var moderA = machine.SystemBus.ReadDoubleWord(gpioABase);
-            var odrA = machine.SystemBus.ReadDoubleWord(gpioABase + OdrOffset);
-            var moderB = machine.SystemBus.ReadDoubleWord(gpioBBase);
-            var odrB = machine.SystemBus.ReadDoubleWord(gpioBBase + OdrOffset);
+            for(var i = 0; i < 3; i++)
+            {
+                moder[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i]);
+                odr[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + OdrOffset);
+            }
 
             var moe = timer.MainOutputEnabled;
             var mode = new int[3];
@@ -214,19 +259,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             for(var p = 0; p < 3; p++)
             {
                 var ph = phases[p];
-                var moderHi = ph.HighOnPortA ? moderA : moderB;
-                var odrHi = ph.HighOnPortA ? odrA : odrB;
-                var moderLo = ph.LowOnPortA ? moderA : moderB;
-                var odrLo = ph.LowOnPortA ? odrA : odrB;
-                mode[p] = PhaseMode(moe, moderHi, odrHi, ph.HighPin,
-                                    moderLo, odrLo, ph.LowPin);
-                ccr[p] = machine.SystemBus.ReadDoubleWord(Tim1Base + ph.CcrOffset);
+                mode[p] = PhaseMode(moe, moder[ph.HighPort], odr[ph.HighPort], ph.HighPin,
+                                    moder[ph.LowPort], odr[ph.LowPort], ph.LowPin);
+                // the shadow, not the register: see ActiveCcr
+                ccr[p] = timer.ActiveCcr(ph.CcrChannel);
             }
             am32sim_set_bridge(mode[0], mode[1], mode[2]);
 
-            var arr = machine.SystemBus.ReadDoubleWord(Tim1Base + 0x2C);
+            var arr = timer.ActiveArr;
+            // PSC is preloaded too, but AM32 writes it once at init and
+            // never again, so the register and the shadow agree
             var psc = machine.SystemBus.ReadDoubleWord(Tim1Base + 0x28);
-            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2], (psc + 1) * TickPs,
+            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2], (psc + 1) * tickPs,
                              timer.DeadTimeNs);
 
             var sensed = comp.SensedPhase;
@@ -247,43 +291,49 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public Phase(string high, string low)
             {
-                Decode(high, out HighOnPortA, out HighPin);
-                Decode(low, out LowOnPortA, out LowPin);
-                // TIM1_CH1 is PA8, CH2 is PA9, CH3 is PA10
-                if(!HighOnPortA || HighPin < 8 || HighPin > 10)
+                Decode(high, out HighPort, out HighPin);
+                Decode(low, out LowPort, out LowPin);
+                // TIM1_CH1 is PA8, CH2 is PA9, CH3 is PA10. AM32 turns on
+                // the G0's PA11/PA12 remap, which carries PA9 and PA10
+                // out on those pads, so a target naming PA11 or PA12
+                // means channel 2 or 3.
+                var channelPin = HighPin == 11 ? 9 : (HighPin == 12 ? 10 : HighPin);
+                if(HighPort != 0 || channelPin < 8 || channelPin > 10)
                 {
                     throw new RecoverableException(string.Format(
-                        "phase high side '{0}' is not a TIM1 output; expected PA8, PA9 or PA10",
-                        high));
+                        "phase high side '{0}' is not a TIM1 output; expected PA8, "
+                        + "PA9, PA10, or PA11/PA12 under the remap", high));
                 }
-                CcrOffset = Tim1Ccr1 + 4ul * (ulong)(HighPin - 8);
+                CcrChannel = channelPin - 8;
             }
 
-            private static void Decode(string pin, out bool onPortA, out int number)
+            private static void Decode(string pin, out int port, out int number)
             {
                 var n = 0;
                 if(pin == null || pin.Length < 3 || pin[0] != 'P'
-                   || (pin[1] != 'A' && pin[1] != 'B')
+                   || pin[1] < 'A' || pin[1] > 'C'
                    || !int.TryParse(pin.Substring(2), out n) || n < 0 || n > 15)
                 {
                     throw new RecoverableException(string.Format(
-                        "'{0}' is not a pin name like PA10 or PB1", pin));
+                        "'{0}' is not a pin name like PA10, PB1 or PC6", pin));
                 }
-                onPortA = pin[1] == 'A';
+                port = pin[1] - 'A';
                 number = n;
             }
 
-            public readonly bool HighOnPortA;
+            // 0=A 1=B 2=C
+            public readonly int HighPort;
             public readonly int HighPin;
-            public readonly bool LowOnPortA;
+            public readonly int LowPort;
             public readonly int LowPin;
-            public readonly ulong CcrOffset;
+            // 0, 1 or 2 for TIM1_CH1..CH3
+            public readonly int CcrChannel;
         }
 
         // SITL_PHASE_*: 0 float, 1 low, 2 pwm, 3 pwm without
         // complementary, 4 proportional brake
-        private static int PhaseMode(bool moe, uint moderHi, uint odrHi, int pinHi,
-                                     uint moderLo, uint odrLo, int pinLo)
+        private int PhaseMode(bool moe, uint moderHi, uint odrHi, int pinHi,
+                              uint moderLo, uint odrLo, int pinLo)
         {
             if(!moe)
             {
@@ -291,6 +341,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             var hi = (moderHi >> (2 * pinHi)) & 3;
             var lo = (moderLo >> (2 * pinLo)) & 3;
+
+            if(enableBridge)
+            {
+                // gate driver with one PWM in and one enable: "low" is
+                // the enable pin. Enable off floats the phase whatever
+                // the PWM pin is doing; enable on with the PWM pin still
+                // a plain output means it is held low.
+                if(((odrLo >> pinLo) & 1) == 0)
+                {
+                    return 0;
+                }
+                return hi == ModeAlternate ? 2 : 1;
+            }
+
             if(hi == ModeAlternate)
             {
                 return lo == ModeAlternate ? 2 : 3;
@@ -300,15 +364,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // high side held off, low side switching: proportionalBrake()
                 return 4;
             }
-            return ((odrLo >> pinLo) & 1) != 0 ? 1 : 0;
+            // USE_INVERTED_LOW targets turn the low FET on by writing BRR,
+            // so ODR low means on; see phaseouts.c LOW_BITREG_ON
+            var lowOn = ((odrLo >> pinLo) & 1) != 0;
+            if(invertedLow)
+            {
+                lowOn = !lowOn;
+            }
+            if(!lowOn)
+            {
+                return 0;
+            }
+            // with an inverted high side the "off" write is BSRR, so a
+            // high ODR on the high pin is still off; only a driven low
+            // side counts as phase low either way
+            return 1;
         }
 
         private const uint ModeAlternate = 2;
         private const ulong OdrOffset = 0x14;
         private const ulong Tim1Base = 0x40012C00;
-        private const ulong Tim1Ccr1 = 0x34;
-        // one 48MHz tick in picoseconds
-        private const uint TickPs = 20833;
 
         private const int RtldNow = 2;
         private const int RtldGlobal = 0x100;
@@ -338,12 +413,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly Phase[] phases;
-        private readonly ulong gpioABase;
-        private readonly ulong gpioBBase;
+        private readonly ulong[] gpioBase;
+        private readonly uint[] moder = new uint[3];
+        private readonly uint[] odr = new uint[3];
+        private readonly bool invertedLow;
+        private readonly bool enableBridge;
         private readonly uint batchUs;
+        private readonly uint tickPs;
         private readonly LimitTimer batch;
         private AM32_STM32_AdvancedTimer timer;
-        private AM32_STM32F0_SysCfgComp comp;
+        private IAM32Comparator comp;
+        private string configPath;
         private bool loaded;
         private bool started;
     }
