@@ -47,12 +47,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     //   0x00  motor rpm, mechanical, read only
     public class AM32_F051_Bridge : IDoubleWordPeripheral, IKnownSize
     {
+        // gpio bases default to the F0 map; the G0 puts its ports at
+        // 0x50000000 instead, so the platform states them there
         public AM32_F051_Bridge(IMachine machine, string phaseAHigh, string phaseALow,
                                 string phaseBHigh, string phaseBLow,
-                                string phaseCHigh, string phaseCLow, uint batchUs = 2)
+                                string phaseCHigh, string phaseCLow, uint batchUs = 2,
+                                ulong gpioABase = 0x48000000, ulong gpioBBase = 0x48000400)
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
+            this.gpioABase = gpioABase;
+            this.gpioBBase = gpioBBase;
 
             phases = new[]
             {
@@ -198,10 +203,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            var moderA = machine.SystemBus.ReadDoubleWord(GpioABase);
-            var odrA = machine.SystemBus.ReadDoubleWord(GpioABase + OdrOffset);
-            var moderB = machine.SystemBus.ReadDoubleWord(GpioBBase);
-            var odrB = machine.SystemBus.ReadDoubleWord(GpioBBase + OdrOffset);
+            var moderA = machine.SystemBus.ReadDoubleWord(gpioABase);
+            var odrA = machine.SystemBus.ReadDoubleWord(gpioABase + OdrOffset);
+            var moderB = machine.SystemBus.ReadDoubleWord(gpioBBase);
+            var odrB = machine.SystemBus.ReadDoubleWord(gpioBBase + OdrOffset);
 
             var moe = timer.MainOutputEnabled;
             var mode = new int[3];
@@ -209,10 +214,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             for(var p = 0; p < 3; p++)
             {
                 var ph = phases[p];
-                var moderHi = ph.HighPort == GpioABase ? moderA : moderB;
-                var odrHi = ph.HighPort == GpioABase ? odrA : odrB;
-                var moderLo = ph.LowPort == GpioABase ? moderA : moderB;
-                var odrLo = ph.LowPort == GpioABase ? odrA : odrB;
+                var moderHi = ph.HighOnPortA ? moderA : moderB;
+                var odrHi = ph.HighOnPortA ? odrA : odrB;
+                var moderLo = ph.LowOnPortA ? moderA : moderB;
+                var odrLo = ph.LowOnPortA ? odrA : odrB;
                 mode[p] = PhaseMode(moe, moderHi, odrHi, ph.HighPin,
                                     moderLo, odrLo, ph.LowPin);
                 ccr[p] = machine.SystemBus.ReadDoubleWord(Tim1Base + ph.CcrOffset);
@@ -242,10 +247,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public Phase(string high, string low)
             {
-                Decode(high, out HighPort, out HighPin);
-                Decode(low, out LowPort, out LowPin);
+                Decode(high, out HighOnPortA, out HighPin);
+                Decode(low, out LowOnPortA, out LowPin);
                 // TIM1_CH1 is PA8, CH2 is PA9, CH3 is PA10
-                if(HighPort != GpioABase || HighPin < 8 || HighPin > 10)
+                if(!HighOnPortA || HighPin < 8 || HighPin > 10)
                 {
                     throw new RecoverableException(string.Format(
                         "phase high side '{0}' is not a TIM1 output; expected PA8, PA9 or PA10",
@@ -254,7 +259,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 CcrOffset = Tim1Ccr1 + 4ul * (ulong)(HighPin - 8);
             }
 
-            private static void Decode(string pin, out ulong port, out int number)
+            private static void Decode(string pin, out bool onPortA, out int number)
             {
                 var n = 0;
                 if(pin == null || pin.Length < 3 || pin[0] != 'P'
@@ -264,13 +269,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     throw new RecoverableException(string.Format(
                         "'{0}' is not a pin name like PA10 or PB1", pin));
                 }
-                port = pin[1] == 'A' ? GpioABase : GpioBBase;
+                onPortA = pin[1] == 'A';
                 number = n;
             }
 
-            public readonly ulong HighPort;
+            public readonly bool HighOnPortA;
             public readonly int HighPin;
-            public readonly ulong LowPort;
+            public readonly bool LowOnPortA;
             public readonly int LowPin;
             public readonly ulong CcrOffset;
         }
@@ -299,8 +304,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private const uint ModeAlternate = 2;
-        private const ulong GpioABase = 0x48000000;
-        private const ulong GpioBBase = 0x48000400;
         private const ulong OdrOffset = 0x14;
         private const ulong Tim1Base = 0x40012C00;
         private const ulong Tim1Ccr1 = 0x34;
@@ -335,6 +338,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly Phase[] phases;
+        private readonly ulong gpioABase;
+        private readonly ulong gpioBBase;
         private readonly uint batchUs;
         private readonly LimitTimer batch;
         private AM32_STM32_AdvancedTimer timer;
