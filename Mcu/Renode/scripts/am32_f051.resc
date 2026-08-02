@@ -21,6 +21,10 @@ $elf?=@none
 $eeprom?=@none
 $platform?=@none
 
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_RCC.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
@@ -44,7 +48,8 @@ sysbus LoadELF $elf
 # 0xFF diverts playStartupTune() into playBlueJayTune(), and a zeroed
 # settings block sends loadEEpromSettings() down the migration path with
 # motor_poles = 0. Generate with Mcu/SITL/sitl_params.py build_image().
-sysbus LoadBinary $eeprom 0x08007C00
+$eeprom_addr?=0x08007C00
+sysbus LoadBinary $eeprom $eeprom_addr
 
 # Factory temperature calibration. Renode zero-fills the system memory
 # page, and __LL_ADC_CALC_TEMPERATURE divides by (TS_CAL2 - TS_CAL1), so

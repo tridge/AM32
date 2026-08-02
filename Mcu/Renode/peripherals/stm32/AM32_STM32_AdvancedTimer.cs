@@ -125,6 +125,20 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public bool MainOutputEnabled => (regs[BDTR / 4] & MOE) != 0;
 
+        // The period and compare values the hardware is actually
+        // counting against, which with ARPE/OCxPE set are not what a
+        // read of ARR or CCRx returns - those give the preload the
+        // firmware wrote, which takes effect at the next update event.
+        // The motor model has to use these or it sees a duty change a
+        // PWM period before the bridge really makes it.
+        public uint ActiveArr => arrShadow;
+
+        public uint ActiveCcr(int channel)
+        {
+            return (channel >= 0 && channel < ccrShadow.Length)
+                ? ccrShadow[channel] : 0;
+        }
+
         // BDTR.DTG, decoded per RM0091 and scaled by the CR1.CKD
         // prescale. AM32 sets this from the per-target DEAD_TIME, and
         // the motor model needs it in nanoseconds to open both fets
