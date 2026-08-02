@@ -235,9 +235,14 @@ sysbus:
 
 // ---- F051 specifics ----------------------------------------------
 // 32K flash / 8K SRAM. The app links at 0x08001000, above a 4K
-// bootloader. Flash is aliased at 0 because checkDeviceInfo() reads a
-// devinfo record at 0x00000FE0 through that alias, and because the
-// real bootloader boots from there.
+// bootloader region that is left empty - no bootloader is loaded, and
+// the CPU is pointed straight at the app vector table instead.
+//
+// flashAlias is NOT an alias: it is a second, independent backing store
+// at 0. Reads there see zeros, not flash. That is why checkDeviceInfo()
+// finds no devinfo record at 0x00000FE0 - correct while no bootloader
+// exists, but correct by accident. Making it a real alias means
+// registering the one memory at both addresses.
 flash: Memory.MappedMemory @ sysbus 0x08000000
     size: 0x8000
 
