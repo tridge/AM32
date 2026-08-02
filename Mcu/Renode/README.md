@@ -58,24 +58,35 @@ replacing the RCC means owning the whole file. Changes made:
   script context) as soon as the firmware programs it. A real model is
   needed for the throttle input path.
 
-## Why no motor
+## Speed, and what it means for the motor
 
-Measured on this tree, not estimated:
+Measured on this tree, not estimated, with the `delayMillis` skip hook
+active:
 
-| | |
+| phase | cost |
 |---|---|
-| Renode running F051 firmware | **17.9 s wall per simulated second** (0.056x real time), plus ~4 s startup |
-| host SITL, same machine | ~1.4x real time |
+| boot and startup tune | 4.2x slower than real time |
+| armed, zero throttle | 7.5x |
+| armed, throttled, stepping for BEMF | 9.2x |
+| host SITL, same machine | ~1.4x **faster** than real time |
 
-Boot to armed needs roughly 1.6 s of simulated time, so about 33 s wall
-— fine. A 60 s chirp would take 18 minutes and the full calibration
-suite would take days, before adding any physics. The SITL's motor model
-runs 2 M steps per simulated second and already dominates its own
-runtime; putting that on top of a 0.056x core is not viable.
+The stepping figure understates a real spin: stuck-rotor protection has
+already latched and zeroed `input`, so the bridge is not being driven
+continuously. Expect worse once the comparator closes the loop.
 
-So the motor stays in the SITL. This harness covers what the SITL
-structurally cannot: the real register code, and bit-reproducible
-timing.
+That rules out calibration work here — a 60 s chirp would take about 9
+minutes and the full suite days — but it does not rule out a motor.
+Spinning one is worth it for what the SITL structurally cannot reach:
+the real `phaseouts.c` and `comparator.c` register code driving real
+physics. Calibration and sweeps stay in the SITL.
+
+The physics will be **DllImported from `Mcu/SITL/sim/motor.c`, not
+ported to C#**. `motor.c` was substantially rewritten recently, so a
+fork would diverge on the next recalibration and leave two models with
+no ground truth. Its physics core needs only `sitl_phase_mode[3]` and
+the gate states; nearly every `extern` reference to a firmware global
+sits in the logging functions, which can be stubbed or fed from
+emulated SRAM.
 
 ## Bring-up findings
 
