@@ -154,7 +154,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private const uint Comp1En = 1u << 0;
         private const uint Comp1Out = 1u << 14;
-        private const uint Comp1Pol = 1u << 15;
+        // COMP1POL is bit 11; bit 15 is COMP1LOCK. AM32 sets neither, but
+        // calling the lock bit polarity would invert BEMF sensing.
+        private const uint Comp1Pol = 1u << 11;
 
         private const int Comp1Line = 0;
         private const int Comp2Line = 1;
