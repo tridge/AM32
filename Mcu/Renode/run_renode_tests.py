@@ -49,6 +49,22 @@ def skip(reason):
     sys.exit(77)
 
 
+# Targets that cannot pass the spin assertions for a firmware reason, not
+# an emulator gap. Skipped rather than left failing so a red sweep still
+# means something.
+UNSPINNABLE = {
+    'DT160_64K_G071':
+        'DEAD_TIME 210 is the only value in either family past 127, where '
+        'the BDTR.DTG encoding stops being linear: (32+18)*8 = 400 ticks, '
+        '6.25us at 64MHz. That is the whole startup ramp duty at ARR 2665, '
+        'so no phase ever drives. Upstream (Alka) confirms the target is '
+        'for slot car ESCs, which only run at 100% throttle. Full throttle '
+        'does not rescue it here, measured: the ramp duty is fixed before '
+        'commanded throttle applies, so 2000us and 1300us give byte '
+        'identical rpm and rotor angle.',
+}
+
+
 def symbols(elf, nm):
     '''address and size for every symbol, so a byte is read as a byte.
        desync_happened is uint8_t here but uint32_t under
@@ -228,6 +244,8 @@ def main():
     ap.add_argument('--edt', action='store_true',
                     help='enable extended dshot telemetry; implies --bdshot')
     args = ap.parse_args()
+    if args.target in UNSPINNABLE:
+        skip('%s: %s' % (args.target, UNSPINNABLE[args.target]))
     if args.edt:
         args.bdshot = True
     if args.bdshot and not args.dshot:

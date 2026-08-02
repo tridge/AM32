@@ -43,7 +43,7 @@ the port:
   `INMSEL` at [7:4] rather than three at [6:4]. `N_VARIANT` targets move
   between COMP1 and COMP2 per commutation step.
 
-### One target does not spin
+### One target is skipped
 
 `DT160_64K_G071` arms but cannot start the test motor. It is not a gap
 in the emulation: it differs from `DT120_64K_G071` in **exactly one
@@ -56,8 +56,22 @@ identical. Diff the two with `gen_target.py` and see.
 `(32 + DTG[4:0]) x 8` ticks, so 210 asks for **400 ticks = 6.25us** at
 64 MHz, not the 3.28us a linear reading would suggest. With `ARR` 2665
 (24 kHz) the firmware's startup duty of 400 ticks is exactly the dead
-time, so the phase never drives at all. Whether that is intended for a
-160 A ESC is a firmware question, not an emulator one.
+time, so the phase never drives at all.
+
+Upstream confirms the intent: the target was for **slot car ESCs, which
+only run at 100% throttle**, where "at low throttle dead time will
+exceed duty cycle except at very low pwm frequencies". So it is not a
+firmware defect either - the sweep was asserting a partial throttle spin
+the target was never meant to do.
+
+Testing it at full throttle does not rescue it, which is worth knowing
+before anyone tries: 2000us and 1300us give **byte identical** rpm and
+rotor angle, because AM32 always begins with a fixed low duty startup
+ramp and never reaches `running`, so the commanded throttle is never
+applied. The failure happens before throttle matters.
+
+`run_renode_tests.py` therefore skips it by name, with the reason in
+`UNSPINNABLE`, so a red sweep still means something.
 
 ### Input protocols
 
