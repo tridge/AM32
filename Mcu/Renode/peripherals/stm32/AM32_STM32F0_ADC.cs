@@ -1,0 +1,285 @@
+//
+// STM32F0 ADC, driven from the motor physics.
+//
+// Renode's stock Analog.STM32F0_ADC gets the calibrate and enable
+// handshake right, which is all the boot needed, but it has no DMA
+// output at all - no GPIO connections, nothing to request a transfer.
+// AM32 reads its conversions exclusively through DMA1 channel 1 into
+// ADCDataDMA[] (Mcu/f051/Src/ADC.c), so against the stock model that
+// buffer stays zero and the firmware sees no battery voltage or
+// current. Worse, the platform also asked the stock model to self
+// trigger at 1kHz, which AM32 does not use - it starts conversions in
+// software from the 1kHz loop - so sequences piled up and logged
+// "Issued a start event before the last sequence finished" forever.
+//
+// This model converts on ADSTART, walks the channels selected in
+// CHSELR in ascending order as SCANDIR=0 requires, and raises a DMA
+// request per conversion, so the firmware's real DMA path runs.
+//
+// Sample values come from Mcu/SITL/sim/motor.c through the bridge, and
+// are converted to raw counts by inverting main.c's arithmetic - the
+// same inversion Mcu/SITL/Src/ADC.c does for the SITL, kept in step
+// with it deliberately.
+//
+using Antmicro.Renode.Core;
+using Antmicro.Renode.Core.Structure;
+using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Antmicro.Renode.Peripherals.Analog
+{
+    [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
+    public class AM32_STM32F0_ADC : IDoubleWordPeripheral, IKnownSize,
+                                    INumberedGPIOOutput
+    {
+        // channels and scaling are per target, out of Inc/targets.h:
+        // VOLTAGE_ADC_CHANNEL, CURRENT_ADC_CHANNEL,
+        // TARGET_VOLTAGE_DIVIDER, MILLIVOLT_PER_AMP, CURRENT_OFFSET.
+        public AM32_STM32F0_ADC(IMachine machine, int voltageChannel,
+                                int currentChannel, int voltageDivider,
+                                int millivoltPerAmp, int currentOffsetMv)
+        {
+            this.machine = machine;
+            this.voltageChannel = voltageChannel;
+            this.currentChannel = currentChannel;
+            this.voltageDivider = voltageDivider;
+            this.millivoltPerAmp = millivoltPerAmp;
+            this.currentOffsetMv = currentOffsetMv;
+            if(voltageDivider <= 0)
+            {
+                throw new RecoverableException("voltageDivider must be positive");
+            }
+
+            var conns = new Dictionary<int, IGPIO>();
+            conns[DmaRequestLine] = new GPIO();
+            conns[IrqLine] = new GPIO();
+            Connections = conns;
+            Reset();
+        }
+
+        public long Size => 0x400;
+        public IReadOnlyDictionary<int, IGPIO> Connections { get; private set; }
+
+        public void Reset()
+        {
+            isr = 0;
+            ier = 0;
+            cr = 0;
+            cfgr1 = 0;
+            cfgr2 = 0;
+            chselr = 0;
+            ccr = 0;
+            dr = 0;
+            Conversions = 0;
+        }
+
+        public ulong Conversions { get; private set; }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            switch(offset)
+            {
+            case ISR: return isr;
+            case IER: return ier;
+            // ADCAL and ADSTART self clear here: the calibration and
+            // enable loops in Mcu/f051/Src/ADC.c poll them
+            case CR: return cr;
+            case CFGR1: return cfgr1;
+            case CFGR2: return cfgr2;
+            case CHSELR: return chselr;
+            case CCR: return ccr;
+            case DR:
+                isr &= ~EOC;
+                return dr;
+            default: return 0;
+            }
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            switch(offset)
+            {
+            case ISR:
+                isr &= ~value; // write 1 to clear
+                return;
+            case IER: ier = value; return;
+            case CR: WriteControl(value); return;
+            case CFGR1: cfgr1 = value; return;
+            case CFGR2: cfgr2 = value; return;
+            case CHSELR: chselr = value; return;
+            case CCR: ccr = value; return;
+            }
+        }
+
+        private void WriteControl(uint value)
+        {
+            if((value & ADCAL) != 0)
+            {
+                // completes immediately; the firmware spins on it
+                cr &= ~ADCAL;
+                return;
+            }
+            if((value & ADDIS) != 0)
+            {
+                cr &= ~ADEN;
+                isr &= ~ADRDY;
+                return;
+            }
+            if((value & ADEN) != 0)
+            {
+                cr |= ADEN;
+                isr |= ADRDY;
+            }
+            if((value & ADSTART) != 0 && (cr & ADEN) != 0)
+            {
+                Convert();
+            }
+        }
+
+        // one regular sequence: every channel selected in CHSELR, in
+        // ascending order, which is what SCANDIR=0 means and what
+        // ADC_DMA_Callback() assumes when it indexes ADCDataDMA[]
+        private void Convert()
+        {
+            var any = false;
+            for(var ch = 0; ch < 19; ch++)
+            {
+                if((chselr & (1u << ch)) == 0)
+                {
+                    continue;
+                }
+                any = true;
+                dr = Sample(ch);
+                isr |= EOC;
+                Conversions++;
+                if((cfgr1 & DMAEN) != 0)
+                {
+                    // request one transfer; the DMA reads DR back
+                    Connections[DmaRequestLine].Blink();
+                }
+            }
+            if(any)
+            {
+                isr |= EOS;
+                if((ier & (EOC | EOS)) != 0)
+                {
+                    Connections[IrqLine].Blink();
+                }
+            }
+        }
+
+        // raw counts for a channel, inverting main.c's conversions
+        private uint Sample(int channel)
+        {
+            double volts = 0, amps = 0, degrees = 0;
+            var b = Bridge;
+            if(b != null)
+            {
+                volts = b.BusVoltage;
+                amps = b.BusCurrent;
+                degrees = b.TemperatureC;
+            }
+
+            double pinMv;
+            if(channel == voltageChannel)
+            {
+                // battery_voltage(10mV) = raw * 3300 / 4095 * divider / 100
+                pinMv = volts * 1000.0 * 10.0 / voltageDivider;
+            }
+            else if(channel == currentChannel)
+            {
+                // actual_current(10mA) =
+                //     ((raw*3300/41) - CURRENT_OFFSET*100) / MILLIVOLT_PER_AMP
+                pinMv = amps * millivoltPerAmp + currentOffsetMv;
+            }
+            else if(channel == TemperatureChannel)
+            {
+                return TemperatureCounts(degrees);
+            }
+            else
+            {
+                return 0;
+            }
+            if(pinMv < 0)
+            {
+                pinMv = 0;
+            }
+            return Clamp(pinMv * 4095.0 / 3300.0);
+        }
+
+        // inverse of __LL_ADC_CALC_TEMPERATURE against the factory
+        // calibration halfwords, which the harness seeds
+        private uint TemperatureCounts(double degrees)
+        {
+            var cal1 = machine.SystemBus.ReadWord(TsCal1);
+            var cal2 = machine.SystemBus.ReadWord(TsCal2);
+            if(cal1 == cal2)
+            {
+                return cal1; // uncalibrated; avoid inventing a slope
+            }
+            return Clamp(cal1 + (degrees - 30.0) * (cal2 - cal1) / (110.0 - 30.0));
+        }
+
+        private static uint Clamp(double counts)
+        {
+            return (uint)Math.Max(0.0, Math.Min(4095.0, Math.Round(counts)));
+        }
+
+        private AM32_F051_Bridge Bridge
+        {
+            get
+            {
+                if(bridge == null)
+                {
+                    bridge = machine.GetPeripheralsOfType<AM32_F051_Bridge>()
+                                    .FirstOrDefault();
+                }
+                return bridge;
+            }
+        }
+
+        private const long ISR = 0x00;
+        private const long IER = 0x04;
+        private const long CR = 0x08;
+        private const long CFGR1 = 0x0C;
+        private const long CFGR2 = 0x10;
+        private const long CHSELR = 0x28;
+        private const long DR = 0x40;
+        private const long CCR = 0x308;
+
+        private const uint ADRDY = 1u << 0;
+        private const uint EOC = 1u << 2;
+        private const uint EOS = 1u << 3;
+
+        private const uint ADEN = 1u << 0;
+        private const uint ADDIS = 1u << 1;
+        private const uint ADSTART = 1u << 2;
+        private const uint ADCAL = 1u << 31;
+
+        private const uint DMAEN = 1u << 0;
+
+        // ADC_IN16 on the F051
+        private const int TemperatureChannel = 16;
+        private const ulong TsCal1 = 0x1FFFF7B8;
+        private const ulong TsCal2 = 0x1FFFF7C2;
+
+        private const int DmaRequestLine = 0;
+        private const int IrqLine = 1;
+
+        private readonly IMachine machine;
+        private readonly int voltageChannel;
+        private readonly int currentChannel;
+        private readonly int voltageDivider;
+        private readonly int millivoltPerAmp;
+        private readonly int currentOffsetMv;
+
+        private AM32_F051_Bridge bridge;
+        private uint isr, ier, cr, cfgr1, cfgr2, chselr, ccr, dr;
+    }
+}
