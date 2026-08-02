@@ -186,6 +186,15 @@ int am32sim_advance(uint64_t now_ns, int driven)
     return sitl_comp_out;
 }
 
+/* phase currents, amps. The firmware cannot see these - the emulated
+   ADC is not fed from the physics - so they are motor truth, useful for
+   watching what the bridge is actually doing. */
+void am32sim_get_currents(double i[3])
+{
+    double th, om;
+    motor_get_state(&th, &om, i);
+}
+
 void am32sim_get_state(double* omega, double* theta, double* rpm)
 {
     double th, om, i[3];
