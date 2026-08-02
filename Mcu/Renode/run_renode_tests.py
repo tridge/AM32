@@ -49,6 +49,22 @@ def skip(reason):
     sys.exit(77)
 
 
+# Virtual time makes a run reproducible, so a target's speed is a fixed
+# number rather than a range. 2% leaves room for a compiler or model
+# nudge while still catching a partly dead bridge, which costs ~24%.
+SPIN_TOLERANCE = 0.02
+EXPECTED_SPIN = os.path.join(HERE, 'data', 'expected_spin.json')
+
+
+def expected(target):
+    '''recorded rpm and zero crossings, or None if not recorded yet'''
+    try:
+        with open(EXPECTED_SPIN) as f:
+            return json.load(f).get(target)
+    except (OSError, ValueError):
+        return None
+
+
 # Targets that cannot pass the spin assertions for a firmware reason, not
 # an emulator gap. Skipped rather than left failing so a red sweep still
 # means something.
@@ -325,15 +341,30 @@ def main():
     if s:
         check('motor runs', s.get('running') == 1,
               'running=%d' % s.get('running', -1))
-        # the real assertion: turning at a sane speed. A stuck or
-        # desynced motor still reports running.
+        # A range this wide passes almost anything that turns, which is
+        # not enough: with two of three high sides dead a target still
+        # limps at 76% speed and sails through. So when the target has a
+        # recorded figure, hold it to that instead.
         rpm = s.get('rpm', 0)
-        check('motor spins', 500 < rpm < 20000, 'rpm=%d' % rpm)
+        want = expected(args.target)
+        if want is None:
+            check('motor spins', 500 < rpm < 20000,
+                  'rpm=%d, no recorded figure for this target' % rpm)
+        else:
+            check('motor spins at the recorded speed',
+                  abs(rpm - want['rpm']) <= SPIN_TOLERANCE * want['rpm'],
+                  'rpm=%d, expected %d' % (rpm, want['rpm']))
         # closed loop, not blind commutation. 1.5s at this speed is
         # thousands of crossings; anything in the hundreds means BEMF
         # sensing is working rather than the startup ramp limping along.
         zc = s.get('zero_crosses', 0)
-        check('commutates on BEMF', zc > 500, 'zero_crosses=%d' % zc)
+        if want is None:
+            check('commutates on BEMF', zc > 500, 'zero_crosses=%d' % zc)
+        else:
+            check('commutates on BEMF at the recorded rate',
+                  abs(zc - want['zero_crosses'])
+                  <= SPIN_TOLERANCE * want['zero_crosses'],
+                  'zero_crosses=%d, expected %d' % (zc, want['zero_crosses']))
         check('no BEMF timeouts', s.get('bemf_timeout') == 0,
               'bemf_timeout_happened=%d' % s.get('bemf_timeout', -1))
         check('no desyncs', s.get('desync') == 0,
