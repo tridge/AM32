@@ -126,6 +126,37 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        // rotor angle, radians mechanical
+        public double Theta
+        {
+            get
+            {
+                double omega = 0, theta = 0, rpm = 0;
+                if(started)
+                {
+                    am32sim_get_state(ref omega, ref theta, ref rpm);
+                }
+                return theta;
+            }
+        }
+
+        // phase currents in amps, motor truth. The firmware cannot see
+        // these: the emulated ADC is not fed from the physics.
+        public double CurrentA => Current(0);
+        public double CurrentB => Current(1);
+        public double CurrentC => Current(2);
+
+        private double Current(int phase)
+        {
+            if(!started)
+            {
+                return 0;
+            }
+            var i = new double[3];
+            am32sim_get_currents(i);
+            return i[phase];
+        }
+
         public void Reset()
         {
             batch.Enabled = false;
@@ -279,6 +310,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         [DllImport("am32sim")]
         private static extern void am32sim_get_state(ref double omega, ref double theta,
                                                      ref double rpm);
+        [DllImport("am32sim")]
+        private static extern void am32sim_get_currents([Out] double[] i);
 
         private readonly IMachine machine;
         private readonly Phase[] phases;

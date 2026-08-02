@@ -57,6 +57,49 @@ monitor with an ESC that will actually spin:
 `--model` picks the motor (and tunes the eeprom to it), `--elf` and
 `--eeprom` override what it picks, `--list` shows what can be emulated.
 
+### Driving it, and watching it
+
+The throttle generator is a peripheral with monitor properties, so the
+input is changed live:
+
+    (monitor) throttle PulseUs 1300      # pulse width, microseconds
+    (monitor) throttle FrameUs 20000     # frame period, default 50Hz
+
+`--run` also loads `status()` into the monitor, with the firmware symbol
+table for that ELF baked in:
+
+    (monitor) python "status()"
+    armed=1 running=1 inputSet=1 input=632 adjusted_input=632
+    duty_cycle=611 commutation_interval=977 zero_crosses=1809 step=5
+    bemf_timeout_happened=0 desync_happened=0
+    rpm=2933.9 theta=5.33 ia=0.00 ib=3.12 ic=-3.12
+
+The first line is firmware state read out of SRAM at each symbol's own
+width; the second is motor truth from the physics. For a time series,
+`sample()` between `RunFor` steps and `save('run.csv')` at the end, then
+plot the CSV.
+
+**There is no equivalent of the SITL GUI**, and one quantity it graphs
+is not available here at all: the emulated ADC is Renode's stock model
+and is *not* fed from the physics, so the voltage and current the
+firmware believes it sees are meaningless in this harness. `ia`/`ib`/`ic`
+above are what the motor is really drawing, not what the firmware
+measures. Wiring an ADC model to the physics, as `Mcu/SITL/Src/ADC.c`
+does for the SITL, is the missing piece.
+
+### Log noise
+
+Renode warns on every access to an unimplemented region. `IWDG` used to
+be one, and the AM32 main loop kicks the watchdog constantly, so it
+produced thousands of warnings per simulated second and buried anything
+worth reading - `logLevel 3` in the test harness had been hiding it. It
+now has a small model instead, which also counts the kicks:
+
+    (monitor) python "print monitor.Machine['sysbus.iwdg'].Kicks"
+
+The counter is accepted but never enforced: a watchdog that actually
+fired would reset the CPU every time you paused at a breakpoint.
+
 The eeprom is generated rather than optional. Renode zero-fills unbacked
 memory where erased flash reads 0xFF, so without one the firmware takes
 the settings migration path - and Renode's own diagnostic for a missing
