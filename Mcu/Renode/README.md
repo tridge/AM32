@@ -87,6 +87,38 @@ above are what the motor is really drawing, not what the firmware
 measures. Wiring an ADC model to the physics, as `Mcu/SITL/Src/ADC.c`
 does for the SITL, is the missing piece.
 
+### Debugging with gdb
+
+    python3 Mcu/Renode/gen_target.py ARK_4IN1_F051 --gdb
+
+Starts Renode with a gdb stub, then opens an xterm running the ARM gdb
+from `tools/`, attached to the emulated core with the matching ELF. The
+machine is halted at reset when gdb connects, so you get control before
+any firmware instruction runs; `continue` in gdb starts it.
+
+    (gdb) break tenKhzRoutine
+    (gdb) continue
+    Breakpoint 1, tenKhzRoutine () at Src/main.c:1348
+    (gdb) bt
+    #0  tenKhzRoutine () at Src/main.c:1348
+    #1  0x0800617a in TIM6_DAC_IRQHandler () at Mcu/f051/Src/stm32f0xx_it.c:213
+    #2  <signal handler called>
+    #3  0x0800325a in main () at Src/main.c:1911
+
+Backtraces cross the interrupt boundary, because the NVIC is emulated
+rather than faked.
+
+The ELF is checked for `.debug_info` before either window opens - the
+AM32 makefile builds `-g3`, so it should always be there, and failing
+early beats discovering it from a gdb prompt. **It also builds `-O3`**,
+so expect inlined frames and locals reported as optimised out.
+
+`--gdb-port` moves the stub off 3333, `--gdb-bin` picks a different gdb,
+`--no-xterm` prints the launcher path to run yourself, and
+`--no-skip-delays` turns off the `delayMillis` hook, which is worth
+doing before single-stepping since that hook rewrites PC to return early
+from the busy-wait delays.
+
 ### Log noise
 
 Renode warns on every access to an unimplemented region. `IWDG` used to
