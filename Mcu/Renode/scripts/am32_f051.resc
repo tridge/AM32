@@ -29,6 +29,10 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_SysCfgComp.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge: each .cs is compiled on its own, so a file may only
+# reference types from one included before it. The ADC samples the
+# bridge for the physics sensor values.
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
 
 mach create "am32"
 machine LoadPlatformDescription $platform
@@ -41,6 +45,15 @@ sysbus LoadELF $elf
 # settings block sends loadEEpromSettings() down the migration path with
 # motor_poles = 0. Generate with Mcu/SITL/sitl_params.py build_image().
 sysbus LoadBinary $eeprom 0x08007C00
+
+# Factory temperature calibration. Renode zero-fills the system memory
+# page, and __LL_ADC_CALC_TEMPERATURE divides by (TS_CAL2 - TS_CAL1), so
+# an unseeded pair makes every temperature reading meaningless. These are
+# representative STM32F051 values rather than any particular die: the
+# sensor sits near 1.43V at 30C and falls about 4.3mV/C, which is 1774
+# and 1348 counts at 3.3V full scale.
+sysbus WriteWord 0x1FFFF7B8 1774
+sysbus WriteWord 0x1FFFF7C2 1348
 
 # Cortex-M0 has no VTOR. The firmware copies its vector table to SRAM
 # and remaps it to 0 via SYSCFG MEM_MODE; the copy holds the same

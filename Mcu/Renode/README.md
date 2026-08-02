@@ -70,22 +70,27 @@ table for that ELF baked in:
 
     (monitor) python "status()"
     armed=1 running=1 inputSet=1 input=632 adjusted_input=632
-    duty_cycle=611 commutation_interval=977 zero_crosses=1809 step=5
+    duty_cycle=611 commutation_interval=975 zero_crosses=2835 step=5
     bemf_timeout_happened=0 desync_happened=0
-    rpm=2933.9 theta=5.33 ia=0.00 ib=3.12 ic=-3.12
+    battery_voltage=1227 actual_current=71 converted_degrees=38
+    rpm=2933.7 theta=1.82 ia=0.00 ib=2.76 ic=-2.76
 
-The first line is firmware state read out of SRAM at each symbol's own
-width; the second is motor truth from the physics. For a time series,
+The first two lines are firmware state read out of SRAM at each symbol's
+own width; the last is motor truth from the physics. For a time series,
 `sample()` between `RunFor` steps and `save('run.csv')` at the end, then
 plot the CSV.
 
-**There is no equivalent of the SITL GUI**, and one quantity it graphs
-is not available here at all: the emulated ADC is Renode's stock model
-and is *not* fed from the physics, so the voltage and current the
-firmware believes it sees are meaningless in this harness. `ia`/`ib`/`ic`
-above are what the motor is really drawing, not what the firmware
-measures. Wiring an ADC model to the physics, as `Mcu/SITL/Src/ADC.c`
-does for the SITL, is the missing piece.
+`battery_voltage` (10mV), `actual_current` (10mA) and
+`converted_degrees` are what the firmware makes of the ADC, and they now
+mean something: the ADC model is fed from the same physics, so 1227
+against a bus at 12.32V is the firmware's own arithmetic checking out
+end to end, through a real DMA transfer into `ADCDataDMA[]`. Current
+reads a little below the instantaneous value because the firmware runs
+it through a moving average (`Src/main.c:816`); voltage and temperature,
+being steady, match exactly.
+
+**There is still no equivalent of the SITL GUI** - no live graphing,
+only `status()` and a CSV to plot elsewhere.
 
 ### Debugging with gdb
 
@@ -121,16 +126,27 @@ from the busy-wait delays.
 
 ### Log noise
 
-Renode warns on every access to an unimplemented region. `IWDG` used to
-be one, and the AM32 main loop kicks the watchdog constantly, so it
-produced thousands of warnings per simulated second and buried anything
-worth reading - `logLevel 3` in the test harness had been hiding it. It
-now has a small model instead, which also counts the kicks:
+Renode warns on every access to an unimplemented region, and two of
+those warnings turned out to be pointing at real defects rather than
+being noise to silence. Both are fixed; `logLevel 3` in the test harness
+had been hiding them.
+
+`IWDG` was an unimplemented tag, and the AM32 main loop kicks the
+watchdog constantly, so it produced thousands of warnings per simulated
+second. It now has a small model, which also counts the kicks:
 
     (monitor) python "print monitor.Machine['sysbus.iwdg'].Kicks"
 
 The counter is accepted but never enforced: a watchdog that actually
 fired would reset the CPU every time you paused at a breakpoint.
+
+`adc: Issued a start event before the last sequence finished` was the
+second, and it meant the ADC path did not work at all. The platform had
+the stock model self-triggering at 1kHz, a hardware trigger AM32 does
+not use - it starts conversions in software - and the stock model has no
+DMA output, so conversions were never drained and `ADCDataDMA[]` stayed
+zero. Replaced by a model that scans `CHSELR` and raises a DMA request
+per conversion, with the external trigger dropped.
 
 The eeprom is generated rather than optional. Renode zero-fills unbacked
 memory where erased flash reads 0xFF, so without one the firmware takes

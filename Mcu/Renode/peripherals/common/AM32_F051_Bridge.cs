@@ -140,8 +140,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        // phase currents in amps, motor truth. The firmware cannot see
-        // these: the emulated ADC is not fed from the physics.
+        // What the ADC model samples: bus voltage, bus current into the
+        // bridge, and temperature. Same source the SITL's ADC.c reads.
+        public double BusVoltage => Sensor(0);
+        public double BusCurrent => Sensor(1);
+        public double TemperatureC => Sensor(2);
+
+        private double Sensor(int which)
+        {
+            if(!started)
+            {
+                return 0;
+            }
+            double volts = 0, amps = 0, degrees = 0;
+            am32sim_get_sensors(ref volts, ref amps, ref degrees);
+            return which == 0 ? volts : (which == 1 ? amps : degrees);
+        }
+
+        // phase currents in amps, motor truth rather than anything the
+        // firmware measures
         public double CurrentA => Current(0);
         public double CurrentB => Current(1);
         public double CurrentC => Current(2);
@@ -312,6 +329,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                                      ref double rpm);
         [DllImport("am32sim")]
         private static extern void am32sim_get_currents([Out] double[] i);
+        [DllImport("am32sim")]
+        private static extern void am32sim_get_sensors(ref double volts, ref double amps,
+                                                       ref double degrees);
 
         private readonly IMachine machine;
         private readonly Phase[] phases;

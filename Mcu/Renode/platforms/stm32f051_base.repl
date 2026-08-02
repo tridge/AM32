@@ -192,10 +192,10 @@ rcc: Miscellaneous.AM32_STM32F0_RCC @ sysbus 0x40021000
 iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
 
 
-adc: Analog.STM32F0_ADC @ sysbus 0x40012400
-    referenceVoltage: 3.3
-    externalEventFrequency: 1000
-    -> nvicInput12@2
+// the adc is declared by the target overlay: its channels and scaling
+// come from VOLTAGE_ADC_CHANNEL, CURRENT_ADC_CHANNEL,
+// TARGET_VOLTAGE_DIVIDER, MILLIVOLT_PER_AMP and CURRENT_OFFSET, which
+// differ per target
 
 crc: CRC.STM32_CRC @ sysbus 0x40023000
     series: STM32Series.F0

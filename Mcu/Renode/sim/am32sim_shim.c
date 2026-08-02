@@ -186,9 +186,26 @@ int am32sim_advance(uint64_t now_ns, int driven)
     return sitl_comp_out;
 }
 
-/* phase currents, amps. The firmware cannot see these - the emulated
-   ADC is not fed from the physics - so they are motor truth, useful for
-   watching what the bridge is actually doing. */
+/* bus voltage, bus current and temperature, which the ADC model turns
+   into raw counts for the firmware to read over DMA. Same source the
+   SITL's Mcu/SITL/Src/ADC.c uses. */
+void am32sim_get_sensors(double* volts, double* amps, double* degrees)
+{
+    sitl_sensors_t s;
+    sitl_sensors_read(&s);
+    if (volts) {
+        *volts = s.bus_voltage;
+    }
+    if (amps) {
+        *amps = s.bus_current;
+    }
+    if (degrees) {
+        *degrees = s.temperature_c;
+    }
+}
+
+/* phase currents, amps. These are motor truth; the firmware sees only
+   what the ADC model gives it. */
 void am32sim_get_currents(double i[3])
 {
     double th, om;
