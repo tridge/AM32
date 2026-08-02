@@ -12,6 +12,7 @@ exits non-zero if any test fails, or 77 if the harness cannot run.
 '''
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -186,8 +187,29 @@ def main():
         # INPUT_SIGNAL_TYPE 0 is mandatory: the default is DSHOT_IN, and
         # with dshot set detectInput() never calls checkServo(), so a
         # servo signal is ignored with no diagnostic
+        overrides = {'INPUT_SIGNAL_TYPE': 0}
+        # MOTOR_KV and MOTOR_POLES have to agree with the motor being
+        # simulated or the firmware is tuned for a different machine:
+        # AM32 scales low rpm power protection from MOTOR_KV, and poles
+        # scales every reported rpm and the commutation timing. Taken
+        # from the model rather than left at the defaults, which is worth
+        # 20% of measured rpm on this model. sitl_params.model_checks()
+        # is the SITL's own rule for this, reused rather than restated.
+        try:
+            motor = json.load(open(args.model)).get('motor', {})
+        except (OSError, ValueError):
+            motor = {}
+        for name, (want, _help) in sitl_params.model_checks(motor).items():
+            overrides[name] = want
+        image = sitl_params.build_image(overrides)
+        bad = sitl_params.mismatches(image, motor)
+        if bad:
+            skip('eeprom disagrees with the model on %s' % ', '.join(bad))
+        print('model %s: %s' % (os.path.basename(args.model),
+                                ', '.join('%s=%d' % (k, v)
+                                          for k, v in sorted(overrides.items()))))
         with open(eeprom, 'wb') as f:
-            f.write(bytes(sitl_params.build_image({'INPUT_SIGNAL_TYPE': 0})))
+            f.write(bytes(image))
 
         res = run(renode, args.elf, eeprom, args.model, so, syms, scratch,
                   physics=not args.no_physics)
