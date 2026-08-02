@@ -15,6 +15,19 @@ through the real comparator. The firmware's own measured
 timing it derives and the motor it derives it from check out
 independently.
 
+Two targets run, one per F051 hardware group:
+
+| target | group | capture | throttle pin | comparator A/B/C |
+|---|---|---|---|---|
+| `FD6288_F051` | `F0_A` | TIM15 + DMA1 ch5 | PA2 | PA5 / PA4 / PA0 |
+| `ARK_4IN1_F051` | `F0_B` | TIM3 + DMA1 ch4 | PB4 | PA0 / PA4 / PA5 |
+
+Both arm and spin. ARK passed on its first run with no model changes,
+which is the useful signal: the second hardware group exercises a
+different capture timer, a different DMA channel, a different input pin
+and a swapped comparator map, and the peripheral models needed nothing
+target specific beyond what the overlay states.
+
 Calibration and sweep work stays in the SITL, on speed grounds - see
 below.
 
@@ -148,12 +161,31 @@ Calibration work still belongs in the SITL - a 60s chirp here is minutes
 
 Same model, same eeprom, same 1300us throttle, same 4.0s of simulated
 time: the emulated F051 settles at 2934 rpm against the host SITL's
-3125, 6.1% apart. The residual is not unexplained - the SITL target runs
-500ns of dead time where this one runs 937ns (DEAD_TIME 45 at 48MHz),
-and dead time subtracts directly from effective duty. These are
-genuinely different targets, so that is a hardware difference rather
-than a modelling one. It has not been nulled out to confirm it accounts
-for the whole gap.
+3125, 6.1% apart. **That gap is currently unexplained.**
+
+It was previously attributed here to dead time, the SITL target running
+500ns against this one's 937ns (DEAD_TIME 45 at 48MHz). Adding the ARK
+target refuted that, because it is the controlled experiment: same
+model, same eeprom, same throttle, same settled duty (ARR 1999, CCR3
+611), differing only in DEAD_TIME - 25 rather than 45, so 520ns rather
+than 937ns, which is nearly the SITL's figure.
+
+| target | DTG | dead time | rpm |
+|---|---|---|---|
+| FD6288_F051 | 45 | 937 ns | 2934.2252 |
+| ARK_4IN1_F051 | 25 | 520 ns | 2934.3298 |
+
+417ns of dead time is worth 0.1 rpm, 0.004%. Closing the gap would take
+1500x that. The model's dead window opens both fets and lets the body
+diode conduct, so with continuous current the phase stays clamped to a
+rail and the applied volt-seconds barely move - physically reasonable,
+and it means dead time is simply not a lever on steady-state rpm here.
+
+So the 6.1% is still to be accounted for. It is not in the physics,
+which is the same compiled object in both. Candidates not yet tested:
+zero-cross detection timing through the comparator RC filters, the
+`batchUs` register sampling interval, and differences in how the two
+harnesses derive the PWM phase.
 
 Two independent implementations - one substituting every peripheral, one
 executing the real register code - agreeing to within a known hardware
