@@ -1,0 +1,9 @@
+:name: AM32 FD6288_F051
+:description: boots an AM32 FD6288_F051 firmware ELF
+
+# Entry point for this target. Set $repo, $elf and $eeprom before
+# including it; see ../am32_f051.resc for what they mean.
+
+$repo?=@.
+$platform=$repo/Mcu/Renode/platforms/targets/FD6288_F051.repl
+include $repo/Mcu/Renode/scripts/am32_f051.resc

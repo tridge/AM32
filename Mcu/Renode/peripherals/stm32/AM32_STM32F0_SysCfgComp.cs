@@ -15,12 +15,16 @@
 // (v_neutral - v_float); keeping the two identical is what lets the same
 // physics drive both.
 //
-// The phase selection lives in CSR[6:4] (COMP1 INMSEL): 101 is PA5,
-// 100 is PA4, 110 is PA0, which the F0_A pin map assigns to phases A, B
-// and C respectively.
+// The phase selection lives in CSR[6:4], the COMP1 INMSEL field: 100 is
+// PA4, 101 is PA5, 110 is PA0. Which of those is phase A, B or C differs
+// per hardware group - F0_A is PA5/PA4/PA0, F0_B is PA0/PA4/PA5 - so the
+// map is a constructor parameter set from the target .repl. A wrong map
+// is silent: the firmware would commutate against the wrong phase and
+// simply never run well, so there is no default.
 //
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
@@ -32,8 +36,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AM32_STM32F0_SysCfgComp : IDoubleWordPeripheral, IKnownSize,
                                            INumberedGPIOOutput
     {
-        public AM32_STM32F0_SysCfgComp(IMachine machine)
+        // phaseXInmsel is the CSR[6:4] code the target's PHASE_X_COMP
+        // selects; see Inc/targets.h COMP_PA0/PA4/PA5.
+        public AM32_STM32F0_SysCfgComp(IMachine machine, int phaseAInmsel,
+                                       int phaseBInmsel, int phaseCInmsel)
         {
+            inmselToPhase = new int[8];
+            for(var i = 0; i < inmselToPhase.Length; i++)
+            {
+                inmselToPhase[i] = -1;
+            }
+            SetPhase(phaseAInmsel, 0);
+            SetPhase(phaseBInmsel, 1);
+            SetPhase(phaseCInmsel, 2);
+
             var conns = new Dictionary<int, IGPIO>();
             conns[Comp1Line] = new GPIO();
             conns[Comp2Line] = new GPIO();
@@ -57,18 +73,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Which phase COMP1's inverting input is watching, 0=A 1=B 2=C,
         // or -1 when the selection is not one of the three phase pins.
-        public int SensedPhase
+        public int SensedPhase => inmselToPhase[(regs[CompCsr / 4] >> 4) & 7];
+
+        private void SetPhase(int inmsel, int phase)
         {
-            get
+            if(inmsel < 0 || inmsel > 7)
             {
-                switch((regs[CompCsr / 4] >> 4) & 7)
-                {
-                case 5: return 0;  // PA5
-                case 4: return 1;  // PA4
-                case 6: return 2;  // PA0
-                default: return -1;
-                }
+                throw new RecoverableException(string.Format(
+                    "comparator INMSEL code {0} is out of range, expected 0-7", inmsel));
             }
+            if(inmselToPhase[inmsel] >= 0)
+            {
+                throw new RecoverableException(string.Format(
+                    "comparator INMSEL code {0} is assigned to two phases", inmsel));
+            }
+            inmselToPhase[inmsel] = phase;
         }
 
         public bool Enabled => (regs[CompCsr / 4] & Comp1En) != 0;
@@ -141,6 +160,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int Comp2Line = 1;
 
         private readonly uint[] regs = new uint[0x100];
+        // CSR[6:4] code to phase, -1 for codes that are not a phase pin
+        private readonly int[] inmselToPhase;
         private bool output;
     }
 }
