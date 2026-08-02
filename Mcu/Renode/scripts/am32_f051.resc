@@ -15,6 +15,7 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_RCC.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_SysCfgComp.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 
 mach create "am32"

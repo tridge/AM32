@@ -226,7 +226,6 @@ sysbus:
         Tag <0x40007000, 0x400073FF> "PWR"
         Tag <0x40007400, 0x400077FF> "DAC"
         Tag <0x40007800, 0x40007BFF> "CEC"
-        Tag <0x40010000, 0x400103FF> "SYSCFGCOMP"
         Tag <0x40015800, 0x40015BFF> "DBGMCU"
         Tag <0x40020000, 0x400203FF> "DMA"
         Tag <0x40020400, 0x400207FF> "DMA2"
@@ -264,6 +263,13 @@ dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
 // Servo PWM source. Drives both the capture timer input and the GPIO
 // pin, because transfercomplete() reads getInputPinState() to size the
 // next transfer.
+// SYSCFG and COMP share a register page on the F051. The stock platform
+// tags the whole thing, so COMP1OUT read back as nothing and BEMF
+// sensing could not work. Line 21 is COMP1's EXTI line.
+syscfgcomp: Miscellaneous.AM32_STM32F0_SysCfgComp @ sysbus <0x40010000, +0x400>
+    0 -> exti@21
+    1 -> exti@22
+
 // 0x50000000 is outside both the peripheral aperture and anything the
 // F051 decodes, so the firmware can never reach it.
 throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x50000000
