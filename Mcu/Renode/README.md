@@ -84,6 +84,10 @@ after 1.5 s of spinning:
 | **10** | **6.3x** | **9.6x** | **2437** | **1170** |
 | 20 | 5.9x  | 8.1x  | 2441 | 1168 |
 
+The rpm column above predates seeding MOTOR_KV from the model, so the
+absolute values are ~20% low against what the test reports now. The
+comparison between rows is unaffected: every row ran the same eeprom.
+
 For reference the MCU emulation alone, with no physics, is 4.8x booting
 and 6.8x throttled; the host SITL runs ~1.4x *faster* than real time.
 
@@ -108,6 +112,22 @@ what is expensive, not the work it decides to skip.
 
 Calibration work still belongs in the SITL - a 60s chirp here is minutes
 - but a spin is entirely practical.
+
+## Checked against the SITL
+
+Same model, same eeprom, same 1300us throttle, same 4.0s of simulated
+time: the emulated F051 settles at 2934 rpm against the host SITL's
+3125, 6.1% apart. The residual is not unexplained - the SITL target runs
+500ns of dead time where this one runs 937ns (DEAD_TIME 45 at 48MHz),
+and dead time subtracts directly from effective duty. These are
+genuinely different targets, so that is a hardware difference rather
+than a modelling one. It has not been nulled out to confirm it accounts
+for the whole gap.
+
+Two independent implementations - one substituting every peripheral, one
+executing the real register code - agreeing to within a known hardware
+difference is the evidence that the register path reproduces the
+calibrated model rather than quietly diverging from it.
 
 ## Physics: borrowed, not forked
 
