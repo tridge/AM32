@@ -283,31 +283,32 @@ Calibration work still belongs in the SITL - a 60s chirp here is minutes
 
 Same model, same eeprom, same 1300us throttle, same 4.0s of simulated
 time: the emulated F051 settles at 2934 rpm against the host SITL's
-3125, 6.1% apart. **That gap is currently unexplained.**
+3125, 6.1% apart. **Dead time accounts for most of that**, the SITL
+target running 500ns against FD6288's 937ns (DEAD_TIME 45 at 48MHz).
 
-It was previously attributed here to dead time, the SITL target running
-500ns against this one's 937ns (DEAD_TIME 45 at 48MHz). Adding the ARK
-target refuted that, because it is the controlled experiment: same
-model, same eeprom, same throttle, same settled duty (ARR 1999, CCR3
-611), differing only in DEAD_TIME - 25 rather than 45, so 520ns rather
-than 937ns, which is nearly the SITL's figure.
+The evidence is a genuinely controlled pair, which fell out of running
+every F051 target against the same model. `DIATONE_F051` and
+`MAMBA_F40PRO_F051` differ in exactly one macro - diff their
+preprocessed output and `DEAD_TIME` is the only line:
 
-| target | DTG | dead time | rpm |
+| target | DEAD_TIME | dead time | rpm |
 |---|---|---|---|
-| FD6288_F051 | 45 | 937 ns | 2934.2252 |
-| ARK_4IN1_F051 | 25 | 520 ns | 2934.3298 |
+| DIATONE_F051 | 45 | 937 ns | 2934 |
+| MAMBA_F40PRO_F051 | 20 | 417 ns | 3115 |
 
-417ns of dead time is worth 0.1 rpm, 0.004%. Closing the gap would take
-1500x that. The model's dead window opens both fets and lets the body
-diode conduct, so with continuous current the phase stays clamped to a
-rail and the applied volt-seconds barely move - physically reasonable,
-and it means dead time is simply not a lever on steady-state rpm here.
+520ns of dead time is worth 6.2% of rpm. The SITL sits 437ns below
+FD6288, which on that slope predicts about 5%, against the 6.1%
+observed - the right size, so dead time is the dominant term rather
+than a rounding error.
 
-So the 6.1% is still to be accounted for. It is not in the physics,
-which is the same compiled object in both. Candidates not yet tested:
-zero-cross detection timing through the comparator RC filters, the
-`batchUs` register sampling interval, and differences in how the two
-harnesses derive the PWM phase.
+**A warning about how not to measure this.** An earlier version of this
+file claimed the opposite, that dead time was worth 0.004%, on the
+strength of comparing FD6288 (DEAD_TIME 45) against ARK_4IN1
+(DEAD_TIME 25) and finding 2934.2252 against 2934.3298. That pair is
+confounded: ARK also sets `TARGET_MIN_BEMF_COUNTS 3` where FD6288 has
+2, and the two effects are each worth about 6% in opposite directions,
+so they cancel almost exactly. Two targets are only a controlled
+experiment if you diff every macro, not the one you are thinking about.
 
 Two independent implementations - one substituting every peripheral, one
 executing the real register code - agreeing to within a known hardware
