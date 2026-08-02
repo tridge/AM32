@@ -31,6 +31,8 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 
 sys.path.insert(0, os.path.join(REPO, 'Mcu', 'SITL'))
 import sitl_params
+sys.path.insert(0, RENODE_DIR)
+import gen_target
 
 failures = []
 
@@ -99,7 +101,7 @@ def report(tag):
 '''
 
 
-def run(renode, target, elf, eeprom, model, so, syms, scratch, physics=True):
+def run(renode, target_resc, elf, eeprom, model, so, syms, scratch, physics=True):
     want = ['armed', 'running', 'zero_crosses', 'bemf_timeout_happened',
             'desync_happened']
     missing = [n for n in want if n not in syms]
@@ -117,7 +119,7 @@ def run(renode, target, elf, eeprom, model, so, syms, scratch, physics=True):
             '$repo=@%s' % REPO,
             '$elf=@%s' % elf,
             '$eeprom=@%s' % eeprom,
-            'include @%s/Mcu/Renode/scripts/targets/%s.resc' % (REPO, target),
+            'include @%s' % target_resc,
             'logLevel 3',
             'cpu AddSymbolHook "delayMillis" "execfile(\'%s/Mcu/Renode/scripts/skip_delays.py\')"' % REPO,
             'bridge LibraryPath "%s"' % so if physics else '',
@@ -162,12 +164,15 @@ def run(renode, target, elf, eeprom, model, so, syms, scratch, physics=True):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--target', default='FD6288_F051',
-                    help='must have a scripts/targets/<TARGET>.resc')
+                    help='any F051 target in Inc/targets.h')
     # defaults to whatever obj/ holds for the target, so the firmware
     # version does not have to be tracked here
     ap.add_argument('--elf', default=None)
     ap.add_argument('--renode', default=None)
     ap.add_argument('--nm', default='arm-none-eabi-nm')
+    # preprocesses Inc/targets.h to build the platform; not the same
+    # tool as --nm, which reads the ELF symbol table
+    ap.add_argument('--gcc', default='arm-none-eabi-gcc')
     ap.add_argument('--model', default=os.path.join(
         REPO, 'Mcu', 'SITL', 'models', 'vimdrones_nano_2216.json'))
     # leaves the bridge unstarted, so there is no motor to sense. Used to
@@ -175,9 +180,6 @@ def main():
     ap.add_argument('--no-physics', action='store_true')
     args = ap.parse_args()
 
-    resc = os.path.join(RENODE_DIR, 'scripts', 'targets', '%s.resc' % args.target)
-    if not os.path.exists(resc):
-        skip('no Renode target %s; expected %s' % (args.target, resc))
     if args.elf is None:
         found = sorted(glob.glob(os.path.join(REPO, 'obj',
                                               'AM32_%s_*.elf' % args.target)))
@@ -197,6 +199,13 @@ def main():
     so = build_library()
 
     with tempfile.TemporaryDirectory() as scratch:
+        # the platform is generated from Inc/targets.h rather than kept
+        # in the tree, so a new target needs nothing written by hand
+        try:
+            target_resc, _ = gen_target.generate(args.target, scratch, args.gcc)
+        except gen_target.Unsupported as e:
+            skip(str(e))
+
         eeprom = os.path.join(scratch, 'eeprom.bin')
         # INPUT_SIGNAL_TYPE 0 is mandatory: the default is DSHOT_IN, and
         # with dshot set detectInput() never calls checkServo(), so a
@@ -225,7 +234,7 @@ def main():
         with open(eeprom, 'wb') as f:
             f.write(bytes(image))
 
-        res = run(renode, args.target, args.elf, eeprom, args.model, so, syms,
+        res = run(renode, target_resc, args.elf, eeprom, args.model, so, syms,
                   scratch, physics=not args.no_physics)
 
     a = res.get('armed', {})

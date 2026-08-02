@@ -265,12 +265,10 @@ systemMemory: Memory.MappedMemory @ sysbus 0x1FFFF000
 dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
     numberOfChannels: 7
 
-// Couples the emulated bridge to the SITL motor physics. LibraryPath
-// and ConfigPath are set from the .resc, since they are absolute paths.
-// The phase pin map is the same for every F051 group so far, so it stays
-// in the model rather than being a parameter here.
-bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x50000400
-    batchUs: 10
+// The bridge is declared by the target overlay, not here: its phase pin
+// map is a required constructor argument and differs per target, and a
+// default here would be silently wrong for the targets that rotate the
+// phases across the same six pins.
 
 // Servo PWM source. The overlay drives it into both the capture timer
 // and the input GPIO pin, because transfercomplete() reads
