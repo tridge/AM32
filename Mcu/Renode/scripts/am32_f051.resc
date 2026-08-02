@@ -1,0 +1,57 @@
+:name: AM32 F051
+:description: boots an AM32 STM32F051 firmware ELF
+
+# Paths are absolute, supplied by the caller, because the test harness
+# runs from a scratch directory like the SITL suite does. $elf is
+# required; $eeprom is optional but you almost always want it, since
+# unbacked Renode memory reads as zero whereas erased flash reads 0xFF,
+# and a zeroed eeprom sends the firmware down the migration path.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_RCC.cs
+
+mach create "am32"
+machine LoadPlatformDescription $repo/Mcu/Renode/platforms/stm32f051.repl
+
+sysbus LoadELF $elf
+
+# Required, not optional. Renode zero-fills unbacked memory whereas
+# erased flash reads 0xFF, and the firmware keys off that: tune[0] !=
+# 0xFF diverts playStartupTune() into playBlueJayTune(), and a zeroed
+# settings block sends loadEEpromSettings() down the migration path with
+# motor_poles = 0. Generate with Mcu/SITL/sitl_params.py build_image().
+sysbus LoadBinary $eeprom 0x08007C00
+
+# Cortex-M0 has no VTOR. The firmware copies its vector table to SRAM
+# and remaps it to 0 via SYSCFG MEM_MODE; the copy holds the same
+# handler addresses, so pointing the CPU at the flash table is
+# vector-equivalent. It is NOT MEM_MODE-equivalent: reads through the
+# 0x0 alias still see flash, which changes checkDeviceInfo(). Fine
+# while no bootloader is loaded, revisit before one is.
+cpu VectorTableOffset 0x08001000
+
+# Renode charges virtual time at a nominal instruction rate rather than
+# from the real instruction stream, and its default is 100 MIPS. This
+# target is a 48MHz Cortex-M0, so the default models a core twice as
+# fast as the hardware AND makes the emulator execute twice as many
+# instructions per simulated second as it needs to. 48 is one
+# instruction per cycle, which is the optimistic end for an M0 running
+# from flash with a wait state - so it is both more faithful than the
+# default and about 2.7x cheaper. Lower values buy a little more speed
+# at the cost of modelling a slower core than the real one.
+cpu PerformanceInMips 48
+
+# The quantum is a synchronisation interval, not a timer resolution:
+# virtual time stays nanosecond-resolution and timer reads still
+# synchronise precisely within a quantum. So this does not coarsen
+# commutation timing on a single machine. 1ms is the knee - going finer
+# is expensive (1us costs about 2.6x) and coarser buys nothing. Revisit
+# only if comparator edges ever arrive from another time domain.
+emulation SetGlobalQuantum "0.001"
+
+# never throttle to real time; we are far below it anyway, but this
+# stops later optimisation from being capped at 1x
+emulation SetGlobalAdvanceImmediately true
