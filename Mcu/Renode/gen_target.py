@@ -23,6 +23,7 @@ harness does for a skip.
 '''
 
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -259,6 +260,33 @@ def generate(target, outdir, nm='arm-none-eabi-gcc'):
     return resc, repl
 
 
+def default_eeprom(path, model):
+    '''An eeprom is not optional: Renode zero-fills unbacked memory where
+       erased flash reads 0xFF, so a missing one sends loadEEpromSettings()
+       down the migration path. INPUT_SIGNAL_TYPE 0 is mandatory too - the
+       default is DSHOT_IN, and with dshot set detectInput() never calls
+       checkServo(), so a servo signal is ignored with no diagnostic.'''
+    sys.path.insert(0, os.path.join(REPO, 'Mcu', 'SITL'))
+    try:
+        import sitl_params
+    except ImportError:
+        raise Unsupported('cannot build a default eeprom (Mcu/SITL not '
+                          'importable); pass --eeprom')
+    overrides = {'INPUT_SIGNAL_TYPE': 0}
+    try:
+        import json
+        motor = json.load(open(model)).get('motor', {})
+    except (OSError, ValueError):
+        motor = {}
+    # the firmware is tuned for the motor it thinks it has; leaving these
+    # at the defaults is worth 20% of measured rpm
+    for name, (want, _help) in sitl_params.model_checks(motor).items():
+        overrides[name] = want
+    with open(path, 'wb') as f:
+        f.write(bytes(sitl_params.build_image(overrides)))
+    return overrides
+
+
 def all_targets():
     try:
         out = subprocess.check_output(['make', 'targets'], cwd=REPO,
@@ -278,8 +306,13 @@ def main():
                     help='F051 targets, which are the ones this can emulate')
     ap.add_argument('--run', action='store_true',
                     help='launch renode on the generated platform')
-    ap.add_argument('--elf', default=None)
-    ap.add_argument('--eeprom', default=None)
+    ap.add_argument('--elf', default=None,
+                    help='default: whatever obj/ holds for the target')
+    ap.add_argument('--eeprom', default=None,
+                    help='default: generated to match --model')
+    ap.add_argument('--model', default=os.path.join(
+        REPO, 'Mcu', 'SITL', 'models', 'vimdrones_nano_2216.json'),
+        help='motor the physics simulates, and what the eeprom is tuned for')
     # extra monitor commands, repeatable, so a run can be scripted rather
     # than interactive. Not argparse.REMAINDER: after a positional that
     # swallows --run and --eeprom themselves.
@@ -306,13 +339,47 @@ def main():
     if not args.run:
         return 0
 
-    elf = args.elf or os.path.join(REPO, 'obj',
-                                   'AM32_%s_2.20.elf' % args.target)
+    elf = args.elf
+    if elf is None:
+        found = sorted(glob.glob(os.path.join(REPO, 'obj',
+                                              'AM32_%s_*.elf' % args.target)))
+        if not found:
+            print('no firmware in obj/ for %s; build it or pass --elf'
+                  % args.target)
+            return 1
+        elf = found[-1]
     if not os.path.exists(elf):
-        print('no firmware at %s; build it or pass --elf' % elf)
+        print('no firmware at %s' % elf)
         return 1
-    setup = '$repo=@%s; $elf=@%s; %sinclude @%s' % (
-        REPO, elf, '$eeprom=@%s; ' % args.eeprom if args.eeprom else '', resc)
+
+    # an eeprom is required, not optional; without one Renode fails with
+    # "Parameters did not match the signature" from LoadBinary, which
+    # says nothing about the actual problem
+    eeprom = args.eeprom
+    if eeprom is None:
+        eeprom = os.path.join(outdir, '%s_eeprom.bin' % args.target)
+        try:
+            default_eeprom(eeprom, args.model)
+        except Unsupported as e:
+            print('SKIP: %s' % e)
+            return 77
+        print(eeprom)
+
+    setup = '$repo=@%s; $elf=@%s; $eeprom=@%s; include @%s' % (
+        REPO, elf, eeprom, resc)
+    setup += '; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"' % (
+        os.path.join(HERE, 'scripts', 'skip_delays.py'))
+
+    # without the physics the bridge never starts and the motor cannot
+    # turn, so a bare --run would boot and then look broken
+    so = os.path.join(REPO, 'obj', 'libam32sim.so')
+    if os.path.exists(so):
+        setup += '; bridge LibraryPath "%s"; bridge ConfigPath "%s"' % (
+            so, args.model)
+    else:
+        print('no %s, so the motor will not turn; build it with '
+              '"make -C Mcu/Renode/sim"' % so)
+
     for c in args.commands:
         setup += '; %s' % c
     cmd = [os.path.join(REPO, 'tools', 'linux', 'renode_1.16.1_portable',

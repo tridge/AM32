@@ -44,9 +44,24 @@ same way the ARM toolchain is installed. Then, for any F051 target:
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --run
 
-That generates the platform and drops you in the Renode monitor. Add
-`--exec` to script it instead of sitting at the prompt, `--eeprom` to
-supply a settings image, `--list` to see what can be emulated.
+That generates the platform, picks the ELF out of `obj/`, generates a
+matching eeprom, wires up the motor physics and drops you in the Renode
+monitor with an ESC that will actually spin:
+
+    (monitor) emulation RunFor "2.5"
+    (monitor) sysbus WriteDoubleWord 0x50000000 1300   # 1300us throttle
+    (monitor) emulation RunFor "1.5"
+    (monitor) python "print monitor.Machine['sysbus.bridge'].Rpm"
+
+`--exec CMD` runs monitor commands instead of sitting at the prompt,
+`--model` picks the motor (and tunes the eeprom to it), `--elf` and
+`--eeprom` override what it picks, `--list` shows what can be emulated.
+
+The eeprom is generated rather than optional. Renode zero-fills unbacked
+memory where erased flash reads 0xFF, so without one the firmware takes
+the settings migration path - and Renode's own diagnostic for a missing
+one is `LoadBinary ... Parameters did not match the signature`, which
+says nothing about the real problem.
 
 The test runner takes the same `--target` and picks the matching ELF out
 of `obj/`:
