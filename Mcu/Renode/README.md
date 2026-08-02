@@ -6,13 +6,17 @@ The SITL replaces all of that with its own fakes, which is why it could
 not catch the PR #361 bug where two targets' `phaseouts.c` tested the
 wrong variable, compiled cleanly and did nothing.
 
-**Scope: a boot/register-level harness, not a motor simulator.** See
-"Why no motor" below — this is a measured decision, not an omission.
-
 ## Status
 
-Bring-up. The F051 firmware boots to its main loop. No throttle input,
-no comparator, no physics yet.
+The F051 firmware boots, detects a servo throttle signal through real
+capture and DMA, arms, and **spins a motor closed loop on BEMF** sensed
+through the real comparator. The firmware's own measured
+`commutation_interval` agrees with the rpm the physics reports, so the
+timing it derives and the motor it derives it from check out
+independently.
+
+Calibration and sweep work stays in the SITL, on speed grounds - see
+below.
 
 ## Running
 
@@ -57,36 +61,63 @@ replacing the RCC means owning the whole file. Changes made:
 - **Python DMA stub removed.** It throws (`sysbus` undefined in its
   script context) as soon as the firmware programs it. A real model is
   needed for the throttle input path.
+- **TIM1 and the SYSCFG/COMP page replaced.** The stock `STM32_Timer` has
+  no MOE, no complementary outputs, no dead time and no preload
+  shadowing; the COMP page was a bare tag, so `COMP1OUT` read back as
+  nothing and BEMF sensing could not work at all.
+- **Stock alternate-function connection blocks for `timer1` and
+  `timer15` deleted.** A later connection block *replaces* an earlier
+  one, so leaving them silently overrode the DMA and NVIC wiring in the
+  peripheral declarations. This cost real debugging time: captures
+  happened and went nowhere.
 
-## Speed, and what it means for the motor
+## Speed, and where it goes
 
 Measured on this tree, not estimated, with the `delayMillis` skip hook
-active:
+active. Wall seconds per simulated second, and the resulting motor state
+after 1.5 s of spinning:
 
-| phase | cost |
-|---|---|
-| boot and startup tune | 4.2x slower than real time |
-| armed, zero throttle | 7.5x |
-| armed, throttled, stepping for BEMF | 9.2x |
-| host SITL, same machine | ~1.4x **faster** than real time |
+| `batchUs` | boot+arm | spinning | rpm | `commutation_interval` |
+|---|---|---|---|---|
+| 2  | 15.0x | 19.1x | 2418 | 1181 |
+| 5  | 9.7x  | 11.1x | 2362 | 1210 |
+| **10** | **6.3x** | **9.6x** | **2437** | **1170** |
+| 20 | 5.9x  | 8.1x  | 2441 | 1168 |
 
-The stepping figure understates a real spin: stuck-rotor protection has
-already latched and zeroed `input`, so the bridge is not being driven
-continuously. Expect worse once the comparator closes the loop.
+For reference the MCU emulation alone, with no physics, is 4.8x booting
+and 6.8x throttled; the host SITL runs ~1.4x *faster* than real time.
 
-That rules out calibration work here — a 60 s chirp would take about 9
-minutes and the full suite days — but it does not rule out a motor.
-Spinning one is worth it for what the SITL structurally cannot reach:
-the real `phaseouts.c` and `comparator.c` register code driving real
-physics. Calibration and sweeps stay in the SITL.
+The physics coupling cost is **per-batch overhead, not integration**.
+Every row above runs the same number of physics sub-steps per simulated
+second - `batchUs` changes only how often Renode samples the registers
+and crosses the P/Invoke boundary - yet the cost more than halves from 2
+to 10. The integration itself is nearly free.
 
-The physics will be **DllImported from `Mcu/SITL/sim/motor.c`, not
-ported to C#**. `motor.c` was substantially rewritten recently, so a
-fork would diverge on the next recalibration and leave two models with
-no ground truth. Its physics core needs only `sitl_phase_mode[3]` and
-the gate states; nearly every `extern` reference to a firmware global
-sits in the logging functions, which can be stubbed or fed from
-emulated SRAM.
+`batchUs: 10` is the default: it costs 0.8% in rpm against the 2us
+reference for a 2x speedup. The spread across the table is real sampling
+error and not noise - two runs at the same setting are bit-identical
+(same rpm, same zero-cross count, same commutation interval), so the
+differences are attributable to batch size alone. Every setting spins
+cleanly: `bemf_timeout_happened` and `desync_happened` are both 0
+throughout.
+
+A stationary, undriven motor is skipped entirely rather than integrated,
+which is most of boot. That helps but does not eliminate the boot cost,
+because the batch tick itself - four register reads and a P/Invoke - is
+what is expensive, not the work it decides to skip.
+
+Calibration work still belongs in the SITL - a 60s chirp here is minutes
+- but a spin is entirely practical.
+
+## Physics: borrowed, not forked
+
+`Mcu/SITL/sim/motor.c` is compiled unmodified into `libam32sim.so`
+(`Mcu/Renode/sim/`) and reached over P/Invoke. It has been refit against
+real hardware more than once, so a C# transliteration would diverge on
+the next recalibration and leave two models with no ground truth.
+`am32sim_shim.c` supplies what the SITL's fake peripherals would have -
+and here every one of those inputs comes from a register the real
+`Mcu/f051/Src` code wrote.
 
 ## Bring-up findings
 

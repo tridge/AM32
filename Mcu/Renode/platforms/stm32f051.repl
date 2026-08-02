@@ -270,6 +270,11 @@ syscfgcomp: Miscellaneous.AM32_STM32F0_SysCfgComp @ sysbus <0x40010000, +0x400>
     0 -> exti@21
     1 -> exti@22
 
+// Couples the emulated bridge to the SITL motor physics. LibraryPath
+// and ConfigPath are set from the .resc, since they are absolute paths.
+bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x50000400
+    batchUs: 10
+
 // 0x50000000 is outside both the peripheral aperture and anything the
 // F051 decodes, so the firmware can never reach it.
 throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x50000000
