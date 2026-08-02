@@ -122,11 +122,13 @@ spi1: SPI.STM32SPI @ sysbus 0x40013000
 spi2: SPI.STM32SPI @ sysbus 0x40003800
     IRQ -> nvic@26
 
-timer1: Timers.STM32_Timer @ sysbus 0x40012C00
+// motor PWM. The stock STM32_Timer has no MOE, no complementary
+// outputs, no dead time and no preload shadowing, and keeps its
+// register fields private.
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
     frequency: 48000000
-    initialLimit: 0xFFFF
-    [BreakInterrupt, UpdateInterrupt, TriggerInterrupt, CommutationInterrupt] -> nvic@[13, 13, 13, 13]
-    CaptureCompareInterrupt -> nvic@14
+    0 -> nvic@13
+    1 -> nvic@14
 
 timer2: Timers.STM32_Timer @ sysbus 0x40000000
     frequency: 48000000
@@ -188,11 +190,10 @@ crc: CRC.STM32_CRC @ sysbus 0x40023000
     configurablePoly: false // Only STM32F07x and STM32F09x implements configurablePoly: true
 
 // Alternate function mapping connections. For more details see `stm32l071.repl`.
-timer1:
-    0 -> gpioPortA#07@2 | gpioPortA#08@2 | gpioPortB#13@2
-    1 -> gpioPortA#09@2 | gpioPortB#00@2 | gpioPortB#14@2
-    2 -> gpioPortA#10@2 | gpioPortB#01@2 | gpioPortB#15@2
-    3 -> gpioPortA#11@2
+// timer1's stock block is gone for the same reason timer15's is: a later
+// block replaces an earlier one, and here it would have overwritten the
+// nvic wiring with pin outputs. The motor model samples TIM1 by querying
+// OutputRef(), not by listening for edges.
 
 timer3:
     0 -> gpioPortA#06@1 | gpioPortB#04@1 | gpioPortC#06@1
