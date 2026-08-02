@@ -121,10 +121,11 @@ FAMILY = {
         'dma_irq': 11,
         'adc_dma': 0,
         'adc_irq': 'nvicInput12@2',
-        # temperature sensor channel, its factory calibration pair, and
-        # the temperature the second point was taken at
+        # temperature sensor channel, its factory calibration pair, the
+        # temperature the second point was taken at, and the Vref+ the
+        # calibration was done with
         'temp_channel': 16,
-        'ts_cal': (0x1FFFF7B8, 0x1FFFF7C2, 110),
+        'ts_cal': (0x1FFFF7B8, 0x1FFFF7C2, 110, 3300),
     },
     'g071': {
         'macro': 'MCU_G071',
@@ -138,7 +139,7 @@ FAMILY = {
         'adc_dma': 1,
         'adc_irq': 'nvicInput12@2',
         'temp_channel': 12,
-        'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 130),
+        'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 130, 3000),
     },
 }
 
@@ -430,6 +431,7 @@ def platform(cfg):
         '    tsCal1: 0x%08X' % spec['ts_cal'][0],
         '    tsCal2: 0x%08X' % spec['ts_cal'][1],
         '    tsCal2Temp: %d' % spec['ts_cal'][2],
+        '    tsCalVrefMv: %d' % spec['ts_cal'][3],
         '    0 -> dma@%d' % spec['adc_dma'],
         '    1 -> %s' % spec['adc_irq'],
         '',

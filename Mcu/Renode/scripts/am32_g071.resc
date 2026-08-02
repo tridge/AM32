@@ -37,11 +37,13 @@ sysbus LoadELF $elf
 $eeprom_addr?=0x0800F800
 sysbus LoadBinary $eeprom $eeprom_addr
 
-# Factory temperature calibration, as on the F051 but at the G0's
-# addresses. Same representative values: the sensor sits near 1.43V at
-# 30C and falls about 4.3mV/C, which is 1774 and 1348 counts at 3.3V.
-sysbus WriteWord 0x1FFF75A8 1774
-sysbus WriteWord 0x1FFF75CA 1348
+# Factory temperature calibration, at the G0's addresses. Note these are
+# not the F051's values with different addresses: the G0 sensor voltage
+# RISES with temperature, and its calibration is taken at 3.0V rather
+# than 3.3V and at 130C rather than 110C for the second point. These are
+# representative STM32G0 numbers rather than any particular die.
+sysbus WriteWord 0x1FFF75A8 990
+sysbus WriteWord 0x1FFF75CA 1290
 
 # The G0 core is a Cortex-M0+, which does have a VTOR, and the firmware
 # sets it itself in initAfterJump(). Pointing the CPU at the flash table

@@ -51,7 +51,8 @@ namespace Antmicro.Renode.Peripherals.Analog
                                 int temperatureChannel = 16,
                                 ulong tsCal1 = 0x1FFFF7B8,
                                 ulong tsCal2 = 0x1FFFF7C2,
-                                int tsCal2Temp = 110)
+                                int tsCal2Temp = 110,
+                                int tsCalVrefMv = 3300)
         {
             this.machine = machine;
             this.voltageChannel = voltageChannel;
@@ -63,6 +64,11 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.tsCal1 = tsCal1;
             this.tsCal2 = tsCal2;
             this.tsCal2Temp = tsCal2Temp;
+            this.tsCalVrefMv = tsCalVrefMv;
+            if(tsCalVrefMv <= 0)
+            {
+                throw new RecoverableException("tsCalVrefMv must be positive");
+            }
             if(voltageDivider <= 0)
             {
                 throw new RecoverableException("voltageDivider must be positive");
@@ -261,8 +267,15 @@ namespace Antmicro.Renode.Peripherals.Analog
             {
                 return cal1; // uncalibrated; avoid inventing a slope
             }
-            return Clamp(cal1 + (degrees - 30.0) * (cal2 - cal1)
-                                / (tsCal2Temp - 30.0));
+            var counts = cal1 + (degrees - 30.0) * (cal2 - cal1)
+                                / (tsCal2Temp - 30.0);
+            // __LL_ADC_CALC_TEMPERATURE scales the reading by
+            // VDDA / TEMPSENSOR_CAL_VREFANALOG before comparing it
+            // against the calibration points, and main.c passes 3300 for
+            // VDDA on both families. The F0 calibrates at 3.3V so that is
+            // a no-op there, but the G0 calibrates at 3.0V, and without
+            // the inverse here a real 25C came back as 57.5C.
+            return Clamp(counts * tsCalVrefMv / 3300.0);
         }
 
         private static uint Clamp(double counts)
@@ -314,6 +327,7 @@ namespace Antmicro.Renode.Peripherals.Analog
         private readonly ulong tsCal1;
         private readonly ulong tsCal2;
         private readonly int tsCal2Temp;
+        private readonly int tsCalVrefMv;
         private readonly int voltageChannel;
         private readonly int currentChannel;
         private readonly int voltageDivider;
