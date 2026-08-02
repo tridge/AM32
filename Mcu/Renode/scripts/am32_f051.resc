@@ -1,15 +1,25 @@
 :name: AM32 F051
 :description: boots an AM32 STM32F051 firmware ELF
 
+# Common to every F051 target. Do not include this directly - include
+# scripts/targets/<TARGET>.resc, which sets $platform and then comes
+# here.
+#
 # Paths are absolute, supplied by the caller, because the test harness
 # runs from a scratch directory like the SITL suite does. $elf is
 # required; $eeprom is optional but you almost always want it, since
 # unbacked Renode memory reads as zero whereas erased flash reads 0xFF,
 # and a zeroed eeprom sends the firmware down the migration path.
+#
+# $platform must already be set. It cannot be built from a target name
+# here: the monitor expands a path variable at the start of a path but
+# leaves a second one later in the same path alone, so
+# "$repo/.../$target.repl" would resolve to a literal "$target.repl".
 
 $repo?=@.
 $elf?=@none
 $eeprom?=@none
+$platform?=@none
 
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_RCC.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
@@ -20,7 +30,7 @@ include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
 
 mach create "am32"
-machine LoadPlatformDescription $repo/Mcu/Renode/platforms/stm32f051.repl
+machine LoadPlatformDescription $platform
 
 sysbus LoadELF $elf
 

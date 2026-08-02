@@ -7,11 +7,13 @@ it arms and then spins a simulated motor closed loop on BEMF.
 Mirrors Mcu/SITL/run_ci_tests.py in style. Only needs the python
 standard library, plus arm-none-eabi-nm for the symbol table.
 
-usage: run_renode_tests.py [--elf ...] [--renode ...] [--model ...]
+usage: run_renode_tests.py [--target ...] [--elf ...] [--renode ...]
+                           [--model ...]
 exits non-zero if any test fails, or 77 if the harness cannot run.
 '''
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -97,7 +99,7 @@ def report(tag):
 '''
 
 
-def run(renode, elf, eeprom, model, so, syms, scratch, physics=True):
+def run(renode, target, elf, eeprom, model, so, syms, scratch, physics=True):
     want = ['armed', 'running', 'zero_crosses', 'bemf_timeout_happened',
             'desync_happened']
     missing = [n for n in want if n not in syms]
@@ -115,7 +117,7 @@ def run(renode, elf, eeprom, model, so, syms, scratch, physics=True):
             '$repo=@%s' % REPO,
             '$elf=@%s' % elf,
             '$eeprom=@%s' % eeprom,
-            'include @%s/Mcu/Renode/scripts/am32_f051.resc' % REPO,
+            'include @%s/Mcu/Renode/scripts/targets/%s.resc' % (REPO, target),
             'logLevel 3',
             'cpu AddSymbolHook "delayMillis" "execfile(\'%s/Mcu/Renode/scripts/skip_delays.py\')"' % REPO,
             'bridge LibraryPath "%s"' % so if physics else '',
@@ -159,8 +161,11 @@ def run(renode, elf, eeprom, model, so, syms, scratch, physics=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--elf', default=os.path.join(REPO, 'obj',
-                                                  'AM32_FD6288_F051_2.20.elf'))
+    ap.add_argument('--target', default='FD6288_F051',
+                    help='must have a scripts/targets/<TARGET>.resc')
+    # defaults to whatever obj/ holds for the target, so the firmware
+    # version does not have to be tracked here
+    ap.add_argument('--elf', default=None)
     ap.add_argument('--renode', default=None)
     ap.add_argument('--nm', default='arm-none-eabi-nm')
     ap.add_argument('--model', default=os.path.join(
@@ -170,8 +175,17 @@ def main():
     ap.add_argument('--no-physics', action='store_true')
     args = ap.parse_args()
 
+    resc = os.path.join(RENODE_DIR, 'scripts', 'targets', '%s.resc' % args.target)
+    if not os.path.exists(resc):
+        skip('no Renode target %s; expected %s' % (args.target, resc))
+    if args.elf is None:
+        found = sorted(glob.glob(os.path.join(REPO, 'obj',
+                                              'AM32_%s_*.elf' % args.target)))
+        if not found:
+            skip('no firmware in obj/ for %s; build it first' % args.target)
+        args.elf = found[-1]
     if not os.path.exists(args.elf):
-        skip('no firmware at %s; build FD6288_F051 first' % args.elf)
+        skip('no firmware at %s' % args.elf)
     renode = find_renode(args.renode)
     if renode is None:
         skip('renode not installed')
@@ -211,8 +225,8 @@ def main():
         with open(eeprom, 'wb') as f:
             f.write(bytes(image))
 
-        res = run(renode, args.elf, eeprom, args.model, so, syms, scratch,
-                  physics=not args.no_physics)
+        res = run(renode, args.target, args.elf, eeprom, args.model, so, syms,
+                  scratch, physics=not args.no_physics)
 
     a = res.get('armed', {})
     s = res.get('spin', {})
