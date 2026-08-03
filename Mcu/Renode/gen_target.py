@@ -860,12 +860,16 @@ def write_gdb_launcher(path, gdb, elf, port):
 def find_elf(target):
     '''newest firmware ELF in obj/ for exactly this target, or None.
        A bare glob is not enough: AM32_X_*.elf also matches the CAN
-       sibling AM32_X_CAN_*.elf, which sorts after every version of X.'''
-    pat = re.compile(r'AM32_%s_[0-9][0-9.]*\.elf$' % re.escape(target))
-    found = sorted(f for f in glob.glob(os.path.join(
-        REPO, 'obj', 'AM32_%s_*.elf' % target))
-        if pat.search(os.path.basename(f)))
-    return found[-1] if found else None
+       sibling AM32_X_CAN_*.elf, which sorts after every version of X.
+       Versions compare numerically, not lexically: 2.20 is newer than
+       2.9.'''
+    pat = re.compile(r'AM32_%s_([0-9]+(?:\.[0-9]+)*)\.elf$' % re.escape(target))
+    found = []
+    for f in glob.glob(os.path.join(REPO, 'obj', 'AM32_%s_*.elf' % target)):
+        m = pat.search(os.path.basename(f))
+        if m:
+            found.append((tuple(int(p) for p in m.group(1).split('.')), f))
+    return max(found)[1] if found else None
 
 
 def find_renode(explicit=None):
@@ -948,7 +952,10 @@ def all_targets(nm='arm-none-eabi-gcc'):
             config(t, nm)
         except Unsupported:
             continue
-        except Exception:
+        except Exception as e:
+            # a generator bug must not silently shrink the sweep list
+            print('WARNING: %s dropped from the list: %s' % (t, e),
+                  file=sys.stderr)
             continue
         found.append(t)
     return found

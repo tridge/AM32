@@ -13,11 +13,11 @@
 // G0's 17/18.
 //
 // AM32's L431 targets use a single comparator (MAIN_COMP, COMP1 or
-// COMP2 per hardware group); the N_VARIANT machinery is kept anyway so
-// a future split-comparator group is a table entry, not a new model.
-// The active comparator is the one most recently written, which is what
-// active_COMP means: the firmware writes its CSR on every commutation
-// step.
+// COMP2 per hardware group), and the L431 firmware has no N_VARIANT
+// split-comparator path - the per-phase comparator parameters exist for
+// symmetry with the G0 model, not as working support for one. The
+// active comparator is the one most recently written, which is what the
+// firmware does on every commutation step.
 //
 // The non-inverting input is the resistor-star virtual neutral, so the
 // output is high when neutral is above the floating phase - the same
@@ -93,9 +93,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        // Driven by the motor model. Only the active comparator's line
-        // moves: the other keeps its last level, and the firmware has its
-        // EXTI line masked off anyway.
+        // Driven by the motor model. Only the active comparator can
+        // read or drive high: the inactive one's output is held low,
+        // and the firmware has its EXTI line masked off anyway.
         public bool CompOutput
         {
             get { return output; }

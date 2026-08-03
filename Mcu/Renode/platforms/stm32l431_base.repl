@@ -123,13 +123,15 @@ rcc: Python.PythonPeripheral @ sysbus 0x40021000
     initable: true
     script: '''
 if request.IsInit:
-    data = {'cr': 0, 'sw': 0, 'bdcr': 0, 'csr': 0}
+    data = {'cr': 0, 'sw': 0, 'pllcfgr': 0, 'bdcr': 0, 'csr': 0}
 
 if request.IsWrite:
     if request.Offset == 0x0:
         data['cr'] = request.Value
     elif request.Offset == 0x8:
         data['sw'] = request.Value & 0x3
+    elif request.Offset == 0xC:
+        data['pllcfgr'] = request.Value
     elif request.Offset == 0x90:
         data['bdcr'] = request.Value
     elif request.Offset == 0x94:
@@ -137,12 +139,18 @@ if request.IsWrite:
 elif request.IsRead:
     if request.Offset == 0x0:
         # MSIRDY(1) <- MSION(0), HSIRDY(10) <- HSION(8),
-        # PLLRDY(25) <- PLLON(24)
+        # HSERDY(17) <- HSEON(16), PLLRDY(25) <- PLLON(24)
         v = data['cr']
-        request.Value = v | ((v & 1) << 1) | (((v >> 8) & 1) << 10) | (((v >> 24) & 1) << 25)
+        request.Value = v | ((v & 1) << 1) | (((v >> 8) & 1) << 10) | (((v >> 16) & 1) << 17) | (((v >> 24) & 1) << 25)
     elif request.Offset == 0x8:
         # SWS[3:2] mirrors SW[1:0]
         request.Value = data['sw'] | (data['sw'] << 2)
+    elif request.Offset == 0xC:
+        # stored, not interpreted: sys_can_init() derives PCLK1 from
+        # LL_RCC_GetSystemClocksFreq(), which recomputes the PLL output
+        # from PLLCFGR - a zero readback makes that 0 MHz, and the CAN
+        # bitrate switch hangs forever in its default arm
+        request.Value = data['pllcfgr']
     elif request.Offset == 0x90:
         # LSERDY(1) <- LSEON(0)
         v = data['bdcr']
