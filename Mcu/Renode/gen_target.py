@@ -126,6 +126,8 @@ FAMILY = {
         # calibration was done with
         'temp_channel': 16,
         'ts_cal': (0x1FFFF7B8, 0x1FFFF7C2, 110, 3300),
+        # no PA11/PA12 phase remap on this family
+        'syscfg': 0,
     },
     'g071': {
         'macro': 'MCU_G071',
@@ -133,6 +135,8 @@ FAMILY = {
         # the G0 puts GPIO where the F0 has spare address space, so the
         # two made-up peripherals move out of the way
         'gpio_a': 0x50000000,
+        # SYSCFG_CFGR1, whose bits 3 and 4 remap PA11/PA12
+        'syscfg': 0x40010000,
         'throttle': 0x60000000,
         'bridge': 0x60000400,
         'dma_irq': 9,
@@ -191,6 +195,25 @@ def pin_name(port, pin):
     if not port.startswith('GPIO') or not pin.startswith('LL_GPIO_PIN_'):
         raise Unsupported('cannot read pin %s %s' % (port, pin))
     return 'P%s%s' % (port[4:], pin[len('LL_GPIO_PIN_'):])
+
+
+def capture_input_af(family, timer, port, pin):
+    '''alternate function that routes <timer>_CH1 to P<port><pin>.
+
+       Parsed out of STOCK_TIMER's channel 0 line rather than restated:
+       those "gpioPortA#02@0" entries are already the per pin AF map, and
+       the table holds an entry for whichever timer is the capture timer
+       on this target. Returns None if the pin is not a CH1 option, which
+       leaves the gate off rather than guessing.'''
+    spec = STOCK_TIMER.get(family, {}).get(timer)
+    if spec is None:
+        return None
+    want = 'gpioPort%s#%02d@' % (port, pin)
+    for entry in spec[3][0].split('|'):
+        entry = entry.strip().lstrip('0 ->').strip()
+        if entry.startswith(want):
+            return int(entry[len(want):])
+    return None
 
 
 def config(target, nm='arm-none-eabi-gcc'):
@@ -282,6 +305,12 @@ def config(target, nm='arm-none-eabi-gcc'):
         # reference manual counts channels from 1, Renode from 0
         'dma_channel': int(chan[len('LL_DMA_CHANNEL_'):]) - 1,
         'throttle_pin': pin_name(m['INPUT_PIN_PORT'], m['INPUT_PIN']),
+        'input_base': FAMILY[family]['gpio_a']
+                      + 0x400 * (ord(m['INPUT_PIN_PORT'][4:]) - ord('A')),
+        'input_pin': int(m['INPUT_PIN'][len('LL_GPIO_PIN_'):]),
+        'input_af': capture_input_af(
+            family, timer, m['INPUT_PIN_PORT'][4:],
+            int(m['INPUT_PIN'][len('LL_GPIO_PIN_'):])),
         'dead_time': m.get('DEAD_TIME', '?'),
         'eeprom_addr': eeprom_addr,
         'comps': comps,
@@ -369,6 +398,13 @@ def platform(cfg):
         '%s: Timers.AM32_STM32_CaptureTimer @ sysbus 0x%08X'
         % (cap, cfg['timer_addr']),
         '    frequency: %d' % spec['timer_hz'],
+    ] + ([
+        # so a capture only happens when the pin is actually routed to
+        # this timer, not merely toggling
+        '    inputBase: 0x%08X' % cfg['input_base'],
+        '    inputPin: %d' % cfg['input_pin'],
+        '    inputAf: %d' % cfg['input_af'],
+    ] if cfg['input_af'] is not None else []) + [
         '    0 -> dma@%d' % cfg['dma_channel'],
         '    1 -> nvic@%d' % cfg['timer_irq'],
         # output 2 is the bidirectional dshot reply, going back to the
@@ -408,6 +444,7 @@ def platform(cfg):
         '    batchUs: 10',
         '    timerHz: %d' % spec['timer_hz'],
         '    gpioABase: 0x%08X' % spec['gpio_a'],
+        '    syscfgBase: 0x%08X' % spec['syscfg'],
         '    gpioBBase: 0x%08X' % (spec['gpio_a'] + 0x400),
         '    gpioCBase: 0x%08X' % (spec['gpio_a'] + 0x800),
     ] + [

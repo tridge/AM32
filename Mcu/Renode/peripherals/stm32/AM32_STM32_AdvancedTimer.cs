@@ -125,6 +125,21 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public bool MainOutputEnabled => (regs[BDTR / 4] & MOE) != 0;
 
+        // CR1.CEN. Without it the counter never advances, so no compare
+        // ever matches and the outputs sit idle however the pins and
+        // CCER are set up.
+        public bool CounterEnabled => (regs[CR1 / 4] & CEN) != 0;
+
+        // CCxE: the channel's main output is connected to its pin
+        public bool ChannelEnabled(int channel)
+        {
+            if(channel < 0 || channel > 3 || !MainOutputEnabled)
+            {
+                return false;
+            }
+            return (regs[CCER / 4] & (CCxE << (4 * channel))) != 0;
+        }
+
         // The period and compare values the hardware is actually
         // counting against, which with ARPE/OCxPE set are not what a
         // read of ARR or CCRx returns - those give the preload the
