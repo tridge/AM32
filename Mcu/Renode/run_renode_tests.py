@@ -674,11 +674,9 @@ def main():
         args.dshot = 600
 
     if args.elf is None:
-        found = sorted(glob.glob(os.path.join(REPO, 'obj',
-                                              'AM32_%s_*.elf' % args.target)))
-        if not found:
+        args.elf = gen_target.find_elf(args.target)
+        if args.elf is None:
             skip('no firmware in obj/ for %s; build it first' % args.target)
-        args.elf = found[-1]
     if not os.path.exists(args.elf):
         skip('no firmware at %s' % args.elf)
     renode = find_renode(args.renode)

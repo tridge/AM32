@@ -26,6 +26,7 @@ does for a skip.
 import argparse
 import glob
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -756,6 +757,17 @@ def write_gdb_launcher(path, gdb, elf, port):
     os.chmod(path, 0o755)
 
 
+def find_elf(target):
+    '''newest firmware ELF in obj/ for exactly this target, or None.
+       A bare glob is not enough: AM32_X_*.elf also matches the CAN
+       sibling AM32_X_CAN_*.elf, which sorts after every version of X.'''
+    pat = re.compile(r'AM32_%s_[0-9][0-9.]*\.elf$' % re.escape(target))
+    found = sorted(f for f in glob.glob(os.path.join(
+        REPO, 'obj', 'AM32_%s_*.elf' % target))
+        if pat.search(os.path.basename(f)))
+    return found[-1] if found else None
+
+
 def find_renode(explicit=None):
     '''the renode to launch: an explicit path wins, else a dotnet
     portable installed under tools/linux (not vendored - a 77MB download
@@ -924,13 +936,11 @@ def main():
 
     elf = args.elf
     if elf is None:
-        found = sorted(glob.glob(os.path.join(REPO, 'obj',
-                                              'AM32_%s_*.elf' % args.target)))
-        if not found:
+        elf = find_elf(args.target)
+        if elf is None:
             print('no firmware in obj/ for %s; build it or pass --elf'
                   % args.target)
             return 1
-        elf = found[-1]
     if not os.path.exists(elf):
         print('no firmware at %s' % elf)
         return 1
