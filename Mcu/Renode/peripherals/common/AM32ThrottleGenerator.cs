@@ -163,6 +163,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        // the telemetry request bit. AM32 does not need it set to process
+        // a command, but a flight controller sets it, so carry what the
+        // sender asked for rather than a fixed zero.
+        public bool TelemetryBit { get; set; }
+
         public bool Enabled
         {
             get { return enabled; }
@@ -171,8 +176,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 enabled = value;
                 if(!enabled)
                 {
+                    // stopping is a flight controller unplugging, not one
+                    // holding the wire down: on a bidirectional link that
+                    // means releasing it, so the ESC still owns its half
+                    // of the frame and the firmware sees signal loss
+                    // rather than a stuck-low line.
                     frameTimer.Enabled = false;
-                    Connections[0].Unset();
+                    transmitting = false;
+                    DriveIdle();
                     high = false;
                     return;
                 }
@@ -289,7 +300,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             escLevel = value;
             // only forward it while we are not driving a frame ourselves
-            if(bidirectional && enabled && !transmitting)
+            if(bidirectional && !transmitting)
             {
                 Connections[0].Set(value);
             }
@@ -341,28 +352,37 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        // Idle between frames, sized to give a 4kHz frame rate - a rate a
-        // flight controller would really use, and cheap: every edge is a
-        // timer event, so the 19kHz that falls out of a minimal gap costs
-        // nearly five times as much to simulate for no added coverage.
-        // Falls back to a bit period if the frame alone is longer.
+        // Dshot frame period. The default 250us is 4kHz, a rate a flight
+        // controller would really use, and cheap: every edge is a timer
+        // event, so the 19kHz that falls out of a minimal gap costs nearly
+        // five times as much to simulate for no added coverage. Raising it
+        // is the cheapest speed lever there is when the wire is not what
+        // is under test - the cost is proportional.
+        public uint DshotFrameUs
+        {
+            get { return dshotFrameUs; }
+            set { dshotFrameUs = value == 0 ? 1u : value; }
+        }
+
+        // Idle between frames. Falls back to a bit period if the frame
+        // alone is longer than the requested period.
         private ulong FrameGapNs
         {
             get
             {
                 var frameNs = BitPeriodNs * 16;
-                return DshotPeriodNs > frameNs ? DshotPeriodNs - frameNs
-                                               : BitPeriodNs;
+                var periodNs = (ulong)dshotFrameUs * 1000;
+                return periodNs > frameNs ? periodNs - frameNs : BitPeriodNs;
             }
         }
 
-        private const ulong DshotPeriodNs = 250000;
+        private uint dshotFrameUs = 250;
 
         // 11 bit value, telemetry request, then a 4 bit CRC over the
         // three nibbles above it
         private uint DshotFrame()
         {
-            var payload = (dshotValue << 1) | 0u; // no telemetry request
+            var payload = (dshotValue << 1) | (TelemetryBit ? 1u : 0u);
             var crc = (payload ^ (payload >> 4) ^ (payload >> 8)) & 0xF;
             if(bidirectional)
             {
