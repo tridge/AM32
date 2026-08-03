@@ -605,7 +605,7 @@ def link_sample(ds, sim):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--target', default='FD6288_F051',
-                    help='any F051 or G071 target in Inc/targets.h')
+                    help='any F051, G071 or non-CAN L431 target in Inc/targets.h')
     # defaults to whatever obj/ holds for the target, so the firmware
     # version does not have to be tracked here
     ap.add_argument('--elf', default=None)
