@@ -1,0 +1,228 @@
+// STM32L431 common to every AM32 L431 target. Not loadable on its own:
+// it deliberately leaves out the capture timer, the comparator and the
+// throttle wiring, which differ per hardware group. Load a generated
+// target overlay instead.
+//
+// Written from RM0394 and Mcu/l431/STM32L4x1.svd rather than vendored:
+// Renode 1.16.1 ships no stm32l4 platform to start from. First non-M0
+// family here, and the first with an FPU.
+//
+// An overlay may only ADD to this file. Redeclaring a name that is
+// already here fails with "Variable 'x' was already declared", which is
+// why anything a target needs to declare for itself is absent below
+// rather than given a default here.
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 80000000
+    IRQ -> cpu@0
+
+// The L4 EXTI keeps the F0/F4 single-bank register layout (IMR1 at
+// 0x00, RTSR1/FTSR1/SWIER1/PR1 following), so the stock model the F051
+// platform runs against serves here unchanged - including not clearing
+// a pending line on its own, which COMP_IRQHandler relies on to wait
+// out the commutation blanking window by immediate re-entry. Lines 21
+// and 22 are COMP1 and COMP2; the firmware also pulses line 15 through
+// SWIER1 to defer dshot decoding out of the DMA interrupt.
+exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 32
+    [0-4] -> nvic@[6-10]
+    [5-9] -> nvicInput23@[0-4]
+    [10-15] -> nvicInput40@[0-5]
+    [21, 22] -> nvicInput64@[0, 1]
+
+nvicInput23: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 5
+    -> nvic@23
+
+nvicInput40: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 6
+    -> nvic@40
+
+// COMP_IRQn: both comparators share one NVIC line on the L4
+nvicInput64: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@64
+
+// TIM1_UP_TIM16_IRQn: TIM1's update interrupt shares the line with
+// TIM16, the commutation timer on this family. The firmware never
+// enables TIM1's UIE, but the sharing is real hardware wiring.
+nvicInput25: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@25
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4f"
+    nvic: nvic
+
+usart1: UART.STM32F7_USART @ sysbus 0x40013800
+    frequency: 80000000
+    IRQ -> nvic@37
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x48000000, +0x400>
+    modeResetValue: 0xABFFFFFF
+    pullUpPullDownResetValue: 0x64000000
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x48000400, +0x400>
+    modeResetValue: 0xFFFFFEBF
+    pullUpPullDownResetValue: 0x00000100
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x48000800, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 16
+    [0-15] -> exti@[0-15]
+
+// motor PWM, the same model the other families use: the stock
+// STM32_Timer has no MOE, no complementary outputs, no dead time and no
+// preload shadowing. TIM1's register layout matches the F0/G0.
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 80000000
+    0 -> nvicInput25@0
+    1 -> nvic@27
+
+timer2: Timers.STM32_Timer @ sysbus 0x40000000
+    frequency: 80000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@28
+
+timer6: Timers.STM32_Timer @ sysbus 0x40001000
+    frequency: 80000000
+    initialLimit: 0xFFFF
+    -> nvic@54
+
+timer7: Timers.STM32_Timer @ sysbus 0x40001400
+    frequency: 80000000
+    initialLimit: 0xFFFF
+    -> nvic@55
+
+// timer15 is declared by the target overlay, not here: it is the
+// capture timer on every L431 hardware group, and belongs with the DMA
+// channel and input pin wiring that go with it.
+
+timer16: Timers.STM32_Timer @ sysbus 0x40014400
+    frequency: 80000000
+    initialLimit: 0xFFFF
+    -> nvicInput25@1
+
+// Enable-to-ready flip-flops at the L4 offsets, in the same spirit as
+// the stock G0 stub: SystemClock_Config spins on HSIRDY, PLLRDY and
+// SWS, and the USE_LSE targets add MSI, LSI and the backup-domain LSE.
+// Reads of CFGR return SW as well as SWS: the AHB/APB prescaler writes
+// read-modify-write CFGR after the SWS poll, and losing the latched
+// switch there would fail a later re-read on the reboot path.
+// Everything else - PLLCFGR, the enable and reset registers (including
+// the APB2RSTR pulse receiveDshotDma() sends TIM15 every frame, which
+// the capture timer model tolerates without) - reads back zero.
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    data = {'cr': 0, 'sw': 0, 'bdcr': 0, 'csr': 0}
+
+if request.IsWrite:
+    if request.Offset == 0x0:
+        data['cr'] = request.Value
+    elif request.Offset == 0x8:
+        data['sw'] = request.Value & 0x3
+    elif request.Offset == 0x90:
+        data['bdcr'] = request.Value
+    elif request.Offset == 0x94:
+        data['csr'] = request.Value
+elif request.IsRead:
+    if request.Offset == 0x0:
+        # MSIRDY(1) <- MSION(0), HSIRDY(10) <- HSION(8),
+        # PLLRDY(25) <- PLLON(24)
+        v = data['cr']
+        request.Value = v | ((v & 1) << 1) | (((v >> 8) & 1) << 10) | (((v >> 24) & 1) << 25)
+    elif request.Offset == 0x8:
+        # SWS[3:2] mirrors SW[1:0]
+        request.Value = data['sw'] | (data['sw'] << 2)
+    elif request.Offset == 0x90:
+        # LSERDY(1) <- LSEON(0)
+        v = data['bdcr']
+        request.Value = v | ((v & 1) << 1)
+    elif request.Offset == 0x94:
+        # LSIRDY(1) <- LSION(0)
+        v = data['csr']
+        request.Value = v | ((v & 1) << 1)
+    else:
+        request.Value = 0
+'''
+
+// DMA1, request driven as on the other families. The L431 routes
+// peripheral requests with the CSELR register at 0xA8 rather than the
+// G0's DMAMUX; it falls past the model's channel block and is ignored,
+// so the routing is hardwired by the platform and CSELR itself is not
+// checked - the same deliberate deviation as the G0's DMAMUX stub.
+// Which channel raises which NVIC line is set by the overlay.
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 7
+
+// Write-readback stubs. FLASH: LL_FLASH_SetLatency polls its own ACR
+// readback; the BSY polls in save_flash_nolib() read SR, which is never
+// written with bit 16 set, so they fall straight through - page erase
+// is a no-op and flash writes land in MappedMemory as plain RAM.
+// PWR: the VOSF poll wants SR2 bit 10 to read zero, which an unwritten
+// register does. OPAMP: init_OPAMP() writes and never polls.
+flash_ctrl: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+
+pwr: Miscellaneous.AM32_RegisterFile @ sysbus <0x40007000, +0x400>
+
+opamp: Miscellaneous.AM32_RegisterFile @ sysbus <0x40007800, +0x400>
+
+// SYSCFG alone: the comparators at 0x40010200 are a separate peripheral
+// on the L4, declared by the target overlay.
+syscfg: Miscellaneous.AM32_RegisterFile @ sysbus <0x40010000, +0x200>
+
+// Ours rather than Renode's watchdog, as on the other families: accepts
+// and counts the kicks but never resets the machine.
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+// 256K covers every L431 variant; the 128K parts keep their settings at
+// 0x0801F800 and the 64K ones at 0x0800F800, both inside this.
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x40000
+
+// NOT an alias: a second, independent backing store at 0. Reads see
+// zeros, not flash, so checkDeviceInfo() finds no devinfo magic at
+// 0x00000FE0 and keeps the compile-time eeprom address - correct while
+// no bootloader is loaded, same as on the F051.
+flashAlias: Memory.MappedMemory @ sysbus 0x0
+    size: 0x1000
+
+// 48K SRAM1 plus the contiguous 16K SRAM2 mirror: the linker script
+// treats them as one 64K region and puts the initial stack pointer at
+// 0x20010000, so mapping only SRAM1 faults the first push.
+ram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x10000
+
+sram2: Memory.MappedMemory @ sysbus 0x10000000
+    size: 0x4000
+
+// factory calibration page. The 1kHz ADC path reads the temperature
+// calibration halfwords at 0x1FFF75A8 and 0x1FFF75CA; an unbacked pair
+// divides by zero in __LL_ADC_CALC_TEMPERATURE.
+systemMemory: Memory.MappedMemory @ sysbus 0x1FFF7000
+    size: 0x1000
+
+// The bridge, the throttle generator, the guilink, the capture timer,
+// the comparator and the ADC are declared by the target overlay: their
+// pin maps, channels and scaling differ per target. The made-up
+// peripherals sit at 0x60000000 as on the G0.
+
+sysbus:
+    init:
+        Tag <0x40002800, 0x40002BFF> "RTC"
+        Tag <0x40002C00, 0x40002FFF> "WWDG"
+        Tag <0x40006400, 0x400067FF> "CAN1"
+        Tag <0x40007C00, 0x40007FFF> "LPTIM1"
+        Tag <0x40008000, 0x400083FF> "LPUART1"
+        Tag <0x40009400, 0x400097FF> "LPTIM2"
+        Tag <0x40011C00, 0x40011FFF> "FIREWALL"
+        Tag <0x40023000, 0x400233FF> "CRC"
