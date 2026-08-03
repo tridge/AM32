@@ -342,7 +342,34 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
             check('reaches the settled window', False,
                   'simulated time did not advance')
             return {}
-        return {'armed': armed, 'spin': link_sample(ds, sim)}
+        spin = link_sample(ds, sim)
+
+        # pacing (state cmd 2): the GUI's speedup slider slows the
+        # emulation for slow motion by holding simulated time to a
+        # fraction of wall time. Wall clock is in the measurement, so
+        # the bounds are generous, and a host too slow to make a 0.05x
+        # target visible reports that instead of failing on machine
+        # speed.
+        def measured_ratio(window):
+            a = sim.latest()[0]
+            wa = time.time()
+            time.sleep(window)
+            return (sim.latest()[0] - a) / (time.time() - wa)
+
+        free = measured_ratio(3.0)
+        if free < 0.08:
+            check('the link paces the emulation', True,
+                  'unpaced %.3fx is too slow to show a 0.05x target; '
+                  'not asserted' % free)
+        else:
+            sim.set_speedup(0.05)
+            time.sleep(1.0)  # let the pace anchor take hold
+            paced = measured_ratio(4.0)
+            sim.set_speedup(1.0)
+            check('the link paces the emulation', 0.01 <= paced <= 0.10,
+                  'unpaced %.3fx, paced %.3fx against a 0.05x target'
+                  % (free, paced))
+        return {'armed': armed, 'spin': spin}
     finally:
         for c in (ds, sim):
             if c is not None:
