@@ -1,0 +1,56 @@
+:name: AM32 G071
+:description: boots an AM32 STM32G071 firmware ELF
+
+# Common to every G071 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the differences from
+# the F051 are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32G0_EXTI.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32G0_Comp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+# set by the generated per-target script: a 128k part keeps its settings
+# at 0x0801F800 where a 64k one uses 0x0800F800
+$eeprom_addr?=0x0800F800
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# Factory temperature calibration, as on the F051 but at the G0's
+# addresses. Same representative values: the sensor sits near 1.43V at
+# 30C and falls about 4.3mV/C, which is 1774 and 1348 counts at 3.3V.
+sysbus WriteWord 0x1FFF75A8 1774
+sysbus WriteWord 0x1FFF75CA 1348
+
+# The G0 core is a Cortex-M0+, which does have a VTOR, and the firmware
+# sets it itself in initAfterJump(). Pointing the CPU at the flash table
+# is still needed for the reset vector, before any of that runs.
+cpu VectorTableOffset 0x08001000
+
+# 64MHz Cortex-M0+, one instruction per cycle; see am32_f051.resc for
+# why this is set rather than left at Renode's 100 MIPS default.
+cpu PerformanceInMips 64
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true

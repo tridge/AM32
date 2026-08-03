@@ -41,9 +41,17 @@ namespace Antmicro.Renode.Peripherals.Analog
         // channels and scaling are per target, out of Inc/targets.h:
         // VOLTAGE_ADC_CHANNEL, CURRENT_ADC_CHANNEL,
         // TARGET_VOLTAGE_DIVIDER, MILLIVOLT_PER_AMP, CURRENT_OFFSET.
+        //
+        // The temperature sensor sits on a different channel, with
+        // different factory calibration, on each family: IN16 calibrated
+        // at 110C on the F051, IN12 at 130C on the G0.
         public AM32_STM32F0_ADC(IMachine machine, int voltageChannel,
                                 int currentChannel, int voltageDivider,
-                                int millivoltPerAmp, int currentOffsetMv)
+                                int millivoltPerAmp, int currentOffsetMv,
+                                int temperatureChannel = 16,
+                                ulong tsCal1 = 0x1FFFF7B8,
+                                ulong tsCal2 = 0x1FFFF7C2,
+                                int tsCal2Temp = 110)
         {
             this.machine = machine;
             this.voltageChannel = voltageChannel;
@@ -51,6 +59,10 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.voltageDivider = voltageDivider;
             this.millivoltPerAmp = millivoltPerAmp;
             this.currentOffsetMv = currentOffsetMv;
+            this.temperatureChannel = temperatureChannel;
+            this.tsCal1 = tsCal1;
+            this.tsCal2 = tsCal2;
+            this.tsCal2Temp = tsCal2Temp;
             if(voltageDivider <= 0)
             {
                 throw new RecoverableException("voltageDivider must be positive");
@@ -142,26 +154,40 @@ namespace Antmicro.Renode.Peripherals.Analog
             }
         }
 
-        // one regular sequence: every channel selected in CHSELR, in
-        // ascending order, which is what SCANDIR=0 means and what
-        // ADC_DMA_Callback() assumes when it indexes ADCDataDMA[]
+        // One regular sequence, in the order ADC_DMA_Callback() assumes
+        // when it indexes ADCDataDMA[]. There are two ways to express
+        // that order and the firmware uses a different one per family:
+        // the F051 leaves CHSELR a channel bitmap scanned in ascending
+        // order (SCANDIR=0), while the G0 sets CFGR1.CHSELRMOD to make
+        // it a list of 4-bit channel numbers, one per rank, terminated
+        // by 0xF. Reading a configured sequence as a bitmap picks the
+        // wrong channels entirely, so this follows the mode bit.
         private void Convert()
         {
             var any = false;
-            for(var ch = 0; ch < 19; ch++)
+            if((cfgr1 & CHSELRMOD) != 0)
             {
-                if((chselr & (1u << ch)) == 0)
+                for(var rank = 0; rank < 8; rank++)
                 {
-                    continue;
+                    var ch = (int)((chselr >> (4 * rank)) & 0xF);
+                    if(ch == 0xF)
+                    {
+                        break; // end of sequence marker
+                    }
+                    any = true;
+                    ConvertOne(ch);
                 }
-                any = true;
-                dr = Sample(ch);
-                isr |= EOC;
-                Conversions++;
-                if((cfgr1 & DMAEN) != 0)
+            }
+            else
+            {
+                for(var ch = 0; ch < 19; ch++)
                 {
-                    // request one transfer; the DMA reads DR back
-                    Connections[DmaRequestLine].Blink();
+                    if((chselr & (1u << ch)) == 0)
+                    {
+                        continue;
+                    }
+                    any = true;
+                    ConvertOne(ch);
                 }
             }
             if(any)
@@ -171,6 +197,18 @@ namespace Antmicro.Renode.Peripherals.Analog
                 {
                     Connections[IrqLine].Blink();
                 }
+            }
+        }
+
+        private void ConvertOne(int ch)
+        {
+            dr = Sample(ch);
+            isr |= EOC;
+            Conversions++;
+            if((cfgr1 & DMAEN) != 0)
+            {
+                // request one transfer; the DMA reads DR back
+                Connections[DmaRequestLine].Blink();
             }
         }
 
@@ -198,7 +236,7 @@ namespace Antmicro.Renode.Peripherals.Analog
                 //     ((raw*3300/41) - CURRENT_OFFSET*100) / MILLIVOLT_PER_AMP
                 pinMv = amps * millivoltPerAmp + currentOffsetMv;
             }
-            else if(channel == TemperatureChannel)
+            else if(channel == temperatureChannel)
             {
                 return TemperatureCounts(degrees);
             }
@@ -217,13 +255,14 @@ namespace Antmicro.Renode.Peripherals.Analog
         // calibration halfwords, which the harness seeds
         private uint TemperatureCounts(double degrees)
         {
-            var cal1 = machine.SystemBus.ReadWord(TsCal1);
-            var cal2 = machine.SystemBus.ReadWord(TsCal2);
+            var cal1 = machine.SystemBus.ReadWord(tsCal1);
+            var cal2 = machine.SystemBus.ReadWord(tsCal2);
             if(cal1 == cal2)
             {
                 return cal1; // uncalibrated; avoid inventing a slope
             }
-            return Clamp(cal1 + (degrees - 30.0) * (cal2 - cal1) / (110.0 - 30.0));
+            return Clamp(cal1 + (degrees - 30.0) * (cal2 - cal1)
+                                / (tsCal2Temp - 30.0));
         }
 
         private static uint Clamp(double counts)
@@ -264,15 +303,17 @@ namespace Antmicro.Renode.Peripherals.Analog
 
         private const uint DMAEN = 1u << 0;
 
-        // ADC_IN16 on the F051
-        private const int TemperatureChannel = 16;
-        private const ulong TsCal1 = 0x1FFFF7B8;
-        private const ulong TsCal2 = 0x1FFFF7C2;
+        // CHSELR holds a rank list rather than a channel bitmap
+        private const uint CHSELRMOD = 1u << 21;
 
         private const int DmaRequestLine = 0;
         private const int IrqLine = 1;
 
         private readonly IMachine machine;
+        private readonly int temperatureChannel;
+        private readonly ulong tsCal1;
+        private readonly ulong tsCal2;
+        private readonly int tsCal2Temp;
         private readonly int voltageChannel;
         private readonly int currentChannel;
         private readonly int voltageDivider;

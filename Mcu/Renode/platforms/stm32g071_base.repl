@@ -13,9 +13,11 @@ nvic: IRQControllers.NVIC @ sysbus 0xE000E000
     systickFrequency: 72000000
     IRQ -> cpu@0
 
-// This model's registers are not compatible with the EXTI in this MCU,
-// it is currently here to support direct interrupts
-exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40021800
+// Renode's own G0 platform puts an STM32F4_EXTI here, with a comment
+// admitting the registers do not match. They really do not: the G0 has
+// IMR1 at 0x80 and split rising/falling pending registers, so no
+// comparator edge ever reached the NVIC. This is a G0 model.
+exti: IRQControllers.AM32_STM32G0_EXTI @ sysbus 0x40021800
     numberOfOutputLines: 34
     firstDirectLine: 19
     [0, 1] -> nvicInput5@[0, 1]
@@ -37,8 +39,11 @@ nvicInput11: Miscellaneous.CombinedInput @ none
     numberOfInputs: 9
     -> nvic@11
 
+// ADC1_COMP_IRQn, shared by the ADC and EXTI lines 17 and 18. Three
+// inputs rather than the stock two, because the target overlay adds the
+// ADC alongside the two comparator lines.
 nvicInput12: Miscellaneous.CombinedInput @ none
-    numberOfInputs: 2
+    numberOfInputs: 3
     -> nvic@12
 
 nvicInput5: Miscellaneous.CombinedInput @ none
@@ -181,10 +186,9 @@ timer15: Timers.STM32_Timer @ sysbus 0x40014000
     initialLimit: 0xFFFF
     -> nvic@20
 
-timer16: Timers.STM32_Timer @ sysbus 0x40014400
-    frequency: 64000000
-    initialLimit: 0xFFFF
-    -> nvic@21
+// timer16 is declared by the target overlay alongside timer3: five G0
+// groups capture the throttle on TIM16_CH1 instead of TIM3_CH1, so
+// which of the two is the capture timer is a per target choice.
 
 timer17: Timers.STM32_Timer @ sysbus 0x40014800
     frequency: 64000000
@@ -247,7 +251,9 @@ self.NoisyLog("  0x%x (%s)" % (request.Value, str(data)))
 // model has no such input. The classic DMA register layout is the same
 // on F0 and G0, so the F0 model serves both. IRQ wiring is left to the
 // overlay, which knows which channel carries the capture.
-dma1: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+// named "dma" rather than "dma1" so the generated overlay wires the
+// capture and ADC channels the same way on both families
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
     numberOfChannels: 7
 
 // DMAMUX routes peripheral requests to channels on the G0, where the F0
@@ -268,8 +274,12 @@ dma2: DMA.STM32G0DMA @ sysbus 0x40020400
 // the adc is declared by the target overlay, as on the F051: its
 // channels and scaling differ per target
 
-iwdg: Timers.STM32_IndependentWatchdog @ sysbus 0x40003000
-    frequency: 32000
+// Ours rather than Renode's Timers.STM32_IndependentWatchdog, for the
+// same reason as on the F051: it accepts the key writes and counts them
+// but never resets the machine. The firmware kicks it from the main
+// loop, so a real watchdog would fire only when the emulation itself
+// stalls, which resets the CPU and hides the actual problem.
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
 
 flash_ctrl: MTD.STM32F4_FlashController @ sysbus 0x40022000
     flash: flash
@@ -280,17 +290,13 @@ flash_ctrl: MTD.STM32F4_FlashController @ sysbus 0x40022000
 systemMemory: Memory.MappedMemory @ sysbus 0x1FFF7000
     size: 0x1000
 
-// Couples the emulated bridge to the SITL motor physics. The GPIO bases
-// are stated because the G0 puts the ports at 0x50000000 where the F0
-// has them at 0x48000000.
-bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x60000400
-    batchUs: 10
-    gpioABase: 0x50000000
-    gpioBBase: 0x50000400
-
-// 0x60000000 is unmapped on the G0. It cannot go at 0x50000000 as it
-// does on the F051, because that is GPIOA here.
-throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x60000000
+// The bridge that couples the emulated FETs to the SITL motor physics
+// is declared by the target overlay, not here: its phase pin map is a
+// required constructor argument and differs per target. So is the
+// throttle generator, together with the wiring that drives it.
+//
+// Both sit at 0x60000000 and above on the G0. Neither can go at
+// 0x50000000 as on the F051, because that is GPIOA here.
 
 // Alternate function mapping connections. For more details see `stm32l071.repl`.
 // timer1's stock alternate-function block is deliberately gone. A later
@@ -309,22 +315,16 @@ timer2:
 timer14:
     0 -> gpioPortA#04@4 | gpioPortA#07@4 | gpioPortB#01@0 | gpioPortF#00@2
 
-timer16:
-    0 -> gpioPortA#06@5 | gpioPortB#06@2 | gpioPortB#08@2 | gpioPortD#00@2
-
 timer17:
     0 -> gpioPortA#07@5 | gpioPortB#07@2 | gpioPortB#09@2 | gpioPortD#01@2
 
 sysbus:
     init:
         Tag <0x40002C00, 0x40002FFF> "WWDG"
-        Tag <0x40003000, 0x400033FF> "IWDG"
         Tag <0x40005C00, 0x40005FFF> "USB "
         Tag <0x40006C00, 0x40006FFF> "CRS"
         Tag <0x40007000, 0x400073FF> "PWR"
         Tag <0x40007400, 0x400077FF> "DAC"
         Tag <0x40007800, 0x40007BFF> "CEC"
-        Tag <0x40010000, 0x400103FF> "SYSCFG"
         Tag <0x40015800, 0x40015BFF> "DBG"
-        Tag <0x40022000, 0x400223FF> "FLASH_INTERFACE"
         Tag <0x40023000, 0x400233FF> "CRC"

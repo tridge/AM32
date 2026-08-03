@@ -101,7 +101,8 @@ def report(tag):
 '''
 
 
-def run(renode, target_resc, elf, eeprom, model, so, syms, scratch, physics=True):
+def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
+        throttle_addr, physics=True):
     want = ['armed', 'running', 'zero_crosses', 'bemf_timeout_happened',
             'desync_happened']
     missing = [n for n in want if n not in syms]
@@ -130,7 +131,7 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch, physics=True
             'python "report(\'armed\')"',
             # 1300us: above the 1100us dead band, low enough to stay in
             # the startup ramp rather than saturating
-            'sysbus WriteDoubleWord 0x50000000 1300',
+            'sysbus WriteDoubleWord 0x%08X 1300' % throttle_addr,
             'emulation RunFor "1.5"',
             'python "report(\'spin\')"',
             'quit',
@@ -164,7 +165,7 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch, physics=True
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--target', default='FD6288_F051',
-                    help='any F051 target in Inc/targets.h')
+                    help='any F051 or G071 target in Inc/targets.h')
     # defaults to whatever obj/ holds for the target, so the firmware
     # version does not have to be tracked here
     ap.add_argument('--elf', default=None)
@@ -203,6 +204,7 @@ def main():
         # in the tree, so a new target needs nothing written by hand
         try:
             target_resc, _ = gen_target.generate(args.target, scratch, args.gcc)
+            throttle_addr = gen_target.throttle_address(args.target, args.gcc)
         except gen_target.Unsupported as e:
             skip(str(e))
 
@@ -235,7 +237,7 @@ def main():
             f.write(bytes(image))
 
         res = run(renode, target_resc, args.elf, eeprom, args.model, so, syms,
-                  scratch, physics=not args.no_physics)
+                  scratch, throttle_addr, physics=not args.no_physics)
 
     a = res.get('armed', {})
     s = res.get('spin', {})
