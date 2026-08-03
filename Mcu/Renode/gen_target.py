@@ -458,7 +458,7 @@ def platform(cfg):
         '// target: many rotate the phases across these six pins, so they',
         '// are stated rather than defaulted.',
         'bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x%08X' % spec['bridge'],
-        '    batchUs: 10',
+        '    batchUs: 20',
         '    timerHz: %d' % spec['timer_hz'],
         '    gpioABase: 0x%08X' % spec['gpio_a'],
         '    syscfgBase: 0x%08X' % spec['syscfg'],
