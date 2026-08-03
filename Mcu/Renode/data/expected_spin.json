@@ -215,9 +215,17 @@
   "rpm": 2990,
   "zero_crosses": 2884
  },
+ "NEUTRON_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2858
+ },
  "NEUTRON_PULLUP_G071": {
   "rpm": 2990,
   "zero_crosses": 2884
+ },
+ "NEUTRON_SINGLE_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
  },
  "NYXTRONICS_50A_F051": {
   "rpm": 3110,
@@ -266,6 +274,10 @@
  "RAZOR32_F051": {
   "rpm": 2985,
   "zero_crosses": 2904
+ },
+ "REF_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
  },
  "REPEAT_DRIVE_F051": {
   "rpm": 2985,
@@ -355,6 +367,14 @@
   "rpm": 2863,
   "zero_crosses": 2757
  },
+ "TBS_12S_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "TBS_16S_L431": {
+  "rpm": 2857,
+  "zero_crosses": 2787
+ },
  "TBS_4IN1_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
@@ -375,9 +395,25 @@
   "rpm": 2989,
   "zero_crosses": 2884
  },
+ "TMOTOR_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "VIMDRONES_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "VIMDRONES_NANO_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
  "VIMDRONES_S50_G071": {
   "rpm": 2735,
   "zero_crosses": 2618
+ },
+ "VIMDRONES_S50_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
  },
  "WRAITH32V1_F051": {
   "rpm": 2985,
