@@ -267,6 +267,10 @@
   "rpm": 2985,
   "zero_crosses": 2904
  },
+ "POGO_L431_CAN": {
+  "rpm": 2856,
+  "zero_crosses": 2787
+ },
  "PWM_ENABLE_G071": {
   "rpm": 2990,
   "zero_crosses": 2884
@@ -276,6 +280,10 @@
   "zero_crosses": 2904
  },
  "REF_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "REF_L431_CAN": {
   "rpm": 2983,
   "zero_crosses": 2917
  },
@@ -314,6 +322,14 @@
  "SEQURE_TOP_G071": {
   "rpm": 2990,
   "zero_crosses": 2883
+ },
+ "SIERRA_PULSE_12S_L431_CAN": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "SIERRA_PULSE_6S_L431_CAN": {
+  "rpm": 2983,
+  "zero_crosses": 2917
  },
  "SISKIN_11A_F051": {
   "rpm": 2985,
@@ -371,8 +387,16 @@
   "rpm": 2983,
   "zero_crosses": 2917
  },
+ "TBS_12S_L431_CAN": {
+  "rpm": 2856,
+  "zero_crosses": 2787
+ },
  "TBS_16S_L431": {
   "rpm": 2857,
+  "zero_crosses": 2787
+ },
+ "TBS_16S_L431_CAN": {
+  "rpm": 2856,
   "zero_crosses": 2787
  },
  "TBS_4IN1_G071": {
@@ -403,7 +427,15 @@
   "rpm": 2983,
   "zero_crosses": 2917
  },
+ "VIMDRONES_L431_CAN": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
  "VIMDRONES_NANO_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "VIMDRONES_NANO_L431_CAN": {
   "rpm": 2983,
   "zero_crosses": 2917
  },
@@ -412,6 +444,10 @@
   "zero_crosses": 2618
  },
  "VIMDRONES_S50_L431": {
+  "rpm": 2983,
+  "zero_crosses": 2917
+ },
+ "VIMDRONES_S50_L431_CAN": {
   "rpm": 2983,
   "zero_crosses": 2917
  },
