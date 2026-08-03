@@ -8,28 +8,49 @@ wrong variable, compiled cleanly and did nothing.
 
 ## Status
 
-The F051 firmware boots, detects a servo throttle signal through real
-capture and DMA, arms, and **spins a motor closed loop on BEMF** sensed
-through the real comparator. The firmware's own measured
-`commutation_interval` agrees with the rpm the physics reports, so the
-timing it derives and the motor it derives it from check out
-independently.
+The firmware boots, detects a servo throttle signal through real capture
+and DMA, arms, and **spins a motor closed loop on BEMF** sensed through
+the real comparator. The firmware's own measured `commutation_interval`
+agrees with the rpm the physics reports, so the timing it derives and
+the motor it derives it from check out independently.
 
-**Any of the 52 F051 targets works**, with no per-target file to write -
-the platform is generated from `Inc/targets.h` on demand. They cover 8
-distinct hardware configurations, differing in capture timer, DMA
-channel, throttle pin, comparator map and bridge pin map. Five have been
-run end to end, one per configuration reachable with a built ELF:
+**Two MCU families are supported, F051 and G071**, covering all 52 F051
+and 53 G071 targets with no per-target file to write - the platform is
+generated from `Inc/targets.h` on demand. What differs between the
+families is a table in `gen_target.py`, not a second code path.
 
-| target | capture | throttle | comparator A/B/C | phase A high |
-|---|---|---|---|---|
-| `FD6288_F051` | TIM15 + ch5 | PA2 | PA5 / PA4 / PA0 | PA10 |
-| `ARK_4IN1_F051` | TIM3 + ch4 | PB4 | PA0 / PA4 / PA5 | PA10 |
-| `RAZOR32_F051` | TIM15 + ch5 | PA2 | PA4 / PA5 / PA0 | PA9 |
-| `DIATONE_F051` | TIM3 + ch4 | PB4 | PA5 / PA0 / PA4 | PA10 |
-| `PB054_F051` | TIM3 + ch4 | PB4 | PA0 / PA5 / PA4 | PA10 |
+The G071 was not a copy of the F051. Three things had to be modelled
+before it would run, and each is a real difference rather than a gap in
+the port:
 
-All five arm and spin, and none needed a change to any peripheral model.
+- **the EXTI is a different peripheral.** Renode's own `stm32g0.repl`
+  declares an `STM32F4_EXTI` here with a comment admitting the registers
+  do not match. `IMR1` is at 0x80 and rising and falling have separate
+  pending registers, so no comparator edge ever reached the NVIC.
+- **the ADC uses the fully configurable sequencer.** `CFGR1.CHSELRMOD`
+  makes `CHSELR` a list of four bit channel numbers per rank rather than
+  a channel bitmap. Read one as the other and the wrong channels convert
+  - the firmware saw no battery voltage at all and would not start.
+- **the comparators are separate and differently laid out**: two of them
+  at 0x40010200, output at CSR bit 30 rather than 14, and a four bit
+  `INMSEL` at [7:4] rather than three at [6:4]. `N_VARIANT` targets move
+  between COMP1 and COMP2 per commutation step.
+
+### One target does not spin
+
+`DT160_64K_G071` arms but cannot start the test motor. It is not a gap
+in the emulation: it differs from `DT120_64K_G071` in **exactly one
+preprocessed macro**, `DEAD_TIME` 210 against 120, and everything else -
+comparator map, pin map, capture timer, DMA channel, ADC scaling - is
+identical. Diff the two with `gen_target.py` and see.
+
+210 is the only `DEAD_TIME` in either family past 127, where the
+`BDTR.DTG` encoding stops being linear. Per RM0444, `DTG[7:5]=110` means
+`(32 + DTG[4:0]) x 8` ticks, so 210 asks for **400 ticks = 6.25us** at
+64 MHz, not the 3.28us a linear reading would suggest. With `ARR` 2665
+(24 kHz) the firmware's startup duty of 400 ticks is exactly the dead
+time, so the phase never drives at all. Whether that is intended for a
+160 A ESC is a firmware question, not an emulator one.
 
 Calibration and sweep work stays in the SITL, on speed grounds - see
 below.
@@ -37,10 +58,8 @@ below.
 ## Running
 
 Renode is not vendored; install it into the gitignored `tools/` tree the
-same way the ARM toolchain is installed, then:
-
-Renode is not vendored; install it into the gitignored `tools/` tree the
-same way the ARM toolchain is installed. Then, for any F051 target:
+same way the ARM toolchain is installed. Then, for any F051 or G071
+target:
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --run
 
@@ -164,15 +183,20 @@ from a scratch directory, as the SITL suite does.
 
 ## What is here
 
-    gen_target.py                   builds a platform for any F051 target out
-                                    of Inc/targets.h
+    gen_target.py                   builds a platform for any F051 or G071
+                                    target out of Inc/targets.h
     platforms/stm32f051_base.repl   MCU-common. Vendored from Renode's
-                                    platforms/cpus/stm32f0.repl (Antmicro, MIT -
-                                    header retained) and edited
+    platforms/stm32g071_base.repl   platforms/cpus/stm32f0.repl and
+                                    stm32g0.repl (Antmicro, MIT - header
+                                    retained) and edited
     peripherals/stm32/              our peripheral models, GPL-3, loaded at
                                     runtime with `include @...cs`; no Renode
                                     rebuild needed
-    scripts/am32_f051.resc          shared by every generated target script
+    peripherals/common/             family-neutral models: the motor bridge,
+                                    the throttle generator, the comparator
+                                    interface both families implement
+    scripts/am32_f051.resc          one per family, shared by every generated
+    scripts/am32_g071.resc          target script of that family
 
 ### Adding a target
 
@@ -190,17 +214,25 @@ what makes generating on demand better than checking 52 platform files
 into the tree and letting them rot.
 
 Generating rather than hand-writing also removes a class of silent
-error, because three things vary per target and **none of them fail
+error, because several things vary per target and **none of them fail
 loudly when wrong**:
 
-- the **comparator map**. `COMP->CSR[6:4]` selects PA4, PA5 or PA0, but
-  which is phase A, B or C differs per target - six permutations across
-  the F051 range. Wrong, and the firmware commutates against the wrong
-  phase and merely runs badly.
+- the **comparator map**. The `INMSEL` field selects which pin the
+  inverting input watches, but which pin is phase A, B or C differs per
+  target - six permutations across the F051 range. Wrong, and the
+  firmware commutates against the wrong phase and merely runs badly.
 - the **bridge pin map**. Most targets put phase A on PA10/PB1, but a
   third of them rotate the phases across the same six pins.
-- the **capture timer and DMA channel**, TIM15 + channel 5 or TIM3 +
-  channel 4.
+- the **capture timer and DMA channel**: TIM15 or TIM3 on the F051,
+  TIM3 or TIM16 on the G071.
+- the **bridge topology**. Most targets drive a high and a low side per
+  phase, but `USE_INVERTED_LOW` ones turn the low FET on by writing BRR,
+  and `PWM_ENABLE_BRIDGE` ones have a gate driver with one PWM and one
+  enable pin and no low side at all. Getting this wrong is the quietest
+  failure of the lot: `CRTEENSY_HILARIESC_F051` spun and passed its
+  tests for a while with its static low phase modelled as floating.
+- the **eeprom address**, 0x0801F800 on the 128k parts against
+  0x0800F800 elsewhere.
 
 ### How a generated overlay fits the base
 
@@ -252,6 +284,23 @@ replacing the RCC means owning the whole file. Changes made:
   earlier one, so leaving them silently overrode the DMA and NVIC wiring
   in the peripheral declarations. This cost real debugging time:
   captures happened and went nowhere.
+
+`stm32g0.repl` is vendored for the same reason but needed far less. It
+already has real memories, DMA and a flash controller, and its RCC stub
+is good enough that the firmware reaches `main()` unaided - the F051 hung
+in its clock spin loops. The G0 edits are the 10 MHz to 64 MHz timer
+correction, the same two alternate-function block deletions, the EXTI
+and comparator replacements described above, a calibration page, and
+register-file stubs for SYSCFG and DMAMUX.
+
+That last one is a deliberate deviation worth stating: the platform
+hardwires DMA routing rather than modelling DMAMUX, so **the firmware's
+DMAMUX configuration is not checked**. If a target ever routes a request
+to the wrong channel, this harness will not notice.
+
+Both made-up peripherals - the motor bridge and the throttle generator -
+move to 0x60000000 on the G0, because 0x50000000 is unmapped on the F051
+but is where the G0 puts GPIO.
 
 ## Speed, and where it goes
 
@@ -312,10 +361,29 @@ preprocessed output and `DEAD_TIME` is the only line:
 | DIATONE_F051 | 45 | 937 ns | 2934 |
 | MAMBA_F40PRO_F051 | 20 | 417 ns | 3115 |
 
-520ns of dead time is worth 6.2% of rpm. The SITL sits 437ns below
-FD6288, which on that slope predicts about 5%, against the 6.1%
-observed - the right size, so dead time is the dominant term rather
-than a rounding error.
+520ns of dead time is worth 6.2% of rpm here, and the SITL sits 437ns
+below FD6288, so dead time is the right size to be the dominant term
+rather than a rounding error.
+
+**Do not read that as a slope.** Grouping all 52 F051 targets by
+`DEAD_TIME` shows a staircase, not a line - the firmware quantises what
+it does with it:
+
+| DEAD_TIME | rpm |
+|---|---|
+| 14, 20 | 3115 |
+| 25, 30, 40, 45 | 2934 |
+| 50, 60, 70 | 2854 |
+| 80 | 2707 |
+| 100 | 2592 |
+
+The DIATONE/MAMBA pair straddles the 20-to-25 step, which is why it
+reads as a large effect. Two targets four counts apart inside one tread
+would have shown nothing at all. This also settles a `USE_INVERTED_LOW`
+question cleanly: `CRTEENSY_HILARIESC_F051` (DEAD_TIME 40) landing on
+exactly the same 2935 as FD6288 (45) once the inversion was modelled is
+the expected result, not a suspicious coincidence, because 40 and 45
+share a tread.
 
 **A warning about how not to measure this.** An earlier version of this
 file claimed the opposite, that dead time was worth 0.004%, on the

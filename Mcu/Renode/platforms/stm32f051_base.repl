@@ -273,10 +273,8 @@ dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
 // default here would be silently wrong for the targets that rotate the
 // phases across the same six pins.
 
-// Servo PWM source. The overlay drives it into both the capture timer
-// and the input GPIO pin, because transfercomplete() reads
-// getInputPinState() to size the next transfer.
-//
-// 0x50000000 is outside both the peripheral aperture and anything the
-// F051 decodes, so the firmware can never reach it.
-throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x50000000
+// The throttle generator is declared by the overlay as well, next to the
+// wiring that feeds it into both the capture timer and the input GPIO
+// pin (transfercomplete() reads getInputPinState() to size the next
+// transfer). Its address is family specific: 0x50000000 is outside
+// anything the F051 decodes, but it is where the G0 puts GPIO.

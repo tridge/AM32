@@ -17,9 +17,9 @@ usage:
     gen_target.py TARGET --run --exec CMD    ... and script it
     gen_target.py --list                     targets this can emulate
 
-Only F051 targets work: the Renode platform base is an STM32F051 and no
-other AM32 MCU family has one yet. Anything else exits 77, as the test
-harness does for a skip.
+F051 and G071 targets work; those are the two AM32 MCU families with a
+Renode platform base so far. Anything else exits 77, as the test harness
+does for a skip.
 '''
 
 import argparse
@@ -31,46 +31,115 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
-BASE_PLATFORM = os.path.join(HERE, 'platforms', 'stm32f051_base.repl')
 
 # every macro the platform description needs. Read from the preprocessor
 # rather than assumed, including the PHASE_*_COMP fallbacks targets.h
 # applies at the bottom of the file.
 WANTED = [
-    'MCU_F051',
+    'MCU_F051', 'MCU_G071',
     'IC_TIMER_REGISTER', 'INPUT_DMA_CHANNEL', 'INPUT_PIN', 'INPUT_PIN_PORT',
-    'DEAD_TIME', 'FILE_NAME',
+    'DEAD_TIME', 'FILE_NAME', 'EEPROM_START_ADD',
     'PHASE_A_COMP', 'PHASE_B_COMP', 'PHASE_C_COMP',
+    # N_VARIANT targets put the three phases across both G0 comparators
+    'N_VARIANT', 'MAIN_COMP',
+    'PHASE_A_COMP_NUMBER', 'PHASE_B_COMP_NUMBER', 'PHASE_C_COMP_NUMBER',
+    # a gate driver with one PWM and one enable per phase, instead of
+    # separate high and low side pins
+    'PWM_ENABLE_BRIDGE',
+    'USE_INVERTED_LOW', 'USE_INVERTED_HIGH',
     'PHASE_A_GPIO_HIGH', 'PHASE_A_GPIO_PORT_HIGH',
     'PHASE_A_GPIO_LOW', 'PHASE_A_GPIO_PORT_LOW',
     'PHASE_B_GPIO_HIGH', 'PHASE_B_GPIO_PORT_HIGH',
     'PHASE_B_GPIO_LOW', 'PHASE_B_GPIO_PORT_LOW',
     'PHASE_C_GPIO_HIGH', 'PHASE_C_GPIO_PORT_HIGH',
     'PHASE_C_GPIO_LOW', 'PHASE_C_GPIO_PORT_LOW',
+    'PHASE_A_GPIO_PWM', 'PHASE_A_GPIO_PORT_PWM',
+    'PHASE_A_GPIO_ENABLE', 'PHASE_A_GPIO_PORT_ENABLE',
+    'PHASE_B_GPIO_PWM', 'PHASE_B_GPIO_PORT_PWM',
+    'PHASE_B_GPIO_ENABLE', 'PHASE_B_GPIO_PORT_ENABLE',
+    'PHASE_C_GPIO_PWM', 'PHASE_C_GPIO_PORT_PWM',
+    'PHASE_C_GPIO_ENABLE', 'PHASE_C_GPIO_PORT_ENABLE',
     'VOLTAGE_ADC_CHANNEL', 'CURRENT_ADC_CHANNEL', 'TARGET_VOLTAGE_DIVIDER',
     'MILLIVOLT_PER_AMP', 'CURRENT_OFFSET',
 ]
 
-# COMP1 CSR[6:4], the INMSEL field, per comparator input pin
-INMSEL = {'COMP_PA4': 4, 'COMP_PA5': 5, 'COMP_PA0': 6}
+# The comparator's inverting-input selection, as the value of the INMSEL
+# field, per family. The F0 names its choices after the pin; the G0 uses
+# the LL driver's IO1/IO2/IO3, which are PB3/PB7/PA2 on COMP2.
+INMSEL = {
+    'f051': {'COMP_PA4': 4, 'COMP_PA5': 5, 'COMP_PA0': 6},
+    'g071': {'LL_COMP_INPUT_MINUS_IO1': 6, 'LL_COMP_INPUT_MINUS_IO2': 7,
+             'LL_COMP_INPUT_MINUS_IO3': 8},
+}
 
-# the capture timer, as (address, nvic line). Renode counts DMA channels
-# from 0 where the reference manual counts from 1.
-CAPTURE_TIMER = {'TIM3': (0x40000400, 16), 'TIM15': (0x40014000, 20)}
+# the capture timer, as (address, nvic line), per family
+CAPTURE_TIMER = {
+    'f051': {'TIM3': (0x40000400, 16), 'TIM15': (0x40014000, 20)},
+    'g071': {'TIM3': (0x40000400, 16), 'TIM16': (0x40014400, 21)},
+}
 
-# stock declaration and alternate-function map for whichever of the two
-# is NOT the capture timer, lifted from Renode's own stm32f0.repl
+# stock declaration and alternate-function map for whichever timers are
+# NOT the capture timer, lifted from Renode's own stm32f0/stm32g0 repl
 STOCK_TIMER = {
-    'TIM3': ('timer3', 0x40000400, 16, [
-        '    0 -> gpioPortA#06@1 | gpioPortB#04@1 | gpioPortC#06@1',
-        '    1 -> gpioPortA#07@1 | gpioPortB#05@1 | gpioPortC#07@1',
-        '    2 -> gpioPortB#00@1 | gpioPortC#08@1',
-        '    3 -> gpioPortB#01@1 | gpioPortC#09@1',
-    ]),
-    'TIM15': ('timer15', 0x40014000, 20, [
-        '    0 -> gpioPortA#01@5 | gpioPortA#02@0 | gpioPortB#14@1 | gpioPortB#15@3',
-        '    1 -> gpioPortA#03@0 | gpioPortB#15@1',
-    ]),
+    'f051': {
+        'TIM3': ('timer3', 0x40000400, 16, [
+            '    0 -> gpioPortA#06@1 | gpioPortB#04@1 | gpioPortC#06@1',
+            '    1 -> gpioPortA#07@1 | gpioPortB#05@1 | gpioPortC#07@1',
+            '    2 -> gpioPortB#00@1 | gpioPortC#08@1',
+            '    3 -> gpioPortB#01@1 | gpioPortC#09@1',
+        ]),
+        'TIM15': ('timer15', 0x40014000, 20, [
+            '    0 -> gpioPortA#01@5 | gpioPortA#02@0 | gpioPortB#14@1 | gpioPortB#15@3',
+            '    1 -> gpioPortA#03@0 | gpioPortB#15@1',
+        ]),
+    },
+    'g071': {
+        'TIM3': ('timer3', 0x40000400, 16, [
+            '    0 -> gpioPortA#06@1 | gpioPortB#04@1 | gpioPortC#06@1',
+            '    1 -> gpioPortA#07@1 | gpioPortB#05@1 | gpioPortC#07@1',
+            '    2 -> gpioPortB#00@1',
+            '    3 -> gpioPortB#01@1',
+        ]),
+        'TIM16': ('timer16', 0x40014400, 21, [
+            '    0 -> gpioPortA#06@5 | gpioPortB#06@2 | gpioPortB#08@2 | gpioPortD#00@2',
+        ]),
+    },
+}
+
+# Everything that differs between the two MCU families, in one place, so
+# a third family is a table entry plus a base .repl rather than a new
+# code path.
+#   dma_irq   nvic line the capture DMA channel raises
+#   adc_dma   DMA channel index the ADC transfers on (0 based)
+FAMILY = {
+    'f051': {
+        'macro': 'MCU_F051',
+        'timer_hz': 48000000,
+        'gpio_a': 0x48000000,
+        'throttle': 0x50000000,
+        'bridge': 0x50000400,
+        'dma_irq': 11,
+        'adc_dma': 0,
+        'adc_irq': 'nvicInput12@2',
+        # temperature sensor channel, its factory calibration pair, and
+        # the temperature the second point was taken at
+        'temp_channel': 16,
+        'ts_cal': (0x1FFFF7B8, 0x1FFFF7C2, 110),
+    },
+    'g071': {
+        'macro': 'MCU_G071',
+        'timer_hz': 64000000,
+        # the G0 puts GPIO where the F0 has spare address space, so the
+        # two made-up peripherals move out of the way
+        'gpio_a': 0x50000000,
+        'throttle': 0x60000000,
+        'bridge': 0x60000400,
+        'dma_irq': 9,
+        'adc_dma': 1,
+        'adc_irq': 'nvicInput12@2',
+        'temp_channel': 12,
+        'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 130),
+    },
 }
 
 
@@ -128,31 +197,57 @@ def config(target, nm='arm-none-eabi-gcc'):
     m = macros(target, nm)
     if 'FILE_NAME' not in m:
         raise Unsupported('%s is not a target in Inc/targets.h' % target)
-    if 'MCU_F051' not in m:
-        raise Unsupported('%s is not an F051 target; the Renode platform '
-                          'base is an STM32F051 and no other AM32 MCU '
-                          'family has one yet' % target)
+
+    family = None
+    for fam, spec in FAMILY.items():
+        if spec['macro'] in m:
+            family = fam
+            break
+    if family is None:
+        raise Unsupported('%s is not an F051 or G071 target; those are the '
+                          'only AM32 MCU families with a Renode platform '
+                          'base so far' % target)
 
     timer = m.get('IC_TIMER_REGISTER')
-    if timer not in CAPTURE_TIMER:
-        raise Unsupported('capture timer %s is not modelled' % timer)
+    if timer not in CAPTURE_TIMER[family]:
+        raise Unsupported('capture timer %s is not modelled on the %s'
+                          % (timer, family))
     chan = m.get('INPUT_DMA_CHANNEL', '')
     if not chan.startswith('LL_DMA_CHANNEL_'):
         raise Unsupported('cannot read DMA channel %s' % chan)
 
+    inmsel = INMSEL[family]
     comps = {}
     for ph in 'ABC':
         c = m.get('PHASE_%s_COMP' % ph)
-        if c not in INMSEL:
+        if c not in inmsel:
             raise Unsupported('comparator input %s for phase %s is not one '
-                              'of PA0/PA4/PA5' % (c, ph))
-        comps[ph] = INMSEL[c]
+                              'of %s' % (c, ph, '/'.join(sorted(inmsel))))
+        comps[ph] = inmsel[c]
 
+    # which comparator senses each phase. Only N_VARIANT targets split
+    # them; everything else uses MAIN_COMP throughout, and the F051 has
+    # only COMP1.
+    main = 1 if family == 'f051' else comp_number(m.get('MAIN_COMP', 'COMP2'))
+    comp_of = {}
+    for ph in 'ABC':
+        if 'N_VARIANT' in m:
+            comp_of[ph] = comp_number(m.get('PHASE_%s_COMP_NUMBER' % ph, ''))
+        else:
+            comp_of[ph] = main
+
+    # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
+    # than HIGH and LOW; the bridge takes them in the same two slots
+    enable_bridge = 'PWM_ENABLE_BRIDGE' in m
+    sides = ('PWM', 'ENABLE') if enable_bridge else ('HIGH', 'LOW')
     pins = {}
     for ph in 'ABC':
-        for side in ('HIGH', 'LOW'):
-            pins[ph + side] = pin_name(m['PHASE_%s_GPIO_PORT_%s' % (ph, side)],
-                                       m['PHASE_%s_GPIO_%s' % (ph, side)])
+        for slot, side in zip(('HIGH', 'LOW'), sides):
+            port = m.get('PHASE_%s_GPIO_PORT_%s' % (ph, side))
+            pin = m.get('PHASE_%s_GPIO_%s' % (ph, side))
+            if port is None or pin is None:
+                raise Unsupported('phase %s has no %s pin defined' % (ph, side))
+            pins[ph + slot] = pin_name(port, pin)
 
     def number(name, default):
         try:
@@ -160,8 +255,18 @@ def config(target, nm='arm-none-eabi-gcc'):
         except ValueError:
             raise Unsupported('%s is not a number: %s' % (name, m.get(name)))
 
+    eeprom = m.get('EEPROM_START_ADD', '')
+    # the macro is a cast expression, e.g. "(uint32_t)0x0800F800"
+    eeprom = eeprom.split(')')[-1].strip()
+    try:
+        eeprom_addr = int(eeprom, 0)
+    except ValueError:
+        raise Unsupported('cannot read EEPROM_START_ADD from %r'
+                          % m.get('EEPROM_START_ADD'))
+
     return {
         'target': target,
+        'family': family,
         'name': m.get('FILE_NAME', target).strip('"').strip(),
         'voltage_channel': suffix_number(m.get('VOLTAGE_ADC_CHANNEL'),
                                          'LL_ADC_CHANNEL_', 'voltage channel'),
@@ -171,20 +276,65 @@ def config(target, nm='arm-none-eabi-gcc'):
         'millivolt_per_amp': number('MILLIVOLT_PER_AMP', 20),
         'current_offset': number('CURRENT_OFFSET', 0),
         'timer': timer,
-        'timer_addr': CAPTURE_TIMER[timer][0],
-        'timer_irq': CAPTURE_TIMER[timer][1],
+        'timer_addr': CAPTURE_TIMER[family][timer][0],
+        'timer_irq': CAPTURE_TIMER[family][timer][1],
         # reference manual counts channels from 1, Renode from 0
         'dma_channel': int(chan[len('LL_DMA_CHANNEL_'):]) - 1,
         'throttle_pin': pin_name(m['INPUT_PIN_PORT'], m['INPUT_PIN']),
         'dead_time': m.get('DEAD_TIME', '?'),
+        'eeprom_addr': eeprom_addr,
         'comps': comps,
+        'comp_of': comp_of,
+        'main_comp': main,
+        'enable_bridge': enable_bridge,
+        'inverted_low': 'USE_INVERTED_LOW' in m,
+        'inverted_high': 'USE_INVERTED_HIGH' in m,
         'pins': pins,
     }
 
 
+def comp_number(macro):
+    '''COMP2 -> 2'''
+    if macro not in ('COMP1', 'COMP2'):
+        raise Unsupported('comparator %r is not COMP1 or COMP2' % macro)
+    return int(macro[4:])
+
+
+def comp_block(cfg):
+    '''the comparator declaration, which is the biggest family split'''
+    if cfg['family'] == 'f051':
+        return [
+            '// SYSCFG and COMP share a register page on the F051. Line 21 is',
+            "// COMP1's EXTI line. The phase map is CSR[6:4], the COMP1 INMSEL",
+            '// field: 4 is PA4, 5 is PA5, 6 is PA0.',
+            'syscfgcomp: Miscellaneous.AM32_STM32F0_SysCfgComp @ sysbus <0x40010000, +0x400>',
+        ] + [
+            '    phase%sInmsel: %d' % (p, cfg['comps'][p]) for p in 'ABC'
+        ] + [
+            '    0 -> exti@21',
+            '    1 -> exti@22',
+        ]
+    return [
+        '// Two separate comparators on the G0, next to each other rather',
+        '// than sharing the SYSCFG page. COMP1 is EXTI line 17, COMP2 is',
+        '// line 18. The phase map is CSR[7:4], the INMSEL field: 6 is IO1,',
+        '// 7 is IO2, 8 is IO3 (PB3, PB7 and PA2 on COMP2).',
+        'comp: Miscellaneous.AM32_STM32G0_Comp @ sysbus <0x40010200, +0x100>',
+    ] + [
+        '    phase%sInmsel: %d' % (p, cfg['comps'][p]) for p in 'ABC'
+    ] + [
+        '    phase%sComp: %d' % (p, cfg['comp_of'][p]) for p in 'ABC'
+    ] + [
+        '    mainComp: %d' % cfg['main_comp'],
+        '    0 -> exti@17',
+        '    1 -> exti@18',
+    ]
+
+
 def platform(cfg):
-    other = 'TIM15' if cfg['timer'] == 'TIM3' else 'TIM3'
-    oname, oaddr, oirq, oaf = STOCK_TIMER[other]
+    fam = cfg['family']
+    spec = FAMILY[fam]
+    others = [t for t in STOCK_TIMER[fam] if t != cfg['timer']]
     cap = 'timer%s' % cfg['timer'][3:]
     tp = cfg['throttle_pin']
     L = [
@@ -195,12 +345,17 @@ def platform(cfg):
                                              cfg['dead_time']),
         '// throttle in on %s, captured by %s_CH1 into DMA1 channel %d'
         % (tp, cfg['timer'], cfg['dma_channel'] + 1),
-        '// comparator: A=%s B=%s C=%s (COMP1 CSR[6:4])'
-        % tuple(cfg['comps'][p] for p in 'ABC'),
+        '// comparator: A=%s B=%s C=%s (INMSEL), on COMP%s/%s/%s'
+        % (tuple(cfg['comps'][p] for p in 'ABC')
+           + tuple(cfg['comp_of'][p] for p in 'ABC')),
+        '// bridge: %s' % ('gate driver PWM + enable per phase'
+                           if cfg['enable_bridge'] else
+                           ('high and low side, low side inverted'
+                            if cfg['inverted_low'] else 'high and low side')),
         '',
         # absolute: these are generated into a scratch or obj directory,
         # so a path relative to the platforms tree would not resolve
-        'using "%s"' % BASE_PLATFORM,
+        'using "%s"' % os.path.join(HERE, 'platforms', 'stm32%s_base.repl' % fam),
         '',
         '// Throttle capture. The stock timer model has no input capture, so',
         '// this is ours; it raises a DMA request rather than an interrupt',
@@ -212,61 +367,74 @@ def platform(cfg):
         '// NVIC wiring here and captures would go to GPIO pins instead.',
         '%s: Timers.AM32_STM32_CaptureTimer @ sysbus 0x%08X'
         % (cap, cfg['timer_addr']),
-        '    frequency: 48000000',
+        '    frequency: %d' % spec['timer_hz'],
         '    0 -> dma@%d' % cfg['dma_channel'],
         '    1 -> nvic@%d' % cfg['timer_irq'],
         '',
-        '%s: Timers.STM32_Timer @ sysbus 0x%08X' % (oname, oaddr),
-        '    frequency: 48000000',
-        '    initialLimit: 0xFFFF',
-        '    -> nvic@%d' % oirq,
-        '',
-        '%s:' % oname,
-    ] + oaf + [
-        '',
-        '// DMA1_Channel4_5_IRQn for the capture channel.',
+    ]
+
+    # whichever timers this target is not capturing with, declared stock
+    for other in others:
+        oname, oaddr, oirq, oaf = STOCK_TIMER[fam][other]
+        L += [
+            '%s: Timers.STM32_Timer @ sysbus 0x%08X' % (oname, oaddr),
+            '    frequency: %d' % spec['timer_hz'],
+            '    initialLimit: 0xFFFF',
+            '    -> nvic@%d' % oirq,
+            '',
+            '%s:' % oname,
+        ] + oaf + ['']
+
+    L += [
+        '// the nvic line the capture DMA channel raises',
         'dma:',
-        '    %d -> nvic@11' % cfg['dma_channel'],
+        '    %d -> nvic@%d' % (cfg['dma_channel'], spec['dma_irq']),
         '',
-        '// SYSCFG and COMP share a register page on the F051. Line 21 is',
-        "// COMP1's EXTI line. The phase map is CSR[6:4], the COMP1 INMSEL",
-        '// field: 4 is PA4, 5 is PA5, 6 is PA0.',
-        'syscfgcomp: Miscellaneous.AM32_STM32F0_SysCfgComp @ sysbus <0x40010000, +0x400>',
-    ] + [
-        '    phase%sInmsel: %d' % (p, cfg['comps'][p]) for p in 'ABC'
-    ] + [
-        '    0 -> exti@21',
-        '    1 -> exti@22',
+    ] + comp_block(cfg) + [
         '',
         '// Couples the emulated bridge to the SITL motor physics.',
         '// LibraryPath and ConfigPath are set from the .resc, since they',
         '// are absolute paths. The phase pins are not the same on every',
-        '// F051 target: a third of them rotate the phases across these six',
-        '// pins, so they are stated rather than defaulted.',
-        'bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x50000400',
+        '// target: many rotate the phases across these six pins, so they',
+        '// are stated rather than defaulted.',
+        'bridge: Miscellaneous.AM32_F051_Bridge @ sysbus 0x%08X' % spec['bridge'],
         '    batchUs: 10',
+        '    timerHz: %d' % spec['timer_hz'],
+        '    gpioABase: 0x%08X' % spec['gpio_a'],
+        '    gpioBBase: 0x%08X' % (spec['gpio_a'] + 0x400),
+        '    gpioCBase: 0x%08X' % (spec['gpio_a'] + 0x800),
     ] + [
         '    phase%s%s: "%s"' % (p, side.capitalize(), cfg['pins'][p + side])
         for p in 'ABC' for side in ('HIGH', 'LOW')
-    ] + [
+    ] + ([
+        '    topology: "enable"',
+    ] if cfg['enable_bridge'] else []) + ([
+        '    invertedLow: true',
+    ] if cfg['inverted_low'] else []) + ([
+        '    invertedHigh: true',
+    ] if cfg['inverted_high'] else []) + [
         '',
-        '// The stock Analog.STM32F0_ADC has no DMA output, and AM32 reads',
-        '// its conversions only through DMA1 channel 1 into ADCDataDMA[],',
-        '// so against it the firmware saw no voltage or current at all.',
-        '// dma@0 is DMA1 channel 1. There is deliberately no external',
-        '// event frequency: AM32 starts conversions in software from the',
-        '// 1kHz loop, and modelling a hardware trigger as well made',
-        '// sequences overlap forever.',
+        '// The stock ADC models have no DMA output, and AM32 reads its',
+        '// conversions only through DMA into ADCDataDMA[], so against them',
+        '// the firmware saw no voltage or current at all. There is',
+        '// deliberately no external event frequency: AM32 starts',
+        '// conversions in software from the 1kHz loop, and modelling a',
+        '// hardware trigger as well made sequences overlap forever.',
         'adc: Analog.AM32_STM32F0_ADC @ sysbus 0x40012400',
         '    voltageChannel: %d' % cfg['voltage_channel'],
         '    currentChannel: %d' % cfg['current_channel'],
         '    voltageDivider: %d' % cfg['voltage_divider'],
         '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
         '    currentOffsetMv: %d' % cfg['current_offset'],
-        '    0 -> dma@0',
-        '    1 -> nvicInput12@2',
+        '    temperatureChannel: %d' % spec['temp_channel'],
+        '    tsCal1: 0x%08X' % spec['ts_cal'][0],
+        '    tsCal2: 0x%08X' % spec['ts_cal'][1],
+        '    tsCal2Temp: %d' % spec['ts_cal'][2],
+        '    0 -> dma@%d' % spec['adc_dma'],
+        '    1 -> %s' % spec['adc_irq'],
         '',
-        'throttle:',
+        'throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x%08X'
+        % spec['throttle'],
         '    0 -> %s@0 | gpioPort%s@%s' % (cap, tp[1], tp[2:]),
         '',
     ]
@@ -279,14 +447,25 @@ def script(cfg, repl_path):
         ':description: boots an AM32 %s firmware ELF' % cfg['target'],
         '',
         '# GENERATED by Mcu/Renode/gen_target.py. Set $repo, $elf and',
-        '# $eeprom before including it; see am32_f051.resc for what they',
+        '# $eeprom before including it; see am32_%s.resc for what they'
+        % cfg['family'],
         '# mean.',
         '',
         '$repo?=@.',
         '$platform=@%s' % repl_path,
-        'include $repo/Mcu/Renode/scripts/am32_f051.resc',
+        # the eeprom address is per target, not per family: a 128k part
+        # keeps its settings at 0x0801F800 where a 64k one uses 0x0800F800
+        '$eeprom_addr=0x%08X' % cfg['eeprom_addr'],
+        'include $repo/Mcu/Renode/scripts/am32_%s.resc' % cfg['family'],
         '',
     ])
+
+
+def throttle_address(target, nm='arm-none-eabi-gcc'):
+    '''where to write a pulse width to drive the throttle generator. Not
+       a constant: it sits at 0x50000000 on the F051, which is where the
+       G0 puts GPIOA, so the G0 moves it to 0x60000000.'''
+    return FAMILY[config(target, nm)['family']]['throttle']
 
 
 def generate(target, outdir, nm='arm-none-eabi-gcc'):
@@ -494,7 +673,8 @@ def all_targets():
                                       stderr=subprocess.DEVNULL).decode()
     except (OSError, subprocess.CalledProcessError):
         return []
-    return sorted(set(t for t in out.split() if t.endswith('F051')))
+    return sorted(set(t for t in out.split()
+                      if t.endswith('F051') or t.endswith('G071')))
 
 
 def main():

@@ -10,6 +10,7 @@
 // and SYSCFG. Anything the firmware reads back and acts on needs a real
 // model, not this.
 //
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 
