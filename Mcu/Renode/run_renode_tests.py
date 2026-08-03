@@ -262,7 +262,8 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
     cmd = [renode, '--disable-xwt', '--console', '-e', 'include @%s' % resc]
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=900)
+                           stderr=subprocess.STDOUT, timeout=900,
+                           env=gen_target.renode_env())
     except FileNotFoundError:
         skip('renode not found; pass --renode')
     except subprocess.TimeoutExpired:
@@ -539,7 +540,7 @@ def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
     return subprocess.Popen(
         [renode, '--disable-xwt', '--console', '-e', 'include @%s' % resc],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT)
+        stderr=subprocess.STDOUT, env=gen_target.renode_env())
 
 
 def drain(proc, tail):

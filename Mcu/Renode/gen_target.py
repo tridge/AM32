@@ -756,6 +756,19 @@ def write_gdb_launcher(path, gdb, elf, port):
     os.chmod(path, 0o755)
 
 
+def renode_env():
+    '''Environment for launching Renode. The bundled mono defaults to a
+    ~4MB SGen nursery, and Renode allocates on every emulated bus access
+    - about 3GB per simulated second while the motor spins - so the
+    default collects ~800 times a simulated second and spends roughly a
+    third of the run suspending threads for the collector. A 64MB nursery
+    measured 1.58x faster on the spin test, results bit-identical. An
+    explicit MONO_GC_PARAMS in the caller's environment wins.'''
+    env = dict(os.environ)
+    env.setdefault('MONO_GC_PARAMS', 'nursery-size=64m')
+    return env
+
+
 def launch_gui(port, state_port):
     '''start Mcu/SITL/sitl_gui.py against the link ports. It needs PySide6,
        which the SITL keeps in its own venv, so prefer that interpreter -
@@ -987,7 +1000,7 @@ def main():
     cmd = [os.path.join(REPO, 'tools', 'linux', 'renode_1.16.1_portable',
                         'renode'), '--disable-xwt', '--console', '-e', setup]
     try:
-        return subprocess.call(cmd)
+        return subprocess.call(cmd, env=renode_env())
     finally:
         for p in (gdb_proc, gui_proc):
             if p is not None and p.poll() is None:
