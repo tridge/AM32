@@ -48,6 +48,14 @@ static struct {
     bool started;
 } st;
 
+/* mean of the fast signals over a sample period, for the state stream.
+   Point sampling a 24kHz PWM at the rate a GUI can plot just aliases it,
+   so the accumulation has to happen down here at the physics sub-step.
+   Off until a subscriber asks for it: it costs a call per sub-step. */
+static bool averaging;
+static double sig_acc[8];
+static uint32_t sig_n;
+
 uint64_t sitl_time_ns(void) { return st.now_ns; }
 
 /*
@@ -181,6 +189,10 @@ int am32sim_advance(uint64_t now_ns, int driven)
             st.cnt_ps = (st.cnt_ps + (uint64_t)dt * 1000) % period_ps;
         }
         motor_step(st.now_ns, dt);
+        if (averaging) {
+            motor_add_signals(sig_acc);
+            sig_n++;
+        }
     }
     st.now_ns = now_ns;
     return sitl_comp_out;
@@ -210,6 +222,67 @@ void am32sim_get_currents(double i[3])
 {
     double th, om;
     motor_get_state(&th, &om, i);
+}
+
+/* the snapshot Mcu/SITL/Src/sitl_state.c publishes on its state port, so
+   the GUI plots the same signals whichever backend it is attached to */
+void am32sim_get_live_state(float* omega, float* theta, float* theta_e,
+                            float i[3], float v[3], float* vbus, float* ibus)
+{
+    motor_get_live_state(omega, theta, theta_e, i, v, vbus, ibus);
+}
+
+void am32sim_set_averaging(int on)
+{
+    averaging = on != 0;
+    memset(sig_acc, 0, sizeof(sig_acc));
+    sig_n = 0;
+}
+
+/* mean of iu,iv,iw,vu,vv,vw,vbus,ibus since the last call. 0 if nothing
+   has been accumulated, in which case the caller keeps the point sample */
+int am32sim_take_signals(double out[8])
+{
+    if (sig_n == 0) {
+        return 0;
+    }
+    for (int k = 0; k < 8; k++) {
+        out[k] = sig_acc[k] / sig_n;
+    }
+    memset(sig_acc, 0, sizeof(sig_acc));
+    sig_n = 0;
+    return 1;
+}
+
+/* runtime motor swap, as the SITL's state port cmd 1 does it */
+int am32sim_reload_config(const char* path)
+{
+    if (!sitl_config_reload(path)) {
+        return 0;
+    }
+    motor_config_changed();
+    return 1;
+}
+
+void am32sim_get_model(double* kv, int* poles)
+{
+    if (kv) {
+        *kv = sitl_cfg.motor.kv;
+    }
+    if (poles) {
+        *poles = sitl_cfg.motor.poles;
+    }
+}
+
+/* obstruction in the prop, 0 free to 1 rigidly locked */
+void am32sim_set_stuck(double stuck)
+{
+    sitl_cfg.stuck = (float)stuck;
+}
+
+double am32sim_get_stuck(void)
+{
+    return sitl_cfg.stuck;
 }
 
 void am32sim_get_state(double* omega, double* theta, double* rpm)

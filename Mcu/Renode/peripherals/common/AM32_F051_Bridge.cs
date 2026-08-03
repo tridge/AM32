@@ -99,6 +99,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 new Phase(phaseCHigh, phaseCLow),
             };
 
+            // matches sitl_comp_phase's initial value in the shim
+            LastSensedPhase = 2;
+
             batch = new LimitTimer(machine.ClockSource, 1000000, this, "bridge",
                                    this.batchUs,
                                    direction: Direction.Ascending,
@@ -196,6 +199,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return which == 0 ? volts : (which == 1 ? amps : degrees);
         }
 
+        // What the last tick made of the bridge, kept so the state stream
+        // can publish it without recomputing: the per-phase mode
+        // (SITL_PHASE_*), which phase the comparator watches, and what it
+        // answered.
+        public bool Started => started;
+        public int LastPhaseMode(int phase) => lastMode[phase];
+        public int LastSensedPhase { get; private set; }
+        public bool LastCompOut { get; private set; }
+
         // phase currents in amps, motor truth rather than anything the
         // firmware measures
         public double CurrentA => Current(0);
@@ -224,6 +236,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             started = false;
             timer = null;
             comp = null;
+            Array.Clear(lastMode, 0, lastMode.Length);
+            LastSensedPhase = 2;
+            LastCompOut = false;
             if(loaded && configPath != null)
             {
                 am32sim_init(configPath);
@@ -280,6 +295,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 ccr[p] = timer.ActiveCcr(ph.CcrChannel);
             }
             am32sim_set_bridge(mode[0], mode[1], mode[2]);
+            mode.CopyTo(lastMode, 0);
 
             var arr = timer.ActiveArr;
             // PSC is preloaded too, but AM32 writes it once at init and
@@ -292,13 +308,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(sensed >= 0)
             {
                 am32sim_set_comp_phase(sensed);
+                LastSensedPhase = sensed;
             }
 
             var nowNs = (ulong)machine.ElapsedVirtualTime.TimeElapsed.TotalMicroseconds * 1000;
             // a bridge that is off cannot change a motor that is not
             // turning; the shim skips those steps, which is most of boot
             var driven = (mode[0] != 0 || mode[1] != 0 || mode[2] != 0) ? 1 : 0;
-            comp.CompOutput = am32sim_advance(nowNs, driven) != 0;
+            LastCompOut = am32sim_advance(nowNs, driven) != 0;
+            comp.CompOutput = LastCompOut;
         }
 
         // one phase's high and low side pins, e.g. "PA10" and "PB1"
@@ -466,6 +484,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] odr = new uint[3];
         private readonly uint[] afrl = new uint[3];
         private readonly uint[] afrh = new uint[3];
+        private readonly int[] lastMode = new int[3];
         private readonly bool invertedLow;
         // AF number that routes TIM1 to a pin; 2 on both F0 and G0
         private readonly uint timerAf;
