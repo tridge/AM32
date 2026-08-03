@@ -26,6 +26,8 @@ include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
 # after the bridge, which it samples for the physics sensor values
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
 
 mach create "am32"
 machine LoadPlatformDescription $platform
