@@ -540,9 +540,13 @@ def main():
                     help='what is serving the ports. "renode" is the emulator '
                          '(Mcu/Renode), which runs a real firmware ELF on an '
                          'emulated MCU and serves the same wire protocols, but '
-                         'has no CAN peripheral and no tone or audio stream, '
-                         'and runs below real time - the speedup slider can '
-                         'only slow it further')
+                         'has no tone or audio stream and runs below real '
+                         'time - the speedup slider can only slow it further')
+    ap.add_argument('--renode-can', action='store_true',
+                    help='enable the DroneCAN panel against the emulator. '
+                         'Only the emulated L431 _CAN targets have a CAN '
+                         'peripheral, so gen_target.py passes this when the '
+                         'target really has one')
     ap.add_argument('--poles', type=int, default=14)
     ap.add_argument('--control-port', type=int, default=0,
                     help='TCP port on localhost accepting UI control commands '
@@ -602,9 +606,11 @@ def main():
     # Ctrl-C only interrupts this process and the child is shut down
     # through node.close() instead of dying with a traceback
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    # the emulated F051 and G071 have no CAN peripheral, so there is
-    # nothing on the other end of a DroneCAN node here
-    can = CanPanel(args.can_uri) if HAVE_DRONECAN and not renode else None
+    # only the emulated L431 _CAN targets have a CAN peripheral, and the
+    # launcher says so with --renode-can; for any other emulated target
+    # there is nothing on the other end of a DroneCAN node here
+    can = (CanPanel(args.can_uri)
+           if HAVE_DRONECAN and (not renode or args.renode_can) else None)
     if can is not None:
         can.started.wait(5.0)
 
@@ -1099,7 +1105,7 @@ def main():
         apply_btn.clicked.connect(param_apply)
         gp.addWidget(apply_btn, 0, 3)
     elif renode:
-        g2.addWidget(QLabel('neither emulated family has a CAN peripheral'),
+        g2.addWidget(QLabel('this emulated target has no CAN peripheral'),
                      0, 0)
     else:
         g2.addWidget(QLabel('pydronecan not available'), 0, 0)
