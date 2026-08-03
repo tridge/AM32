@@ -55,6 +55,7 @@ static struct {
 static bool averaging;
 static double sig_acc[8];
 static uint32_t sig_n;
+static uint32_t comp_toggles;
 
 uint64_t sitl_time_ns(void) { return st.now_ns; }
 
@@ -188,7 +189,11 @@ int am32sim_advance(uint64_t now_ns, int driven)
         if (period_ps) {
             st.cnt_ps = (st.cnt_ps + (uint64_t)dt * 1000) % period_ps;
         }
+        const uint8_t comp_before = sitl_comp_out;
         motor_step(st.now_ns, dt);
+        if (sitl_comp_out != comp_before) {
+            comp_toggles++;
+        }
         if (averaging) {
             motor_add_signals(sig_acc);
             sig_n++;
@@ -196,6 +201,18 @@ int am32sim_advance(uint64_t now_ns, int driven)
     }
     st.now_ns = now_ns;
     return sitl_comp_out;
+}
+
+/* comparator output transitions since the last call. The batch caller
+   samples the level once per batch, which would collapse the noise
+   chatter motor.c generates near a zero crossing into nothing - and the
+   G4 startup path only escapes low speed because that chatter keeps
+   producing fresh edges after the blanking window. */
+uint32_t am32sim_get_comp_toggles(void)
+{
+    const uint32_t n = comp_toggles;
+    comp_toggles = 0;
+    return n;
 }
 
 /* bus voltage, bus current and temperature, which the ADC model turns
@@ -272,6 +289,13 @@ void am32sim_get_model(double* kv, int* poles)
     if (poles) {
         *poles = sitl_cfg.motor.poles;
     }
+}
+
+/* mechanical rotor angle in radians: start from a chosen rest position
+   rather than motor_init()'s zero */
+void am32sim_set_theta(double theta)
+{
+    motor_set_theta(theta);
 }
 
 /* obstruction in the prop, 0 free to 1 rigidly locked */

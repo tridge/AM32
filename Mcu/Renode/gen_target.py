@@ -18,10 +18,10 @@ usage:
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py --list                     targets this can emulate
 
-F051, G071 and L431 targets work; those are the AM32 MCU families with
-a Renode platform base so far. Anything else exits 77, as the test
-harness does for a skip - including the _CAN targets, whose bxCAN
-peripheral is not modelled yet.
+F051, G071, L431 and G431 targets work; those are the AM32 MCU families
+with a Renode platform base so far. Anything else exits 77, as the test
+harness does for a skip - including the G431 _CAN targets until their
+FDCAN peripheral is modelled (the L431 _CAN targets' bxCAN is).
 '''
 
 import argparse
@@ -39,7 +39,13 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 # rather than assumed, including the PHASE_*_COMP fallbacks targets.h
 # applies at the bottom of the file.
 WANTED = [
-    'MCU_F051', 'MCU_G071', 'MCU_L431',
+    'MCU_F051', 'MCU_G071', 'MCU_L431', 'MCU_G431',
+    # the G431 SEQURE splits conversion across both ADC instances, and
+    # its NTC rides in ADC1's sequence
+    'USE_ADC_1_2', 'NTC_ADC_CHANNEL',
+    # per-phase low-side alternate functions: the G4 puts TIM1_CH3N on
+    # PB15 at AF4 where the other low sides are AF6
+    'AF_A_LOW', 'AF_B_LOW', 'AF_C_LOW',
     # always defined by targets.h - 0 for a plain target, 1 for a _CAN
     # one - so it is the value that says whether CAN support is built in
     'DRONECAN_SUPPORT',
@@ -88,6 +94,9 @@ INMSEL = {
              'LL_COMP_INPUT_MINUS_IO3': (7, 1),
              'LL_COMP_INPUT_MINUS_IO4': (7, 2),
              'LL_COMP_INPUT_MINUS_IO5': (7, 3)},
+    # the G4 keeps the G0's four-bit INMSEL at [7:4] (no INMESEL)
+    'g431': {'LL_COMP_INPUT_MINUS_IO1': (6, 0),
+             'LL_COMP_INPUT_MINUS_IO2': (7, 0)},
 }
 
 # the capture timer, as (address, nvic line), per family
@@ -95,6 +104,7 @@ CAPTURE_TIMER = {
     'f051': {'TIM3': (0x40000400, 16), 'TIM15': (0x40014000, 20)},
     'g071': {'TIM3': (0x40000400, 16), 'TIM16': (0x40014400, 21)},
     'l431': {'TIM15': (0x40014000, 24)},
+    'g431': {'TIM15': (0x40014000, 24)},
 }
 
 # stock declaration and alternate-function map for whichever timers are
@@ -129,6 +139,12 @@ STOCK_TIMER = {
     'l431': {
         'TIM15': ('timer15', 0x40014000, 24, [
             '    0 -> gpioPortA#02@14 | gpioPortB#14@14',
+        ]),
+    },
+    # likewise on the G431, where TIM15_CH1 on PA2 is AF9
+    'g431': {
+        'TIM15': ('timer15', 0x40014000, 24, [
+            '    0 -> gpioPortA#02@9 | gpioPortB#14@1',
         ]),
     },
 }
@@ -188,6 +204,39 @@ FAMILY = {
         'timer_af': 2,
         'extra_dma_irqs': [],
     },
+    'g431': {
+        'macro': 'MCU_G431',
+        'timer_hz': 160000000,
+        'gpio_a': 0x48000000,
+        # no PA11/PA12 phase remap on this family
+        'syscfg': 0,
+        'throttle': 0x60000000,
+        'bridge': 0x60000400,
+        'guilink': 0x60000800,
+        # DMA1_Channel1_IRQn: the capture is on channel 1 in every G4
+        # group, routed by DMAMUX (stubbed; routing hardwired here)
+        'dma_irq': 11,
+        # ADC1 transfers on DMA1 channel 2
+        'adc_dma': 1,
+        # ADC1_2_IRQn; the firmware never unmasks it
+        'adc_irq': 'nvic@18',
+        'adc_base': 0x50000000,
+        'adc_sqr': True,
+        'temp_channel': 16,
+        # second calibration point at 110C on the G4, not the G0/L4's 130
+        'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 110, 3000),
+        # TIM1 routes to the phase pins on AF6 here
+        'timer_af': 6,
+        # two G4 groups put phase A's low side on PF0
+        'gpio_f': 0x48001400,
+        # DMA1_Channel2_IRQHandler does not exist in the firmware (the
+        # ADC callback is polled from the 1kHz loop); wiring the line
+        # would send a spurious interrupt into Default_Handler's
+        # infinite loop, so deliberately none
+        'extra_dma_irqs': [],
+        # the platform's CAN peripheral, for the hub wiring
+        'can_name': 'fdcan1',
+    },
     'l431': {
         'macro': 'MCU_L431',
         'timer_hz': 80000000,
@@ -215,6 +264,8 @@ FAMILY = {
         # DMA1_Channel1_IRQn: ADC_DMA_Callback() runs from this ISR as
         # well as from the 1kHz loop
         'extra_dma_irqs': [(0, 11)],
+        # the platform's CAN peripheral, for the hub wiring
+        'can_name': 'can1',
     },
 }
 
@@ -312,16 +363,17 @@ def config(target, nm='arm-none-eabi-gcc'):
             family = fam
             break
     if family is None:
-        raise Unsupported('%s is not an F051, G071 or L431 target; those '
-                          'are the only AM32 MCU families with a Renode '
-                          'platform base so far' % target)
+        raise Unsupported('%s is not an F051, G071, L431 or G431 target; '
+                          'those are the only AM32 MCU families with a '
+                          'Renode platform base so far' % target)
 
     # DRONECAN_SUPPORT is always defined - 0 on a plain target, 1 on a
     # _CAN one - so the value is the test, not the name or definedness.
-    # Only the L431 has a CAN peripheral modelled (bxCAN).
+    # The L431's bxCAN and the G431's FDCAN are modelled.
     dronecan = m.get('DRONECAN_SUPPORT', '0').strip() not in ('', '0')
-    if dronecan and family != 'l431':
-        raise Unsupported('%s: CAN is only modelled on the L431' % target)
+    if dronecan and 'can_name' not in FAMILY[family]:
+        raise Unsupported('%s: CAN is not modelled on the %s'
+                          % (target, family))
 
     timer = m.get('IC_TIMER_REGISTER')
     if timer not in CAPTURE_TIMER[family]:
@@ -340,16 +392,16 @@ def config(target, nm='arm-none-eabi-gcc'):
                               'of %s' % (c, ph, '/'.join(sorted(inmsel))))
         comps[ph] = inmsel[c]
 
-    # which comparator senses each phase. Only N_VARIANT targets split
-    # them; everything else uses MAIN_COMP throughout, and the F051 has
-    # only COMP1.
+    # Which comparator senses each phase. The G0 N_VARIANT targets and
+    # every G431 group split the phases across COMP1 and COMP2, saying
+    # so with PHASE_x_COMP_NUMBER; everything else keeps all three on
+    # MAIN_COMP, and the F051 has only COMP1. Keying on the macro rather
+    # than on N_VARIANT is what lets the G431 groups through.
     main = 1 if family == 'f051' else comp_number(m.get('MAIN_COMP', 'COMP2'))
     comp_of = {}
     for ph in 'ABC':
-        if 'N_VARIANT' in m:
-            comp_of[ph] = comp_number(m.get('PHASE_%s_COMP_NUMBER' % ph, ''))
-        else:
-            comp_of[ph] = main
+        num = m.get('PHASE_%s_COMP_NUMBER' % ph)
+        comp_of[ph] = comp_number(num) if num else main
 
     # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
     # than HIGH and LOW; the bridge takes them in the same two slots
@@ -379,14 +431,21 @@ def config(target, nm='arm-none-eabi-gcc'):
         raise Unsupported('cannot read EEPROM_START_ADD from %r'
                           % m.get('EEPROM_START_ADD'))
 
+    # three G431 targets have no current shunt at all; -1 means no
+    # channel ever matches in the ADC model and the reading stays 0
+    cur = m.get('CURRENT_ADC_CHANNEL')
+    ntc = m.get('NTC_ADC_CHANNEL')
     return {
         'target': target,
         'family': family,
         'name': m.get('FILE_NAME', target).strip('"').strip(),
         'voltage_channel': suffix_number(m.get('VOLTAGE_ADC_CHANNEL'),
                                          'LL_ADC_CHANNEL_', 'voltage channel'),
-        'current_channel': suffix_number(m.get('CURRENT_ADC_CHANNEL'),
-                                         'LL_ADC_CHANNEL_', 'current channel'),
+        'current_channel': suffix_number(cur, 'LL_ADC_CHANNEL_',
+                                         'current channel') if cur else -1,
+        'ntc_channel': suffix_number(ntc, 'LL_ADC_CHANNEL_',
+                                     'ntc channel') if ntc else -1,
+        'adc12': 'USE_ADC_1_2' in m,
         'voltage_divider': number('TARGET_VOLTAGE_DIVIDER', 110),
         'millivolt_per_amp': number('MILLIVOLT_PER_AMP', 20),
         'current_offset': number('CURRENT_OFFSET', 0),
@@ -414,6 +473,11 @@ def config(target, nm='arm-none-eabi-gcc'):
         'inverted_low': 'USE_INVERTED_LOW' in m,
         'inverted_high': 'USE_INVERTED_HIGH' in m,
         'pins': pins,
+        # per-phase low-side AF overrides (AF_x_LOW): the G4 SEQURE puts
+        # TIM1_CH3N on PB15 at AF4 where everything else is AF6
+        'low_afs': sorted(set(
+            suffix_number(m['AF_%s_LOW' % ph], 'LL_GPIO_AF_', 'low-side AF')
+            for ph in 'ABC' if m.get('AF_%s_LOW' % ph))),
     }
 
 
@@ -461,6 +525,22 @@ def comp_block(cfg):
             '    0 -> exti@21',
             '    1 -> exti@22',
         ]
+    if cfg['family'] == 'g431':
+        return [
+            '// The G4 keeps the G0 comparator layout - four-bit INMSEL at',
+            '// [7:4], output at bit 30 - so the G0 model serves, but the',
+            '// EXTI lines are the F051/L431 ones: COMP1 is 21, COMP2 is 22.',
+            '// Every G431 group splits the phases across both comparators.',
+            'comp: Miscellaneous.AM32_STM32G0_Comp @ sysbus <0x40010200, +0x100>',
+        ] + [
+            '    phase%sInmsel: %d' % (p, cfg['comps'][p][0]) for p in 'ABC'
+        ] + [
+            '    phase%sComp: %d' % (p, cfg['comp_of'][p]) for p in 'ABC'
+        ] + [
+            '    mainComp: %d' % cfg['main_comp'],
+            '    0 -> exti@21',
+            '    1 -> exti@22',
+        ]
     return [
         '// Two separate comparators on the G0, next to each other rather',
         '// than sharing the SYSCFG page. COMP1 is EXTI line 17, COMP2 is',
@@ -478,12 +558,84 @@ def comp_block(cfg):
     ]
 
 
+def adc_block(cfg, spec):
+    '''the ADC declaration(s). One instance almost everywhere; the G431
+       USE_ADC_1_2 targets convert temperature and the NTC on ADC1 and
+       voltage and current on ADC2, each with its own DMA channel.'''
+    head = [
+        '// The stock ADC models have no DMA output, and AM32 reads its',
+        '// conversions only through DMA into ADCDataDMA[], so against them',
+        '// the firmware saw no voltage or current at all. There is',
+        '// deliberately no external event frequency: AM32 starts',
+        '// conversions in software from the 1kHz loop, and modelling a',
+        '// hardware trigger as well made sequences overlap forever.',
+    ]
+    cal = [
+        '    temperatureChannel: %d' % spec['temp_channel'],
+        '    tsCal1: 0x%08X' % spec['ts_cal'][0],
+        '    tsCal2: 0x%08X' % spec['ts_cal'][1],
+        '    tsCal2Temp: %d' % spec['ts_cal'][2],
+        '    tsCalVrefMv: %d' % spec['ts_cal'][3],
+    ]
+    if not cfg['adc12']:
+        return head + [
+            'adc: Analog.AM32_STM32F0_ADC @ sysbus 0x%08X' % spec['adc_base'],
+            '    voltageChannel: %d' % cfg['voltage_channel'],
+            '    currentChannel: %d' % cfg['current_channel'],
+            '    voltageDivider: %d' % cfg['voltage_divider'],
+            '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
+            '    currentOffsetMv: %d' % cfg['current_offset'],
+        ] + cal + ([
+            '    sqrSequencer: true',
+        ] if spec['adc_sqr'] else []) + [
+            '    0 -> dma@%d' % spec['adc_dma'],
+            '    1 -> %s' % spec['adc_irq'],
+        ]
+    return head + [
+        '// ADC1 converts the temperature sensor and the NTC (the NTC has',
+        '// no model mapping and reads 0; converted_degrees uses the',
+        '// internal sensor). Sized to stop short of ADC2 at +0x100.',
+        'adc: Analog.AM32_STM32F0_ADC @ sysbus <0x%08X, +0x100>'
+        % spec['adc_base'],
+        '    voltageChannel: -1',
+        '    currentChannel: -1',
+        '    voltageDivider: %d' % cfg['voltage_divider'],
+        '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
+        '    currentOffsetMv: %d' % cfg['current_offset'],
+    ] + cal + [
+        '    sqrSequencer: true',
+        '    0 -> dma@%d' % spec['adc_dma'],
+        '    1 -> %s' % spec['adc_irq'],
+        '',
+        '// ADC2: voltage and current, transferred on DMA1 channel 4',
+        'adc2: Analog.AM32_STM32F0_ADC @ sysbus <0x%08X, +0x100>'
+        % (spec['adc_base'] + 0x100),
+        '    voltageChannel: %d' % cfg['voltage_channel'],
+        '    currentChannel: %d' % cfg['current_channel'],
+        '    voltageDivider: %d' % cfg['voltage_divider'],
+        '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
+        '    currentOffsetMv: %d' % cfg['current_offset'],
+        '    temperatureChannel: -1',
+        '    sqrSequencer: true',
+        '    0 -> dma@3',
+        '',
+        '// the ADC12 common registers, write-readback only',
+        'adccommon: Miscellaneous.AM32_RegisterFile @ sysbus <0x%08X, +0x100>'
+        % (spec['adc_base'] + 0x300),
+    ]
+
+
 def platform(cfg):
     fam = cfg['family']
     spec = FAMILY[fam]
     others = [t for t in STOCK_TIMER[fam] if t != cfg['timer']]
     cap = 'timer%s' % cfg['timer'][3:]
     tp = cfg['throttle_pin']
+    # a second accepted low-side AF (the G4 SEQURE's PB15 is AF4)
+    alts = [a for a in cfg['low_afs'] if a != spec['timer_af']]
+    if len(alts) > 1:
+        raise Unsupported('more than one alternate low-side AF: %s' % alts)
+    alt_af = alts[0] if alts else None
     L = [
         '// GENERATED by Mcu/Renode/gen_target.py from Inc/targets.h -',
         '// edit that, or the generator, not this file.',
@@ -569,7 +721,9 @@ def platform(cfg):
         '    syscfgBase: 0x%08X' % spec['syscfg'],
         '    gpioBBase: 0x%08X' % (spec['gpio_a'] + 0x400),
         '    gpioCBase: 0x%08X' % (spec['gpio_a'] + 0x800),
-    ] + [
+    ] + ([
+        '    gpioFBase: 0x%08X' % spec['gpio_f'],
+    ] if spec.get('gpio_f') else []) + [
         '    phase%s%s: "%s"' % (p, side.capitalize(), cfg['pins'][p + side])
         for p in 'ABC' for side in ('HIGH', 'LOW')
     ] + ([
@@ -578,30 +732,11 @@ def platform(cfg):
         '    invertedLow: true',
     ] if cfg['inverted_low'] else []) + ([
         '    invertedHigh: true',
-    ] if cfg['inverted_high'] else []) + [
+    ] if cfg['inverted_high'] else []) + ([
+        '    timerAfAlt: %d' % alt_af,
+    ] if alt_af is not None else []) + [
         '',
-        '// The stock ADC models have no DMA output, and AM32 reads its',
-        '// conversions only through DMA into ADCDataDMA[], so against them',
-        '// the firmware saw no voltage or current at all. There is',
-        '// deliberately no external event frequency: AM32 starts',
-        '// conversions in software from the 1kHz loop, and modelling a',
-        '// hardware trigger as well made sequences overlap forever.',
-        'adc: Analog.AM32_STM32F0_ADC @ sysbus 0x%08X' % spec['adc_base'],
-        '    voltageChannel: %d' % cfg['voltage_channel'],
-        '    currentChannel: %d' % cfg['current_channel'],
-        '    voltageDivider: %d' % cfg['voltage_divider'],
-        '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
-        '    currentOffsetMv: %d' % cfg['current_offset'],
-        '    temperatureChannel: %d' % spec['temp_channel'],
-        '    tsCal1: 0x%08X' % spec['ts_cal'][0],
-        '    tsCal2: 0x%08X' % spec['ts_cal'][1],
-        '    tsCal2Temp: %d' % spec['ts_cal'][2],
-        '    tsCalVrefMv: %d' % spec['ts_cal'][3],
-    ] + ([
-        '    sqrSequencer: true',
-    ] if spec['adc_sqr'] else []) + [
-        '    0 -> dma@%d' % spec['adc_dma'],
-        '    1 -> %s' % spec['adc_irq'],
+    ] + adc_block(cfg, spec) + [
         '',
         'throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x%08X'
         % spec['throttle'],
@@ -649,7 +784,7 @@ def script(cfg, repl_path):
         # after the include, so the machine exists. The hub is wiring
         # only; no host socket opens until something sets canmcast Bus.
         'emulation CreateCANHub "canhub"',
-        'connector Connect sysbus.can1 canhub',
+        'connector Connect sysbus.%s canhub' % FAMILY[cfg['family']]['can_name'],
         'connector Connect sysbus.canmcast canhub',
         '',
     ] if cfg['dronecan'] else []))
@@ -973,7 +1108,7 @@ def all_targets(nm='arm-none-eabi-gcc'):
     # Cheap substring prefilter, then ask the preprocessor what the
     # target really is.
     cand = [t for t in out.split()
-            if 'F051' in t or 'G071' in t or 'L431' in t]
+            if 'F051' in t or 'G071' in t or 'L431' in t or 'G431' in t]
     found = []
     for t in sorted(set(cand)):
         try:

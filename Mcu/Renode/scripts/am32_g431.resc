@@ -1,0 +1,79 @@
+:name: AM32 G431
+:description: boots an AM32 STM32G431 firmware ELF
+
+# Common to every G431 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the differences from
+# the other families are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32G0_Comp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+# the FDCAN and the mcast CAN bridge the _CAN target overlays use
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_FDCAN.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_CanMcast.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+# set by the generated per-target script: the CAN builds keep their
+# settings at 0x0801F800 and link at 0x08004000 above the 16K CAN
+# bootloader
+$eeprom_addr?=0x0800F800
+$app_base?=0x08001000
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# Factory temperature calibration. The G4 calibrates at a 3.0V
+# reference like the G0 and L4, but its second point is at 110C, not
+# 130C. Representative G4 numbers (V30 = 0.76V, 2.5mV/C rising slope),
+# not any particular die.
+sysbus WriteWord 0x1FFF75A8 1037
+sysbus WriteWord 0x1FFF75CA 1310
+
+# The G4 app writes VTOR itself in initAfterJump(), but the reset
+# vector is fetched before that runs, so the CPU must be pointed at the
+# app table here...
+cpu VectorTableOffset $app_base
+
+# ... and again after every reset. The firmware reboots itself on
+# signal loss (and DroneCAN's RestartNode does the same on request),
+# and Renode restores the CPU's default vector table at 0 when it
+# resets; nothing is mapped there but the empty bootloader region, so
+# without this the CPU halts while the emulation looks healthy.
+macro reset
+"""
+    cpu VectorTableOffset $app_base
+"""
+
+
+# NOT one instruction per 160MHz cycle: the G4 runs 4-wait-state flash
+# and, as on the L431, the number is load-bearing for dshot capture
+# alignment - the DMA re-arm in the capture ISR must not fit inside the
+# first bit's high time or a one-edge-late capture window becomes a
+# stable state and the learned frametime bounds go wrong. 64 keeps the
+# re-arm slower than a dshot600 bit, verified against the frametime
+# bounds the firmware learns.
+cpu PerformanceInMips 64
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
