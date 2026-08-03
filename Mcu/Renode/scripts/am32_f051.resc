@@ -68,6 +68,20 @@ sysbus WriteWord 0x1FFFF7C2 1348
 # while no bootloader is loaded, revisit before one is.
 cpu VectorTableOffset 0x08001000
 
+# ... and again after every reset. The firmware reboots itself on signal
+# loss, which any interactive session hits within a minute, and Renode
+# restores the CPU's default vector table at 0 when it resets. Nothing
+# is mapped there but an empty 4K bootloader region, so SP and PC both
+# read zero, the CPU halts with "PC does not lay in memory", and the ESC
+# is dead for the rest of the run while the emulation carries on looking
+# healthy. Renode says as much when this macro is missing: "No action
+# for reset - macro <machine>.reset is not registered".
+macro reset
+"""
+    cpu VectorTableOffset 0x08001000
+"""
+
+
 # Renode charges virtual time at a nominal instruction rate rather than
 # from the real instruction stream, and its default is 100 MIPS. This
 # target is a 48MHz Cortex-M0, so the default models a core twice as
