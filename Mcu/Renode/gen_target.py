@@ -1091,6 +1091,13 @@ def main():
         print('no firmware at %s' % elf)
         return 1
 
+    # the mcast scheme is 239.65.82.<bus>, one octet only for 0..9, and
+    # a DroneCAN node id is 7 bits with 0 meaning dynamic allocation
+    if args.can_bus > 9:
+        ap.error('--can-bus must be 0..9, or negative to disconnect')
+    if not 0 <= args.can_node <= 127:
+        ap.error('--can-node must be 0..127')
+
     # an eeprom is required, not optional; without one Renode fails with
     # "Parameters did not match the signature" from LoadBinary, which
     # says nothing about the actual problem
