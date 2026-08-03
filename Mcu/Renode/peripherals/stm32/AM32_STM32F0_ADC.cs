@@ -44,7 +44,18 @@ namespace Antmicro.Renode.Peripherals.Analog
         //
         // The temperature sensor sits on a different channel, with
         // different factory calibration, on each family: IN16 calibrated
-        // at 110C on the F051, IN12 at 130C on the G0.
+        // at 110C on the F051, IN12 at 130C on the G0, IN17 at 130C on
+        // the L4.
+        //
+        // sqrSequencer selects the L4's ADCv3 regular sequence: ranked
+        // 5-bit channel fields in SQR1..SQR4 with the length in
+        // SQR1[3:0], instead of the F0/G0 CHSELR in either of its two
+        // modes. The rest of the register interface AM32 touches - the
+        // ADCAL and ADEN/ADRDY handshake, CFGR DMAEN at bit 0, DR at
+        // 0x40, common CCR at 0x308 - matches bit for bit, which is why
+        // this is a mode rather than a separate model. The L4-only
+        // DEEPPWD/ADVREGEN writes fall through WriteControl harmlessly
+        // and nothing polls them.
         public AM32_STM32F0_ADC(IMachine machine, int voltageChannel,
                                 int currentChannel, int voltageDivider,
                                 int millivoltPerAmp, int currentOffsetMv,
@@ -52,7 +63,8 @@ namespace Antmicro.Renode.Peripherals.Analog
                                 ulong tsCal1 = 0x1FFFF7B8,
                                 ulong tsCal2 = 0x1FFFF7C2,
                                 int tsCal2Temp = 110,
-                                int tsCalVrefMv = 3300)
+                                int tsCalVrefMv = 3300,
+                                bool sqrSequencer = false)
         {
             this.machine = machine;
             this.voltageChannel = voltageChannel;
@@ -65,6 +77,7 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.tsCal2 = tsCal2;
             this.tsCal2Temp = tsCal2Temp;
             this.tsCalVrefMv = tsCalVrefMv;
+            this.sqrSequencer = sqrSequencer;
             if(tsCalVrefMv <= 0)
             {
                 throw new RecoverableException("tsCalVrefMv must be positive");
@@ -94,6 +107,12 @@ namespace Antmicro.Renode.Peripherals.Analog
             chselr = 0;
             ccr = 0;
             dr = 0;
+            smpr1 = 0;
+            smpr2 = 0;
+            for(var i = 0; i < sqr.Length; i++)
+            {
+                sqr[i] = 0;
+            }
             Conversions = 0;
         }
 
@@ -112,6 +131,15 @@ namespace Antmicro.Renode.Peripherals.Analog
             case CFGR2: return cfgr2;
             case CHSELR: return chselr;
             case CCR: return ccr;
+            // stored, not interpreted beyond Convert(): the LL sequencer
+            // and sampling-time helpers read-modify-write these, so a
+            // zero readback would lose the fields written before
+            case SMPR1: return smpr1;
+            case SMPR2: return smpr2;
+            case SQR1: return sqr[0];
+            case SQR2: return sqr[1];
+            case SQR3: return sqr[2];
+            case SQR4: return sqr[3];
             case DR:
                 isr &= ~EOC;
                 return dr;
@@ -132,6 +160,12 @@ namespace Antmicro.Renode.Peripherals.Analog
             case CFGR2: cfgr2 = value; return;
             case CHSELR: chselr = value; return;
             case CCR: ccr = value; return;
+            case SMPR1: smpr1 = value; return;
+            case SMPR2: smpr2 = value; return;
+            case SQR1: sqr[0] = value; return;
+            case SQR2: sqr[1] = value; return;
+            case SQR3: sqr[2] = value; return;
+            case SQR4: sqr[3] = value; return;
             }
         }
 
@@ -171,7 +205,31 @@ namespace Antmicro.Renode.Peripherals.Analog
         private void Convert()
         {
             var any = false;
-            if((cfgr1 & CHSELRMOD) != 0)
+            if(sqrSequencer)
+            {
+                // ADCv3: SQR1[3:0] is ranks-1, then 5-bit channel fields
+                // at a 6-bit stride - SQ1..SQ4 in SQR1 from bit 6,
+                // SQ5..SQ9 in SQR2 from bit 0, and so on
+                var ranks = (int)(sqr[0] & 0xF) + 1;
+                for(var rank = 1; rank <= ranks && rank <= 16; rank++)
+                {
+                    int reg, shift;
+                    if(rank <= 4)
+                    {
+                        reg = 0;
+                        shift = 6 * rank;
+                    }
+                    else
+                    {
+                        reg = (rank - 5) / 5 + 1;
+                        shift = 6 * ((rank - 5) % 5);
+                    }
+                    var ch = (int)((sqr[reg] >> shift) & 0x1F);
+                    any = true;
+                    ConvertOne(ch);
+                }
+            }
+            else if((cfgr1 & CHSELRMOD) != 0)
             {
                 for(var rank = 0; rank < 8; rank++)
                 {
@@ -304,6 +362,13 @@ namespace Antmicro.Renode.Peripherals.Analog
         private const long CHSELR = 0x28;
         private const long DR = 0x40;
         private const long CCR = 0x308;
+        // ADCv3 (L4) regular sequence and sampling time registers
+        private const long SMPR1 = 0x14;
+        private const long SMPR2 = 0x18;
+        private const long SQR1 = 0x30;
+        private const long SQR2 = 0x34;
+        private const long SQR3 = 0x38;
+        private const long SQR4 = 0x3C;
 
         private const uint ADRDY = 1u << 0;
         private const uint EOC = 1u << 2;
@@ -334,7 +399,11 @@ namespace Antmicro.Renode.Peripherals.Analog
         private readonly int millivoltPerAmp;
         private readonly int currentOffsetMv;
 
+        private readonly bool sqrSequencer;
+
         private AM32_F051_Bridge bridge;
         private uint isr, ier, cr, cfgr1, cfgr2, chselr, ccr, dr;
+        private uint smpr1, smpr2;
+        private readonly uint[] sqr = new uint[4];
     }
 }
