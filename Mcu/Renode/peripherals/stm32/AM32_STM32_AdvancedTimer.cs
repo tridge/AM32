@@ -140,6 +140,11 @@ namespace Antmicro.Renode.Peripherals.Timers
             return (regs[CCER / 4] & (CCxE << (4 * channel))) != 0;
         }
 
+        // The register, not the shadow: AM32 writes PSC once at init
+        // and never again, so they agree. The bridge reads this every
+        // tick, so it must not go through the bus.
+        public uint Prescaler => regs[PSC / 4] & MaxCount;
+
         // The period and compare values the hardware is actually
         // counting against, which with ARPE/OCxPE set are not what a
         // read of ARR or CCRx returns - those give the preload the
