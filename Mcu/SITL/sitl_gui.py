@@ -1807,6 +1807,16 @@ def main():
             'it too), and what the core is doing: which region the program\n'
             'counter is in, or that it has halted.')
         gs.addWidget(fw_label, 1, 0, 1, 3)
+        # LED swatch for targets with a WS2812 strip: shows the colour
+        # the firmware last clocked out, decoded from the real pin
+        led_label = QLabel('  LED  ')
+        led_label.setFont(fixed)
+        led_label.setToolTip(
+            'The colour the firmware last sent to its WS2812 LED strip,\n'
+            'decoded from the bit-banged data pin. Hidden until the\n'
+            'firmware sends a frame.')
+        led_label.setVisible(False)
+        gs.addWidget(led_label, 1, 3)
     eeprom_client = EepromClient(args.host, args.state_port)
     param_state = {'dialog': None, 'mismatch': None, 'next_check': 0.0,
                    'input_hint': None}
@@ -2300,6 +2310,18 @@ def main():
             fw_label.setStyleSheet('')
         fw_label.setText('firmware: %-16s core: %s'
                          % (info['name'] or '(unreadable)', where))
+        led = info.get('led')
+        if led is not None:
+            led_label.setVisible(True)
+            # black text on light colours, white on dark
+            lum = 0.299 * led[0] + 0.587 * led[1] + 0.114 * led[2]
+            led_label.setStyleSheet(
+                'background-color: rgb(%d,%d,%d); color: %s;'
+                ' border: 1px solid gray;'
+                % (led[0], led[1], led[2],
+                   'black' if lum > 128 else 'white'))
+        else:
+            led_label.setVisible(False)
 
     def update_sim_status():
         smp = sim.latest()

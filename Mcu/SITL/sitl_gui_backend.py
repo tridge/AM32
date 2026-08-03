@@ -551,8 +551,15 @@ class SimStream(object):
             if magic == self.MAGIC_INFO and len(d) >= 20:
                 pc, app_base, armed_count, loop_hz = struct.unpack_from('<IIII',
                                                                        d, 4)
+                name = d[20:].split(b'\0')[0]
+                # the LED block rides behind the name's terminator:
+                # 'L', led count, then LED0 as R,G,B
+                led = None
+                rest = d[20 + len(name) + 1:]
+                if len(rest) >= 5 and rest[0:1] == b'L' and rest[1] > 0:
+                    led = (rest[2], rest[3], rest[4])
                 self.info = {
-                    'name': d[20:].split(b'\0')[0].decode(errors='replace'),
+                    'name': name.decode(errors='replace'),
                     'pc': pc,
                     'app_base': app_base,
                     'halted': bool(b3 & 1),
@@ -560,6 +567,7 @@ class SimStream(object):
                     'armed': bool(b3 & 4),
                     'armed_count': armed_count,
                     'loop_hz': loop_hz,
+                    'led': led,
                     't': time.time(),
                 }
                 continue
