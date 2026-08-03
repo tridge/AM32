@@ -58,22 +58,33 @@ namespace Antmicro.Renode.Peripherals.CAN
         // the mcast bus number: 239.65.82.<Bus>. Setting it opens the
         // sockets; negative closes them. Left closed by default so a
         // run that is not using CAN cannot collide with a real SITL on
-        // the same machine.
+        // the same machine. Serialized: reconfiguring while the old
+        // receive thread is still draining must not race it.
         public int Bus
         {
             get { return bus; }
             set
             {
-                if(value == bus)
+                if(value > 9)
                 {
-                    return;
+                    // the SITL's scheme is 239.65.82.<bus>, one octet
+                    // shared with nothing else only for 0..9
+                    throw new RecoverableException(string.Format(
+                        "mcast bus {0} is out of range, expected 0..9", value));
                 }
-                Close();
-                if(value < 0)
+                lock(lifecycle)
                 {
-                    return;
+                    if(value == bus)
+                    {
+                        return;
+                    }
+                    Close();
+                    if(value < 0)
+                    {
+                        return;
+                    }
+                    Open(value);
                 }
-                Open(value);
             }
         }
 
@@ -108,6 +119,11 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 return;
             }
+            SendToHost(tx, message);
+        }
+
+        private void SendToHost(Socket tx, CANMessageFrame message)
+        {
             var id = message.ExtendedFormat
                 ? ((message.Id & 0x1FFFFFFFu) | EffFlag)
                 : (message.Id & 0x7FFu);
@@ -138,23 +154,34 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 this.Log(LogLevel.Warning, "mcast send failed: {0}", e.Message);
             }
+            catch(ObjectDisposedException)
+            {
+                // a concurrent Bus change closed the socket under us
+            }
         }
 
+        // Callers hold `lifecycle`. The sockets are created as locals and
+        // only published once fully set up, and the receive thread gets
+        // them as arguments rather than reading the mutable fields - a
+        // reconfigure must never hand the thread a null or someone
+        // else's socket.
         private void Open(int busNumber)
         {
             var group = IPAddress.Parse(string.Format("239.65.82.{0}", busNumber));
+            Socket tx = null;
+            Socket rx = null;
             try
             {
                 // separate transmit socket, so its ephemeral local port
                 // identifies our own datagrams on the receive side
-                var tx = new Socket(AddressFamily.InterNetwork,
-                                    SocketType.Dgram, ProtocolType.Udp);
+                tx = new Socket(AddressFamily.InterNetwork,
+                                SocketType.Dgram, ProtocolType.Udp);
                 tx.SetSocketOption(SocketOptionLevel.IP,
                                    SocketOptionName.MulticastTimeToLive, 1);
                 tx.Connect(new IPEndPoint(group, Port));
 
-                var rx = new Socket(AddressFamily.InterNetwork,
-                                    SocketType.Dgram, ProtocolType.Udp);
+                rx = new Socket(AddressFamily.InterNetwork,
+                                SocketType.Dgram, ProtocolType.Udp);
                 rx.SetSocketOption(SocketOptionLevel.Socket,
                                    SocketOptionName.ReuseAddress, true);
                 // bind the group address itself, as the SITL does, so
@@ -163,34 +190,45 @@ namespace Antmicro.Renode.Peripherals.CAN
                 rx.SetSocketOption(SocketOptionLevel.IP,
                                    SocketOptionName.AddMembership,
                                    new MulticastOption(group));
-
-                txSocket = tx;
-                rxSocket = rx;
             }
             catch(SocketException e)
             {
-                Close();
+                if(tx != null)
+                {
+                    tx.Close();
+                }
+                if(rx != null)
+                {
+                    rx.Close();
+                }
                 throw new RecoverableException(string.Format(
                     "cannot open mcast bus {0}: {1}", busNumber, e.Message));
             }
+            txSocket = tx;
+            rxSocket = rx;
             bus = busNumber;
-            var thread = new Thread(() => ReceiveLoop(rxSocket, txSocket))
+            rxThread = new Thread(() => ReceiveLoop(rx, tx))
             {
                 IsBackground = true,
                 Name = "am32 can mcast " + busNumber,
             };
-            thread.Start();
+            rxThread.Start();
             this.Log(LogLevel.Info, "CAN bridged to mcast bus {0} ({1}:{2})",
                      busNumber, group, Port);
         }
 
+        // Callers hold `lifecycle`. Joining the old thread before the
+        // caller opens a replacement means a stale datagram can never be
+        // delivered as a frame on the new bus.
         private void Close()
         {
             bus = -1;
             var tx = txSocket;
             var rx = rxSocket;
+            var thread = rxThread;
             txSocket = null;
             rxSocket = null;
+            rxThread = null;
             // closing the rx socket is what stops the receive thread
             if(rx != null)
             {
@@ -199,6 +237,11 @@ namespace Antmicro.Renode.Peripherals.CAN
             if(tx != null)
             {
                 tx.Close();
+            }
+            if(thread != null && !thread.Join(2000))
+            {
+                this.Log(LogLevel.Warning,
+                         "mcast receive thread did not stop in time");
             }
         }
 
@@ -222,7 +265,15 @@ namespace Antmicro.Renode.Peripherals.CAN
                     }
                     catch(SocketException)
                     {
+                        if(rxSocket != rx)
+                        {
+                            return; // replaced or closed; this thread is done
+                        }
                         continue;
+                    }
+                    if(rxSocket != rx)
+                    {
+                        return;
                     }
                     var src = (IPEndPoint)from;
                     // our own transmissions loop back; drop them
@@ -277,13 +328,23 @@ namespace Antmicro.Renode.Peripherals.CAN
             var flags = (ushort)(buf[4] | (buf[5] << 8));
             if((flags & FlagCanFd) != 0)
             {
-                return null; // bxCAN cannot receive FD frames
+                return null; // classic CAN cannot receive FD frames
             }
             var id = (uint)(buf[6] | (buf[7] << 8) | (buf[8] << 16)
                             | ((uint)buf[9] << 24));
+            if((id & ErrFlag) != 0)
+            {
+                return null; // libcanard error frames are not deliverable
+            }
+            var extended = (id & EffFlag) != 0;
+            if(!extended && (id & ~RtrFlag) > 0x7FF)
+            {
+                // a standard frame with upper identifier bits is
+                // malformed; rejecting beats silently aliasing it
+                return null;
+            }
             var data = new byte[n - HeaderLen];
             Array.Copy(buf, HeaderLen, data, 0, data.Length);
-            var extended = (id & EffFlag) != 0;
             return new CANMessageFrame(
                 id & (extended ? 0x1FFFFFFFu : 0x7FFu), data,
                 extendedFormat: extended,
@@ -334,12 +395,17 @@ namespace Antmicro.Renode.Peripherals.CAN
         private const ushort FlagCanFd = 0x0001;
         private const uint EffFlag = 0x80000000u;
         private const uint RtrFlag = 0x40000000u;
+        private const uint ErrFlag = 0x20000000u;
         private const int Port = 57732;
         private const int HeaderLen = 10;
 
         private readonly IMachine machine;
+        // serializes Open/Close against Bus reconfiguration
+        private readonly object lifecycle = new object();
+
         private volatile Socket txSocket;
         private volatile Socket rxSocket;
+        private Thread rxThread;
         private int bus;
         private uint framesToHost;
         private uint framesFromHost;

@@ -408,13 +408,19 @@ def run_can(renode, target_resc, elf, eeprom, model, so, scratch,
     try:
         deadline = time.time() + seconds
         can = CanPanel('mcast:%d' % bus)
-        can.started.wait(10.0)
+        if not can.started.wait(10.0):
+            check('the DroneCAN node starts', False,
+                  'CanPanel did not come up within 10s')
+            return {}
         if can.error is not None:
             check('the DroneCAN node starts', False, can.error)
             return {}
         can.rate = 100          # wall clock; well inside the 250ms
-        can.armed = True        # simulated-time RawCommand failsafe
-        can.throttle = 0.0
+        # a REAL unarmed test: full throttle commanded while the
+        # ArmingStatus stream says disarmed. Firmware that ignored
+        # REQUIRE_ARMING would spin here.
+        can.armed = False       # simulated-time RawCommand failsafe
+        can.throttle = CAN_THROTTLE
         can.enabled = True
         sim = SimStream('127.0.0.1', state_port, period_us=1000)
         sim.enabled = True
@@ -434,21 +440,29 @@ def run_can(renode, target_resc, elf, eeprom, model, so, scratch,
             check('the ESC appears on the mcast bus', False,
                   'no esc.Status within the backstop')
             return {}
-        # arming needs about 1.5 simulated seconds at zero throttle
         first = can.uptime
-        if wait_uptime(first + 4) is None:
+        if wait_uptime(first + 3) is None:
+            check('reaches the unarmed window', False, 'uptime stalled')
+            return {}
+        unarmed = dict(can.status)
+        # arming needs about 1.5 simulated seconds at zero throttle
+        can.throttle = 0.0
+        can.armed = True
+        if wait_uptime(first + 7) is None:
             check('reaches the arming window', False, 'uptime stalled')
             return {}
         armed = dict(can.status)
         can.throttle = CAN_THROTTLE
-        if wait_uptime(first + 10) is None:
+        if wait_uptime(first + 13) is None:
             check('reaches the settled window', False, 'uptime stalled')
             return {}
         s = sim.latest()
         spin = dict(can.status)
-        spin['sim_rpm'] = s[1] * 60.0 / (2 * 3.14159265358979)
+        spin['sim_rpm'] = (s[1] * 60.0 / (2 * 3.14159265358979)
+                           if s is not None else -1)
         spin['esc_frames'] = can.esc_rate.count
-        return {'armed': armed, 'spin': spin, 'node_id': can.node_id}
+        return {'unarmed': unarmed, 'armed': armed, 'spin': spin,
+                'node_id': can.node_id}
     finally:
         for c in (can, sim):
             if c is not None:
@@ -461,16 +475,18 @@ def run_can(renode, target_resc, elf, eeprom, model, so, scratch,
 
 
 def report_can(res, target, node_id):
+    u = res.get('unarmed')
     a = res.get('armed')
     s = res.get('spin')
-    if a is None or s is None:
+    if u is None or a is None or s is None:
         print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
         return 1
     check('the ESC appears on the mcast bus as node %d' % node_id,
           res.get('node_id') == node_id,
           'esc.Status from node %s' % res.get('node_id'))
-    check('does not spin unarmed', a.get('rpm', -1) == 0,
-          'rpm=%s at zero throttle' % a.get('rpm'))
+    check('refuses full throttle while disarmed', u.get('rpm', -1) == 0,
+          'rpm=%s with RawCommand %d and ArmingStatus disarmed'
+          % (u.get('rpm'), int(8191 * CAN_THROTTLE)))
     check('the telemetry carries the bus voltage',
           8.0 < a.get('voltage', 0) < 30.0, 'voltage=%.1f' % a.get('voltage', 0))
     want = expected(target)
@@ -812,6 +828,9 @@ def main():
             import dronecan  # noqa: F401
         except ImportError:
             skip('the python dronecan package is not installed')
+        if not 0 <= args.can_bus <= 9:
+            skip('--can-bus must be 0..9 (the mcast scheme is '
+                 '239.65.82.<bus>)')
 
     if args.elf is None:
         args.elf = gen_target.find_elf(args.target)
