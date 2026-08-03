@@ -63,13 +63,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 uint timerHz = 48000000,
                                 bool invertedLow = false, bool invertedHigh = false,
                                 string topology = "highlow", uint timerAf = 2,
-                                uint timerAfAlt = 0, ulong gpioFBase = 0,
+                                uint lowAfA = 0, uint lowAfB = 0, uint lowAfC = 0,
+                                ulong gpioFBase = 0,
                                 ulong syscfgBase = 0)
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
             this.timerAf = timerAf;
-            this.timerAfAlt = timerAfAlt;
             this.syscfgBase = syscfgBase;
             // index 3 is GPIOF, for the G431 groups whose phase A low
             // side is PF0; base 0 means the platform declares no port F
@@ -96,11 +96,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // 15625 at 64MHz on the G0
             tickPs = (uint)(1000000000000ul / timerHz);
 
+            // a low-side AF of 0 means "same as the timer AF"; the G4
+            // SEQURE's TIM1_CH3N is the one pin on a different number
             phases = new[]
             {
-                new Phase(phaseAHigh, phaseALow),
-                new Phase(phaseBHigh, phaseBLow),
-                new Phase(phaseCHigh, phaseCLow),
+                new Phase(phaseAHigh, phaseALow, lowAfA != 0 ? lowAfA : timerAf),
+                new Phase(phaseBHigh, phaseBLow, lowAfB != 0 ? lowAfB : timerAf),
+                new Phase(phaseCHigh, phaseCLow, lowAfC != 0 ? lowAfC : timerAf),
             };
             foreach(var ph in phases)
             {
@@ -380,10 +382,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // a pin only carries the timer output when it is in
                 // alternate mode AND selects the timer's AF AND the
                 // channel is connected to it
-                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin)
+                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin, timerAf)
                     && timer.ChannelEnabled(ph.CcrChannel)
                     && RemapOk(ph.RemapBit);
-                var loTimer = TimerDrives(ph.LowPort, ph.LowPin)
+                var loTimer = TimerDrives(ph.LowPort, ph.LowPin, ph.LowAf)
                     && timer.ComplementaryEnabled(ph.CcrChannel);
                 mode[p] = PhaseMode(moe, hiTimer, odr[ph.HighPort], ph.HighPin,
                                     loTimer, odr[ph.LowPort], ph.LowPin);
@@ -412,11 +414,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var before = LastCompOut;
             LastCompOut = am32sim_advance(nowNs, driven) != 0;
             // Replay every comparator transition the physics produced
-            // inside this batch, not just the final level. Near a zero
-            // crossing the modelled front-end noise chatters, and losing
-            // that chatter to batch sampling strands the targets whose
-            // startup only escapes low speed because a fresh edge always
-            // follows the blanking window.
+            // inside this batch, not just the final level, so front-end
+            // noise chatter near a zero crossing is not silently lost.
+            // A known limit: all replayed edges land at the batch's end
+            // instant, so the EXTI latches them as at most one pending
+            // event - timestamped delivery would need scheduling the
+            // edges in virtual time, which the SEQURE startup work may
+            // yet demand.
             var toggles = am32sim_get_comp_toggles();
             TotalToggles += toggles;
             for(var t = 1; t < toggles; t++)
@@ -429,8 +433,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // one phase's high and low side pins, e.g. "PA10" and "PB1"
         private class Phase
         {
-            public Phase(string high, string low)
+            public Phase(string high, string low, uint lowAf)
             {
+                LowAf = lowAf;
                 Decode(high, out HighPort, out HighPin);
                 Decode(low, out LowPort, out LowPin);
                 // TIM1_CH1 is PA8, CH2 is PA9, CH3 is PA10. AM32 turns on
@@ -474,6 +479,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // 0, 1 or 2 for TIM1_CH1..CH3
             public readonly int CcrChannel;
             public readonly uint RemapBit;
+            // the AF that routes the timer to the low-side pin
+            public readonly uint LowAf;
         }
 
         // SITL_PHASE_*: 0 float, 1 low, 2 pwm, 3 pwm without
@@ -529,17 +536,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // the AF that selects this timer. MODER alone is not enough: an
         // alternate pin pointing at the wrong AF drives nothing useful,
         // and that is a live porting bug on a new target.
-        private bool TimerDrives(int port, int pin)
+        private bool TimerDrives(int port, int pin, uint expectedAf)
         {
             if(((moder[port] >> (2 * pin)) & 3) != ModeAlternate)
             {
                 return false;
             }
             var afr = pin < 8 ? afrl[port] : afrh[port];
-            var af = (afr >> (4 * (pin & 7))) & 0xF;
-            // timerAfAlt covers a pin whose channel sits on a second AF
-            // number, like the G4 SEQURE's TIM1_CH3N on PB15 at AF4
-            return af == timerAf || (timerAfAlt != 0 && af == timerAfAlt);
+            // each pin has exactly one AF that routes this timer to it;
+            // accepting any other would mask a real pin-mux porting bug
+            return ((afr >> (4 * (pin & 7))) & 0xF) == expectedAf;
         }
 
         // PA11/PA12 carry TIM1_CH2 and CH3 only while the G0's SYSCFG
@@ -608,7 +614,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // AF number that routes TIM1 to a pin; 2 on F0 and G0, 1 on the
         // L4, 6 on the G4
         private readonly uint timerAf;
-        private readonly uint timerAfAlt;
         // SYSCFG_CFGR1, 0 on families without the remap
         private readonly ulong syscfgBase;
         private readonly bool enableBridge;

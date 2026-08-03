@@ -54,7 +54,7 @@ namespace Antmicro.Renode.Peripherals.CAN
         {
             // CSR/CSA clear, INIT set out of reset as on hardware; the
             // driver's first act is clearing CSR and waiting CSA==0
-            lock(pending)
+            lock(sync)
             {
                 pending.Clear();
             }
@@ -115,23 +115,27 @@ namespace Antmicro.Renode.Peripherals.CAN
                 return;
             case NBTP: nbtp = value; return;
             case IR:
-                ir &= ~value; // write 1 to clear
-                UpdateLines();
+                lock(sync)
+                {
+                    ir &= ~value; // write 1 to clear
+                    UpdateLines();
+                }
                 return;
-            case IE: ie = value; UpdateLines(); return;
-            case ILS: ils = value; UpdateLines(); return;
-            case ILE: ile = value; UpdateLines(); return;
+            case IE: lock(sync) { ie = value; UpdateLines(); } return;
+            case ILS: lock(sync) { ils = value; UpdateLines(); } return;
+            case ILE: lock(sync) { ile = value; UpdateLines(); } return;
             case RXGFC: rxgfc = value; return;
             case RXF0A:
-                lock(pending)
+                lock(sync)
                 {
                     if(f0Fill > 0)
                     {
                         f0Get = (int)((value & 3) + 1) % FifoDepth;
                         f0Fill--;
                     }
-                    // the freed slot admits the next frame off the wire
-                    if(pending.Count > 0 && f0Fill < FifoDepth)
+                    // the freed FIFO admits the next frame off the wire,
+                    // raising a fresh RF0N for it
+                    if(pending.Count > 0 && f0Fill == 0)
                     {
                         Deliver(pending.Dequeue());
                     }
@@ -152,21 +156,23 @@ namespace Antmicro.Renode.Peripherals.CAN
             }
         }
 
-        // A frame from the hub: push it into RX FIFO0's message RAM, or
-        // hold it until the firmware drains. Host-side senders burst in
-        // wall time while the emulation runs slower than real time; on a
-        // real bus the 1Mbit/s wire serializes frames at least 128us
-        // apart, so the holding queue models the wire's pacing, not an
-        // imaginary deeper FIFO.
+        // A frame from the hub: into RX FIFO0's message RAM only when the
+        // FIFO is EMPTY, else held. Host-side senders burst in wall time
+        // while the emulation runs slower; on a real bus the 1Mbit/s wire
+        // spaces frames at least 128us apart and the ISR always wins the
+        // race, so every frame gets its own RF0N. Stacking a burst into
+        // the FIFO would strand all but the first: the driver clears the
+        // write-one-to-clear RF0N and reads one element per interrupt,
+        // and a frame already in the FIFO raises no new edge.
         public void OnFrameReceived(CANMessageFrame message)
         {
             if((cccr & CccrInit) != 0 || message.Data.Length > 8)
             {
                 return;
             }
-            lock(pending)
+            lock(sync)
             {
-                if(f0Fill >= FifoDepth)
+                if(f0Fill > 0 || pending.Count > 0)
                 {
                     if(pending.Count < PendingLimit)
                     {
@@ -249,8 +255,11 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 handler(frame);
             }
-            ir |= IrTc;
-            UpdateLines();
+            lock(sync)
+            {
+                ir |= IrTc;
+                UpdateLines();
+            }
         }
 
         // The G4 routes each IR bit's group to line 0 or 1 through ILS;
@@ -335,8 +344,9 @@ namespace Antmicro.Renode.Peripherals.CAN
 
         private readonly IMachine machine;
         private readonly ulong ramBase;
-        // frames waiting for FIFO space, with its own lock: the socket
-        // thread delivers while the emulation thread acknowledges
+        // one lock for the IR/FIFO/queue state: the socket thread
+        // delivers while the emulation thread acknowledges and clears
+        private readonly object sync = new object();
         private readonly Queue<CANMessageFrame> pending = new Queue<CANMessageFrame>();
         private uint cccr, nbtp, ir, ie, ils, ile, rxgfc, txbc, txbtie;
         private uint f0Fill;
