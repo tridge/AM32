@@ -25,6 +25,8 @@ include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
 # after the bridge, which it samples for the physics sensor values
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
 # after the bridge and the generator, whose types it names
 include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
 # the mcast CAN bridge the _CAN target overlays declare

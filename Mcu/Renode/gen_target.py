@@ -46,6 +46,8 @@ WANTED = [
     # per-phase low-side alternate functions: the G4 puts TIM1_CH3N on
     # PB15 at AF4 where the other low sides are AF6
     'AF_A_LOW', 'AF_B_LOW', 'AF_C_LOW',
+    # WS2812 LED strip, bit-banged on a GPIOB pin
+    'USE_LED_STRIP', 'WS2812_PIN',
     # always defined by targets.h - 0 for a plain target, 1 for a _CAN
     # one - so it is the value that says whether CAN support is built in
     'DRONECAN_SUPPORT',
@@ -478,6 +480,11 @@ def config(target, nm='arm-none-eabi-gcc'):
         'low_afs': sorted(set(
             suffix_number(m['AF_%s_LOW' % ph], 'LL_GPIO_AF_', 'low-side AF')
             for ph in 'ABC' if m.get('AF_%s_LOW' % ph))),
+        # WS2812.c hardwires the strip to GPIOB; only the pin varies
+        'ws2812_pin': suffix_number(m['WS2812_PIN'], 'LL_GPIO_PIN_',
+                                    'WS2812 pin')
+                      if 'USE_LED_STRIP' in m and m.get('WS2812_PIN')
+                      else None,
     }
 
 
@@ -757,8 +764,32 @@ def platform(cfg):
         '// the launcher sets Bus.',
         'canmcast: CAN.AM32_CanMcast @ sysbus 0x%08X' % (spec['guilink'] + 0x400),
         '',
-    ] if cfg['dronecan'] else [])
+    ] if cfg['dronecan'] else []) + ws2812_block(cfg, spec)
     return '\n'.join(L)
+
+
+def ws2812_block(cfg, spec):
+    '''the LED strip decoder and the pin rewiring that feeds it. The
+       strip pin keeps its EXTI route: a connection block REPLACES the
+       base's, so the whole port B map is restated with the one pin
+       fanned out.'''
+    pin = cfg['ws2812_pin']
+    if pin is None:
+        return []
+    routes = []
+    for p in range(16):
+        if p == pin:
+            routes.append('    %d -> exti@%d | ws2812@0' % (p, p))
+        else:
+            routes.append('    %d -> exti@%d' % (p, p))
+    return [
+        '// Decodes the WS2812 strip AM32 bit-bangs on PB%d; the GUI' % pin,
+        '// shows the colour through the guilink device-info reply.',
+        'ws2812: Miscellaneous.AM32_Ws2812 @ sysbus 0x%08X'
+        % (spec['guilink'] + 0x800),
+        '',
+        'gpioPortB:',
+    ] + routes + ['']
 
 
 def script(cfg, repl_path):
