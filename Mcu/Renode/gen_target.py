@@ -756,6 +756,22 @@ def write_gdb_launcher(path, gdb, elf, port):
     os.chmod(path, 0o755)
 
 
+def find_renode(explicit=None):
+    '''the renode to launch: an explicit path wins, else a dotnet
+    portable installed under tools/linux (not vendored - a 77MB download
+    from the renode release page - but 1.76x faster on this workload
+    with bit-identical results), else the vendored mono portable, else
+    whatever $PATH has.'''
+    if explicit:
+        return explicit
+    for pattern in ('renode_*dotnet*', 'renode_*portable'):
+        found = sorted(glob.glob(os.path.join(
+            REPO, 'tools', 'linux', pattern, 'renode')))
+        if found:
+            return found[-1]
+    return 'renode'
+
+
 def renode_env():
     '''Environment for launching Renode. The bundled mono defaults to a
     ~4MB SGen nursery, and Renode allocates on every emulated bus access
@@ -868,6 +884,11 @@ def main():
     ap.add_argument('--no-skip-delays', action='store_true',
                     help='emulate the busy-wait delays instead of skipping '
                          'them; slower boot, but honest to step through')
+    ap.add_argument('--renode', default=None,
+                    help='renode binary to launch; default prefers a '
+                         'dotnet portable under tools/linux/ (1.76x '
+                         'faster, install it from the renode release '
+                         'page), falling back to the vendored mono one')
     ap.add_argument('--elf', default=None,
                     help='default: whatever obj/ holds for the target')
     ap.add_argument('--eeprom', default=None,
@@ -1003,8 +1024,8 @@ def main():
 
     for c in args.commands:
         setup += '; %s' % c
-    cmd = [os.path.join(REPO, 'tools', 'linux', 'renode_1.16.1_portable',
-                        'renode'), '--disable-xwt', '--console', '-e', setup]
+    cmd = [find_renode(args.renode), '--disable-xwt', '--console',
+           '-e', setup]
     try:
         return subprocess.call(cmd, env=renode_env())
     finally:
