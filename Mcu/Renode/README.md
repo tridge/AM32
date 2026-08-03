@@ -582,6 +582,18 @@ which is most of boot. That helps but does not eliminate the boot cost,
 because the batch tick itself - four register reads and a P/Invoke - is
 what is expensive, not the work it decides to skip.
 
+The single biggest cost is mono's garbage collector, not the emulation:
+Renode allocates on every emulated bus access - about 3GB per simulated
+second at spin - and the bundled mono's ~4MB nursery then collects ~800
+times a simulated second, each collection stopping every thread by
+signal. The launchers therefore run Renode with
+`MONO_GC_PARAMS=nursery-size=64m` (an explicit setting in the
+environment wins): measured 1.58x wall time on the spin test, results
+bit-identical. For scale, executing the translated Cortex-M0 code is
+only 2-3% of the run; after the GC fix the remaining time is dominated
+by Renode's C# time framework and generic bus dispatch. The table above
+was measured before this fix.
+
 Calibration work still belongs in the SITL - a 60s chirp here is minutes
 - but a spin is entirely practical.
 
