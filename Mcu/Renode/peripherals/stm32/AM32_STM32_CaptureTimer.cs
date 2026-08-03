@@ -44,13 +44,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             var conns = new Dictionary<int, IGPIO>();
             conns[DmaRequestLine] = new GPIO();
             conns[IrqLine] = new GPIO();
+            conns[OutputLine] = new GPIO();
             Connections = conns;
 
             counter = new LimitTimer(machine.ClockSource, frequency, this,
                                      "cnt", MaxCount + 1,
                                      direction: Direction.Ascending,
                                      enabled: false, autoUpdate: true,
-                                     eventEnabled: false);
+                                     eventEnabled: true);
+            counter.LimitReached += OnPeriod;
             Reset();
         }
 
@@ -64,13 +66,23 @@ namespace Antmicro.Renode.Peripherals.Timers
                 regs[i] = 0;
             }
             regs[ARR / 4] = MaxCount;
+            // CC1S = 01: reset into input capture, so a timer that has
+            // not been programmed yet does not drive the shared wire
+            regs[CCMR1 / 4] = 1;
             counter.Enabled = false;
             counter.Divider = 1;
+            counter.Limit = MaxCount + 1;
             counter.Value = 0;
             lastPinState = false;
             havePin = false;
             Connections[DmaRequestLine].Unset();
             Connections[IrqLine].Unset();
+            // The shared throttle wire is pulled up, so "not driving" is
+            // high, not low. Asserting this line low while the channel is
+            // an input would look to the generator like the ESC holding
+            // the wire down, and no dshot frame would get through.
+            Connections[OutputLine].Set(true);
+            replyBits = 0;
         }
 
         // pulsed by RCC APBxRSTR; receiveDshotDma() resets the timer on
@@ -119,8 +131,30 @@ namespace Antmicro.Renode.Peripherals.Timers
                 if((value & UG) != 0)
                 {
                     counter.Divider = (ulong)((regs[PSC / 4] & MaxCount) + 1);
+                    counter.Limit = (regs[ARR / 4] & MaxCount) + 1;
                     counter.Value = 0;
                 }
+                return;
+            case CCMR1:
+                regs[idx] = value;
+                if(!OutputMode)
+                {
+                    // the reply is finished; decode what we drove, then
+                    // release the wire
+                    DecodeReply();
+                    ResetReply();
+                    Connections[OutputLine].Set(true);
+                }
+                else
+                {
+                    ResetReply();
+                }
+                return;
+            case ARR:
+                regs[idx] = value & MaxCount;
+                // input capture leaves this at 0xFFFF and relies on the
+                // 16 bit wrap; the dshot reply sets it to a bit period
+                counter.Limit = (value & MaxCount) + 1;
                 return;
             case SR:
                 // rc_w0: writing 0 to a bit clears it
@@ -149,7 +183,10 @@ namespace Antmicro.Renode.Peripherals.Timers
             var wasSet = havePin && lastPinState;
             havePin = true;
             lastPinState = value;
-            if(!Counting)
+            // in output mode the channel drives the wire, it does not
+            // listen to it; capturing our own reply would corrupt
+            // dma_buffer
+            if(!Counting || OutputMode)
             {
                 return;
             }
@@ -177,6 +214,171 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
         }
 
+        // One counter period. In input capture mode this is just the 16
+        // bit wrap and nothing happens. In output mode it is one bit of
+        // the bidirectional dshot reply: sendDshotDma() puts the timer in
+        // PWM mode with ARR as the bit period and points the DMA at CCR1,
+        // so each period consumes one gcr[] entry and drives the line.
+        //
+        // The line is driven at one level per period rather than as a
+        // real PWM waveform. AM32 writes gcr[] entries of 0 or 64 against
+        // ARR 92, so on hardware a "1" period is a 70% duty pulse, but
+        // the GCR line code only carries information in the transitions
+        // between periods. Modelling the intra-period edge would add a
+        // second timer event per bit for nothing the decode looks at.
+        private void OnPeriod()
+        {
+            if(!OutputMode)
+            {
+                return;
+            }
+            var level = (regs[CCR1 / 4] & MaxCount) != 0;
+            if((regs[CCER / 4] & CC1P) != 0)
+            {
+                level = !level;
+            }
+            Connections[OutputLine].Set(level && OutputEnabled);
+            RecordReplyBit(level && OutputEnabled);
+            if((regs[DIER / 4] & CC1DE) != 0)
+            {
+                // ask the DMA for the next bit
+                Connections[DmaRequestLine].Blink();
+            }
+            regs[SR / 4] |= CC1IF;
+            UpdateIrq();
+        }
+
+        // The last bidirectional dshot reply this timer actually drove on
+        // the wire, GCR decoded back to the 16 bit frame: 12 bits of
+        // eRPM-or-EDT payload and a 4 bit CRC. Decoded from the levels
+        // that were output, not from the firmware's gcr[] buffer, so it
+        // checks the transmit path rather than restating it.
+        public uint LastReplyFrame { get; private set; }
+
+        // how many replies have been decoded, so a test can tell "no
+        // reply yet" from "a reply of zero"
+        public uint ReplyCount { get; private set; }
+
+        // the last reply's levels packed LSB-first, one bit per period,
+        // for diagnosing a decode that does not line up
+        public ulong ReplyRaw { get; private set; }
+
+        // bit n set if a decoded frame had top nibble n. eRPM and each
+        // extended telemetry type carry a different nibble, so a test can
+        // tell which kinds of reply went out over a run without having to
+        // sample a single frame at exactly the right moment.
+        public uint ReplyTypeMask { get; private set; }
+
+        // replies whose 21 periods were not a legal GCR code, and replies
+        // that decoded but failed their own CRC
+        public uint ReplyGcrErrors { get; private set; }
+        public uint ReplyCrcErrors { get; private set; }
+
+        // The line code is 21 bit periods; the 20 GCR bits are the
+        // transitions between adjacent periods, then each 5 bit group
+        // maps back to a nibble. Same scheme as decode_gcr() in
+        // Mcu/SITL/Src/sitl_input.c.
+        private void RecordReplyBit(bool level)
+        {
+            if(replyBits < reply.Length)
+            {
+                reply[replyBits++] = level;
+            }
+        }
+
+        // Called when the channel goes back to input capture, i.e. the
+        // whole reply has been driven.
+        //
+        // The transmission opens with buffer_padding idle periods, which
+        // are gcr[] entries of 0 driving the line high, so the line code
+        // starts at the falling edge out of idle. Finding it that way
+        // avoids having to know buffer_padding here, and skips the first
+        // recorded period, which is whatever CCR1 held before the DMA
+        // supplied the first entry.
+        private void DecodeReply()
+        {
+            var raw = 0ul;
+            for(var i = 0; i < replyBits && i < 64; i++)
+            {
+                if(reply[i])
+                {
+                    raw |= 1ul << i;
+                }
+            }
+            ReplyRaw = raw;
+            var start = -1;
+            for(var i = 1; i < replyBits; i++)
+            {
+                if(!reply[i] && reply[i - 1])
+                {
+                    start = i;
+                    break;
+                }
+            }
+            if(start < 0 || start + ReplyPeriods > replyBits)
+            {
+                return;
+            }
+            var gcrnum = 0u;
+            for(var j = 1; j < ReplyPeriods; j++)
+            {
+                gcrnum = (gcrnum << 1)
+                    | (uint)((reply[start + j] != reply[start + j - 1]) ? 1 : 0);
+            }
+            var frame = 0u;
+            for(var q = 3; q >= 0; q--)
+            {
+                var code = (gcrnum >> (q * 5)) & 0x1F;
+                var nibble = -1;
+                for(var i = 0; i < GcrTable.Length; i++)
+                {
+                    if(GcrTable[i] == code)
+                    {
+                        nibble = i;
+                        break;
+                    }
+                }
+                if(nibble < 0)
+                {
+                    // not a legal GCR code; leave the previous frame and
+                    // let the count show nothing new arrived
+                    ReplyGcrErrors++;
+                    return;
+                }
+                frame = (frame << 4) | (uint)nibble;
+            }
+            // Src/dshot.c: the low nibble is the inverted xor of the
+            // three payload nibbles
+            var csum = ~((frame >> 4) ^ (frame >> 8) ^ (frame >> 12)) & 0xF;
+            if(csum != (frame & 0xF))
+            {
+                ReplyCrcErrors++;
+            }
+            LastReplyFrame = frame;
+            ReplyTypeMask |= 1u << (int)((frame >> 12) & 0xF);
+            ReplyCount++;
+        }
+
+        // restart the reply capture whenever the channel is reconfigured
+        private void ResetReply()
+        {
+            replyBits = 0;
+        }
+
+        // Src/dshot.c gcr_encode_table
+        private static readonly uint[] GcrTable = {
+            0x19, 0x1B, 0x12, 0x13, 0x1D, 0x15, 0x16, 0x17,
+            0x1A, 0x09, 0x0A, 0x0B, 0x1E, 0x0D, 0x0E, 0x0F,
+        };
+
+        private const int ReplyPeriods = 21;
+
+        // CC1S = 00 means channel 1 is an output; receiveDshotDma() sets
+        // it to 01 for input capture
+        private bool OutputMode => (regs[CCMR1 / 4] & CC1S) == 0;
+
+        private bool OutputEnabled => (regs[CCER / 4] & CC1E) != 0;
+
         private void UpdateIrq()
         {
             var pending = (regs[SR / 4] & regs[DIER / 4] & CC1IE) != 0;
@@ -190,6 +392,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const long DIER = 0x0C;
         private const long SR = 0x10;
         private const long EGR = 0x14;
+        private const long CCMR1 = 0x18;
         private const long CCER = 0x20;
         private const long CNT = 0x24;
         private const long PSC = 0x28;
@@ -201,17 +404,25 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const uint CC1IE = 1u << 1;
         private const uint CC1IF = 1u << 1;
         private const uint CC1DE = 1u << 9;
+        private const uint CC1E = 1u << 0;
         private const uint CC1P = 1u << 1;
         private const uint CC1NP = 1u << 3;
+        private const uint CC1S = 3u << 0;
         private const uint MaxCount = 0xFFFF;
 
         private const int DmaRequestLine = 0;
         private const int IrqLine = 1;
+        // drives the shared throttle wire when the ESC is replying
+        private const int OutputLine = 2;
 
         private readonly ulong frequency;
         private readonly LimitTimer counter;
         private readonly uint[] regs = new uint[0x100];
         private bool lastPinState;
         private bool havePin;
+        // the whole transmission: buffer_padding idle periods plus the
+        // 21 period line code, with room to spare
+        private readonly bool[] reply = new bool[64];
+        private int replyBits;
     }
 }

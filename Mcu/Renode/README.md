@@ -15,9 +15,16 @@ agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
 **Two MCU families are supported, F051 and G071**, covering all 52 F051
-and 53 G071 targets with no per-target file to write - the platform is
+and 54 G071 targets with no per-target file to write - the platform is
 generated from `Inc/targets.h` on demand. What differs between the
 families is a table in `gen_target.py`, not a second code path.
+
+Targets are selected by asking the preprocessor which MCU each one
+resolves to, not by their names. Most are named after the MCU, but
+`STELLAR_G071_V1` ends in its board revision, and an earlier suffix match
+silently dropped it from `--list` and therefore from every sweep driven
+by it. A target that is never listed is never tested, and nothing
+complains.
 
 The G071 was not a copy of the F051. Three things had to be modelled
 before it would run, and each is a real difference rather than a gap in
@@ -51,6 +58,110 @@ identical. Diff the two with `gen_target.py` and see.
 (24 kHz) the firmware's startup duty of 400 ticks is exactly the dead
 time, so the phase never drives at all. Whether that is intended for a
 160 A ESC is a firmware question, not an emulator one.
+
+### Input protocols
+
+Servo and DShot both work, as real pin edges through the firmware's own
+capture and DMA path rather than by writing values into `dma_buffer`.
+That is the point: `detectInput()`, `checkDshot()` and
+`computeDshotDMA()` are the auto-detection and decode most likely to
+carry an MCU porting bug, and poking the buffer would bypass exactly the
+code under test.
+
+    python3 Mcu/Renode/run_renode_tests.py --target FD6288_F051 --dshot 600
+
+DShot 300 and 600 both arm and spin. DShot 632 lands on the same
+internal throttle scale as a 1300us servo pulse, so the three are
+directly comparable, and they agree: 2934 rpm on servo, 2934 on
+dshot300, 2935 on dshot600.
+
+**DShot150 is not offered, because AM32 cannot detect it.**
+`checkDshot()` classifies on the smallest gap between consecutive edges,
+and accepts 1-3 or 4-8 counts at the detection prescaler of
+`CPU_FREQUENCY_MHZ / 6` - 187.5ns per count at 48MHz.
+
+Which gap is smallest depends on the frame. Detection happens at zero
+throttle, where the frame is all zero bits, so the shortest interval is
+a zero's high time, 0.375 of a bit period; once ones appear it becomes a
+one's low time, 0.25 of a bit period. Either way dshot150 is out of
+range:
+
+| | 0.375T (all-zero frame) | 0.25T (frame with ones) |
+|---|---|---|
+| dshot600 | 625ns = 3.3 counts | 417ns = 2.2 counts |
+| dshot300 | 1250ns = 6.7 counts | 833ns = 4.4 counts |
+| dshot150 | 2500ns = **13.3 counts** | 1667ns = 8.9 counts |
+
+Measured rather than predicted: driving dshot150 leaves
+`smallestnumber` at 13, `dshot` at 0 and `inputSet` at 0, and the ESC
+never arms.
+
+That is worth stating precisely because it is a case of the two
+harnesses agreeing. The SITL, which replaces every peripheral with a
+fake, reached the same conclusion (`Mcu/SITL/sitl_gui.py`) - and this
+harness, which runs the real capture and DMA registers, reproduces it
+from the timing rather than from the same shared code. Two independent
+routes to the same limitation is much better evidence than either alone.
+
+The generator emits frames at 4kHz. Nothing in the firmware requires
+that - a minimal inter-frame gap gives about 19kHz and decodes just as
+cleanly - but every edge is a timer event, so the realistic rate costs
+nearly five times less to simulate for no loss of coverage.
+
+### Bidirectional DShot
+
+    python3 Mcu/Renode/run_renode_tests.py --target FD6288_F051 --bdshot
+
+Works, and spins at 2936 rpm - the same as servo and plain dshot.
+
+Two things had to exist for it. The capture timer gained an
+output-compare mode, because `sendDshotDma()` reuses **the same timer and
+the same pin** as a PWM output with the DMA feeding `CCR1`, one `gcr[]`
+entry per bit period. And the throttle generator became the arbiter of a
+shared half duplex wire: Renode GPIO has no contention, so the generator
+drives its own frame and otherwise passes the ESC's level through to the
+pin, which is what a flight controller releasing the line looks like.
+
+The wire is **pulled up**, so "not driving" is high, not low. Getting
+that wrong is not subtle in its effect but is easy to miss in its cause:
+a released line reading low looks exactly like the ESC holding the wire
+down, and bdshot detection goes from working to no captures at all.
+
+The reply is driven as one level per bit period rather than as a real
+PWM waveform. AM32 writes `gcr[]` entries of 0 or 64 against `ARR` 92, so
+on hardware a set period is a 70% duty pulse, but the GCR line code
+carries information only in the transitions between periods.
+
+`dshot_badcounts` settles at exactly 100 and then stops rising. That is
+correct rather than a defect: bidirectional frames carry an inverted CRC,
+and the firmware only switches to that interpretation after seeing the
+line idle high 100 times, so the first hundred frames genuinely fail CRC
+before the mode is recognised.
+
+### Decoding the reply, and extended telemetry
+
+    python3 Mcu/Renode/run_renode_tests.py --target FD6288_F051 --edt
+
+The capture timer GCR-decodes the reply back out of the levels it drove
+on the wire, rather than reading the firmware's `gcr[]` buffer, so the
+assertion covers the transmit path instead of restating it. The line
+code starts at the falling edge out of idle: the transmission opens with
+`buffer_padding` idle-high periods, and the first recorded period is
+whatever `CCR1` held before the DMA supplied an entry.
+
+That closes the loop on the whole chain. A spin decodes to frame
+`0x76D3`, whose payload is shift 3 and mantissa 365 - a 2920us
+electrical period, which at 14 poles is 2935 rpm, the speed the physics
+says the motor is turning. The firmware sensed the emulated motor
+through the comparators and reported it correctly, and 12295 replies in
+a run carry no GCR or CRC errors.
+
+`--edt` additionally sends dshot command 13 while armed and stopped,
+which enables extended telemetry. Frames then interleave one in two with
+eRPM, and each kind carries its own top nibble, so a run shows which
+went out: the type mask goes from `0xAA81` without EDT to `0xEAD5` with
+it, and the four added bits are exactly temperature, voltage, current
+and the EDT-init frame.
 
 Calibration and sweep work stays in the SITL, on speed grounds - see
 below.
