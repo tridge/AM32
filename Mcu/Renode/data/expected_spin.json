@@ -1,422 +1,422 @@
 {
  "AGFRC_V2_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2882
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "AIKON20X20_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "AIKONSINGLE_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "AIKON_04_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "AIKON_PRO_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "AIRBOT_PHOENIX_12S_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "AM32REF_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "AM32_ESC_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2885
  },
  "AORC_GP_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "AORC_PD_G071": {
-  "rpm": 2995,
-  "zero_crosses": 2889
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "ARIA_RAMP_F051": {
-  "rpm": 2933,
-  "zero_crosses": 2604
+  "rpm": 2986,
+  "zero_crosses": 2641
  },
  "ARK_4IN1_F051": {
-  "rpm": 2933,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2879
  },
  "ARK_4IN1_RAMP_F051": {
-  "rpm": 2932,
-  "zero_crosses": 2833
+  "rpm": 2986,
+  "zero_crosses": 2876
  },
  "ASCENT_TEST_F051": {
-  "rpm": 2707,
-  "zero_crosses": 2618
+  "rpm": 2710,
+  "zero_crosses": 2622
  },
  "BLPWR_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3036
+  "rpm": 3110,
+  "zero_crosses": 3033
  },
  "BOTDRIVE_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "CRTEENSY_HILARIESC_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2879
  },
  "DAKEFPV_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2913
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "DIATONE_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "DM_VISHNU32_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "DT120_64K_G071": {
-  "rpm": 2730,
-  "zero_crosses": 2613
+  "rpm": 2735,
+  "zero_crosses": 2618
  },
  "DT120_G071": {
-  "rpm": 2730,
-  "zero_crosses": 2613
+  "rpm": 2735,
+  "zero_crosses": 2618
  },
  "ESC_3BRC_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2882
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "FD6288_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "FLASHHOBBY_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "FLYCOLOR_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "FLYCOLOR_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "FLYCOLOR_HV3_G071": {
-  "rpm": 2841,
-  "zero_crosses": 2737
+  "rpm": 2863,
+  "zero_crosses": 2757
  },
  "GEN_128K_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "GEN_64K_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "GSPACE_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "HAKRC_2023_G071": {
-  "rpm": 2995,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "HGLRC_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "HVFLYCOLOR_F051": {
-  "rpm": 2854,
-  "zero_crosses": 2767
+  "rpm": 2858,
+  "zero_crosses": 2770
  },
  "IFLIGHT_12S_G071": {
-  "rpm": 2840,
-  "zero_crosses": 2737
+  "rpm": 2863,
+  "zero_crosses": 2757
  },
  "IFLIGHT_12S_SINGLE_N_G071": {
-  "rpm": 2731,
-  "zero_crosses": 2613
+  "rpm": 2736,
+  "zero_crosses": 2618
  },
  "IFLIGHT_BLITZ_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "IFLIGHT_BLITZ_N_G071": {
-  "rpm": 2995,
-  "zero_crosses": 2889
+  "rpm": 2989,
+  "zero_crosses": 2885
  },
  "IFLIGHT_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "ILLICITFPV_12S_AIO_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "JUPITER_80_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "LMNR_SIEGE_100A8S_SINGLE_G071": {
-  "rpm": 3086,
-  "zero_crosses": 2984
+  "rpm": 3097,
+  "zero_crosses": 2987
  },
  "LMNR_SIEGE_80A8S_4IN1_G071": {
-  "rpm": 3086,
-  "zero_crosses": 2984
+  "rpm": 3097,
+  "zero_crosses": 2987
  },
  "LUMENIER_SIEGE_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "LUMINOUSBEES_F051": {
-  "rpm": 2854,
-  "zero_crosses": 2778
+  "rpm": 2858,
+  "zero_crosses": 2781
  },
  "MAMBA_F40PRO_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3037
+  "rpm": 3111,
+  "zero_crosses": 3036
  },
  "MAMBA_F50PRO_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3037
+  "rpm": 3111,
+  "zero_crosses": 3036
  },
  "MAMBA_F55_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "MAMBA_F60PRO_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3037
+  "rpm": 3111,
+  "zero_crosses": 3036
  },
  "MAMBA_F65_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "MAMBA_S80_12S_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2913
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "MP6531_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "NEUTRONRC_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2861
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "NEUTRONRC_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "NEUTRON_PULLUP_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "NYXTRONICS_50A_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3036
+  "rpm": 3110,
+  "zero_crosses": 3033
  },
  "NYXTRONICS_DOUBLE_75A_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3036
+  "rpm": 3110,
+  "zero_crosses": 3033
  },
  "NYXTRONICS_DOUBLE_80A_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "OCDRC_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "OPEN_DRAIN_B_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "OPEN_DRAIN_G071": {
-  "rpm": 2995,
-  "zero_crosses": 2887
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "ORQA_F051": {
-  "rpm": 2592,
-  "zero_crosses": 2499
+  "rpm": 2587,
+  "zero_crosses": 2498
  },
  "PB054_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "PB405_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "PB450_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "PWM_ENABLE_G071": {
-  "rpm": 2995,
-  "zero_crosses": 2887
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "RAZOR32_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "REPEAT_DRIVE_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2862
+  "rpm": 2985,
+  "zero_crosses": 2908
  },
  "RHINO80A_F051": {
-  "rpm": 3116,
-  "zero_crosses": 3037
+  "rpm": 3111,
+  "zero_crosses": 3036
  },
  "RRIOT_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "SDMODEL_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "SEQURE_4IN1_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "SEQURE_4IN1_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2913
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "SEQURE_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "SEQURE_HV_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2883
  },
  "SEQURE_TOP_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2883
  },
  "SISKIN_11A_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "SISKIN_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "SKYSTARS_12S_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "SKYSTARS_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "SKYSTARS_KM80_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "SP_CRUSTCORE_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "STELLAR_G071_V1": {
-  "rpm": 2841,
-  "zero_crosses": 2737
+  "rpm": 2863,
+  "zero_crosses": 2757
  },
  "ST_G0_03_N_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "ST_G0_04_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "ST_G0_05_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "ST_G0_06_N_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2913
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "SURFBEE_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2990,
+  "zero_crosses": 2884
  },
  "TBS_12S_G071": {
-  "rpm": 2841,
-  "zero_crosses": 2738
+  "rpm": 2863,
+  "zero_crosses": 2757
  },
  "TBS_4IN1_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "TMOTOR45_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "TMOTOR55_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "TMOTOR_F60A_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "TMOTOR_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2913
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "VIMDRONES_S50_G071": {
-  "rpm": 2731,
-  "zero_crosses": 2640
+  "rpm": 2735,
+  "zero_crosses": 2618
  },
  "WRAITH32V1_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "WRAITH32V2_F051": {
-  "rpm": 2854,
-  "zero_crosses": 2767
+  "rpm": 2858,
+  "zero_crosses": 2770
  },
  "XRC_F051": {
-  "rpm": 2934,
-  "zero_crosses": 2860
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "XROTOR65_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "YYRC_F60MINI_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "YYRC_F60PRO_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "YYRC_F65MINI_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "YYRC_F65PRO_F051": {
-  "rpm": 2935,
-  "zero_crosses": 2859
+  "rpm": 2985,
+  "zero_crosses": 2904
  },
  "ZTW_A_HV_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2884
  },
  "ZTW_A_LV_G071": {
-  "rpm": 2994,
-  "zero_crosses": 2888
+  "rpm": 2989,
+  "zero_crosses": 2885
  }
 }

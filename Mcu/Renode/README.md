@@ -569,13 +569,17 @@ second - `batchUs` changes only how often Renode samples the registers
 and crosses the P/Invoke boundary - yet the cost more than halves from 2
 to 10. The integration itself is nearly free.
 
-`batchUs: 10` is the default: it costs 0.8% in rpm against the 2us
-reference for a 2x speedup. The spread across the table is real sampling
-error and not noise - two runs at the same setting are bit-identical
-(same rpm, same zero-cross count, same commutation interval), so the
-differences are attributable to batch size alone. Every setting spins
-cleanly: `bemf_timeout_happened` and `desync_happened` are both 0
-throughout.
+`batchUs: 20` is the default: it costs ~1.7% in steady rpm against the
+recorded batchUs 10 values (2.5% against the 2us reference) for another
+1.2x once the GC fix above is in. That was validated by running the
+scripted spin on all 105 recorded targets - everything passes, no BEMF
+timeouts, no desyncs, worst rpm shift +1.84% - and the recorded values
+in `data/expected_spin.json` were re-harvested at the new default, so
+the tests hold targets to the current configuration exactly. The spread
+across the table is real sampling error and not noise - two runs at the
+same setting are bit-identical (same rpm, same zero-cross count, same
+commutation interval), so the differences are attributable to batch
+size alone.
 
 A stationary, undriven motor is skipped entirely rather than integrated,
 which is most of boot. That helps but does not eliminate the boot cost,
