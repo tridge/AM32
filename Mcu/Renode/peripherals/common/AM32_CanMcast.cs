@@ -37,7 +37,8 @@ using System.Threading;
 namespace Antmicro.Renode.Peripherals.CAN
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class AM32_CanMcast : IDoubleWordPeripheral, IKnownSize, ICAN
+    public class AM32_CanMcast : IDoubleWordPeripheral, IKnownSize, ICAN,
+                                 IDisposable
     {
         public AM32_CanMcast(IMachine machine)
         {
@@ -53,6 +54,16 @@ namespace Antmicro.Renode.Peripherals.CAN
         // node comes back and keeps talking, as on a real bus.
         public void Reset()
         {
+        }
+
+        // machine teardown, unlike firmware reset, must not leave a
+        // ghost thread receiving alongside a replacement machine
+        public void Dispose()
+        {
+            lock(lifecycle)
+            {
+                Close();
+            }
         }
 
         // the mcast bus number: 239.65.82.<Bus>. Setting it opens the
