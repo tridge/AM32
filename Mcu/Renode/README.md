@@ -15,19 +15,20 @@ agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
 **Three MCU families are supported, F051, G071 and L431**, covering all
-52 F051, 54 G071 and 9 non-CAN L431 targets with no per-target file to
-write - the platform is generated from `Inc/targets.h` on demand. What
-differs between the families is a table in `gen_target.py`, not a
-second code path. The nine `_CAN` L431 targets skip with exit 77 until
-the bxCAN peripheral is modelled; they are recognised by the value the
+52 F051, 54 G071 and 18 L431 targets with no per-target file to write -
+the platform is generated from `Inc/targets.h` on demand. What differs
+between the families is a table in `gen_target.py`, not a second code
+path. The `_CAN` L431 targets run their DroneCAN firmware on an
+emulated bxCAN (see below); they are recognised by the value the
 preprocessor gives `DRONECAN_SUPPORT`, not by their names.
 
-Targets are selected by asking the preprocessor which MCU each one
-resolves to, not by their names. Most are named after the MCU, but
-`STELLAR_G071_V1` ends in its board revision, and an earlier suffix match
-silently dropped it from `--list` and therefore from every sweep driven
-by it. A target that is never listed is never tested, and nothing
-complains.
+Targets are classified by asking the preprocessor which MCU each one
+resolves to, not by their names - a cheap substring prefilter narrows
+the candidate list first, but the family decision is the
+preprocessor's. Most are named after the MCU, but `STELLAR_G071_V1`
+ends in its board revision, and an earlier suffix match silently
+dropped it from `--list` and therefore from every sweep driven by it. A
+target that is never listed is never tested, and nothing complains.
 
 The G071 was not a copy of the F051. Three things had to be modelled
 before it would run, and each is a real difference rather than a gap in
@@ -84,6 +85,55 @@ What was genuinely new:
   48 MIPS the re-arm overruns the first bit, the window drifts into the
   inter-frame gap and alignment becomes the only stable state, as on
   hardware.
+
+### DroneCAN over the emulated bxCAN
+
+The `_CAN` L431 targets run their real DroneCAN stack - libcanard's
+bxCAN driver against Renode's stock `CAN.STMCAN`, which turns out to
+model everything the driver needs: the `MSR.INAK` init handshake, the
+TX mailboxes with `TSR` bookkeeping, the RX FIFOs with `RFOM` release,
+and the acceptance filters (AM32 leaves filter 0 in accept-all mask
+mode). The frames leave the machine through a `CANHub` into
+`AM32_CanMcast`, a bridge speaking the ArduPilot multicast CAN scheme:
+UDP datagrams on `239.65.82.<bus>:57732` with the 10-byte header and
+CRC16-CCITT that `Src/DroneCAN/sys_can_SITL.c` and libcanard's mcast
+driver use. Anything on `mcast:<bus>` sees the emulated ESC -
+**dronecan_gui_tool**, the SITL GUI's DroneCAN panel,
+`sitl_can_test.py` - and can arm it, throttle it, fetch and set its
+parameters and read its `esc.Status` telemetry.
+
+    python3 Mcu/Renode/gen_target.py VIMDRONES_L431_CAN --run
+    # ... then: dronecan_gui_tool mcast:0
+
+`--can-bus N` moves it to another bus number (-1 disconnects);
+`--can-node` sets the node id written into the generated eeprom,
+because an anonymous node sends nothing until a DNA allocator answers
+and a bare bench run has none. The launcher's eeprom also sets input
+type 5 (dronecan only), as a real CAN ESC would be configured - and
+not only for realism: with the input type left at auto, the throttle
+generator's self-started zero-servo signal and the CAN input both
+write `newinput`, and the flapping input keeps resetting the arming
+counter so the ESC never arms. A real bench would show the same fight
+if a servo lead were left plugged in.
+
+`run_renode_tests.py --target VIMDRONES_L431_CAN --can` covers the
+path end to end with the GUI's own `CanPanel`: the node appears on the
+bus with the right id, refuses to spin unarmed, arms and spins at the
+recorded speed on `RawCommand`, and the rpm its `esc.Status` telemetry
+reports matches the physics to 5%. The scripted servo and dshot modes
+also run on `_CAN` targets (their test eeprom keeps input type 0), so
+the CAN builds are held to the same spin figures as everything else.
+
+Two things surfaced bringing this up. `sys_can_init()` derives the CAN
+bitrate from `LL_RCC_GetSystemClocksFreq()`, which recomputes the PLL
+output from `PLLCFGR` - against the stub's original zero readback that
+made PCLK1 come out 0 MHz and the driver hang in its bitrate switch
+(the same zero readback had been quietly leaving `LL_USART_Init()`
+unconfigured, so storing PLLCFGR fixed latent telemetry breakage too).
+And the bridge deliberately keeps its sockets across a firmware reset:
+`RestartNode` and the signal-loss reboot both go through
+`NVIC_SystemReset()`, and the node has to come back on the same bus as
+it would on real wire.
 
 The L431 also exposed a harness bug the other families could not hit:
 the firmware ELF was picked by globbing `AM32_<target>_*.elf`, and for
@@ -302,6 +352,13 @@ talking to; both ends speak the same wire format.
 `--link` does the same without opening a GUI, for driving from a script
 with `Mcu/SITL/sitl_dshot.py` or `sitl_gui_backend.py`.
 
+On a `_CAN` target, `--gui` also passes `--renode-can` so the GUI's
+DroneCAN panel comes up live against the mcast bridge: enable CAN
+there and the ESC arms and throttles over the bus rather than the
+dshot wire, with telemetry and the parameter editor going through
+DroneCAN exactly as against the SITL. The panel's rate control is
+wall clock, like everything else the GUI sends.
+
 **The input is setpoints, not a wire recording, and that is forced by the
 clock.** Renode runs far below real time, so the GUI's 50Hz stream of
 servo frames - 50Hz of *wall* clock - is a 5.5Hz signal as the firmware
@@ -388,11 +445,15 @@ the motor, continue.
 
     python3 Mcu/Renode/run_renode_tests.py --target FD6288_F051 --link
     python3 Mcu/Renode/run_renode_tests.py --target FD6288_F051 --gui
+    python3 Mcu/Renode/run_renode_tests.py --target VIMDRONES_L431_CAN --can
 
 `--link` drives the target through the udp ports with the GUI's own
 backend classes; `--gui` runs the real `sitl_gui.py` under Qt's offscreen
 platform and scripts it through its control port, which is the only way
-to cover the UI a person actually uses.
+to cover the UI a person actually uses. `--can` arms and throttles a
+`_CAN` target over DroneCAN through the mcast bridge with the GUI's
+`CanPanel`, on bus 7 by default so a live SITL or GUI on the same
+machine is not disturbed.
 
 Both are paced by **simulated** time read out of the state stream rather
 than by the wall clock, so they hold the throttle for the same emulated
@@ -493,8 +554,9 @@ from a scratch directory, as the SITL suite does.
     peripherals/common/             family-neutral models: the motor bridge,
                                     the throttle generator, the guilink
                                     server that serves the SITL wire
-                                    protocols, the comparator interface
-                                    every family implements
+                                    protocols, the mcast CAN bridge, the
+                                    comparator interface every family
+                                    implements
     scripts/am32_f051.resc          one per family, shared by every generated
     scripts/am32_g071.resc          target script of that family
     scripts/am32_l431.resc
