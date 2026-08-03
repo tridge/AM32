@@ -656,7 +656,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             var name = FirmwareName();
             var text = Encoding.UTF8.GetBytes(name);
-            var pkt = new byte[20 + text.Length + 1];
+            // the LED block rides behind the name's terminator, where a
+            // client that predates it never looks
+            if(ws2812 == null)
+            {
+                ws2812 = machine.GetPeripheralsOfType<AM32_Ws2812>()
+                                .FirstOrDefault();
+            }
+            var ledBytes = ws2812 != null && ws2812.Count > 0 ? 5 : 0;
+            var pkt = new byte[20 + text.Length + 1 + ledBytes];
             Array.Copy(BitConverter.GetBytes(StateMagicInfo), 0, pkt, 0, 2);
             pkt[2] = 9;
             var armed = ArmedAddress != 0
@@ -669,6 +677,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Array.Copy(BitConverter.GetBytes(armedCount), 0, pkt, 12, 4);
             Array.Copy(BitConverter.GetBytes(LoopHz), 0, pkt, 16, 4);
             Array.Copy(text, 0, pkt, 20, text.Length);
+            if(ledBytes > 0)
+            {
+                var off = 20 + text.Length + 1;
+                var color = ws2812.Color;
+                pkt[off] = (byte)'L';
+                pkt[off + 1] = (byte)Math.Min(ws2812.Count, 255);
+                pkt[off + 2] = (byte)(color >> 16);
+                pkt[off + 3] = (byte)(color >> 8);
+                pkt[off + 4] = (byte)color;
+            }
             Send(stateSocket, pkt, pkt.Length, to);
         }
 
@@ -918,6 +936,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private AM32ThrottleGenerator generator;
         private AM32_F051_Bridge bridge;
         private AM32_STM32_CaptureTimer capture;
+        private AM32_Ws2812 ws2812;
 
         // guarded by sync: the newest setpoint, and where its sender is
         private bool haveSetpoint;
