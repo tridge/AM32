@@ -14,10 +14,13 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Two MCU families are supported, F051 and G071**, covering all 52 F051
-and 54 G071 targets with no per-target file to write - the platform is
-generated from `Inc/targets.h` on demand. What differs between the
-families is a table in `gen_target.py`, not a second code path.
+**Three MCU families are supported, F051, G071 and L431**, covering all
+52 F051, 54 G071 and 9 non-CAN L431 targets with no per-target file to
+write - the platform is generated from `Inc/targets.h` on demand. What
+differs between the families is a table in `gen_target.py`, not a
+second code path. The nine `_CAN` L431 targets skip with exit 77 until
+the bxCAN peripheral is modelled; they are recognised by the value the
+preprocessor gives `DRONECAN_SUPPORT`, not by their names.
 
 Targets are selected by asking the preprocessor which MCU each one
 resolves to, not by their names. Most are named after the MCU, but
@@ -42,6 +45,58 @@ the port:
   at 0x40010200, output at CSR bit 30 rather than 14, and a four bit
   `INMSEL` at [7:4] rather than three at [6:4]. `N_VARIANT` targets move
   between COMP1 and COMP2 per commutation step.
+
+The L431 is the first Cortex-M4F here and the first family with no
+stock Renode platform to vendor - `stm32l431_base.repl` is written from
+RM0394 and the SVD. Much of it is an F051 reunion: GPIO back at
+0x48000000, the EXTI with the F0/F4 single-bank layout at the same
+address (so the stock `STM32F4_EXTI` serves, non-clearing re-entry
+behaviour included) and the comparators back on EXTI lines 21 and 22.
+What was genuinely new:
+
+- **the inverting input select is two fields.** `INMSEL` is three bits
+  at [6:4] (bit 7 is part of `INPSEL` here, which is why the G0 model's
+  four bit read cannot serve) plus `INMESEL` at [26:25], and the LL
+  driver's IO2..IO5 all collide on `INMSEL` 7. The phase map is keyed
+  on the full `(comparator, INMSEL, INMESEL)` triple in
+  `AM32_STM32L4_Comp`.
+- **the ADC is ADCv3 with the SQR rank sequencer**: ranked five bit
+  channel fields in SQR1..SQR4 instead of `CHSELR` in either of its two
+  modes, and ADC1 moves to 0x50040000. Everything else AM32 touches
+  matches the F0/G0 model bit for bit, so this is a `sqrSequencer` mode
+  on the shared model, not a third one. The calibrate/enable handshake
+  gains `DEEPPWD`/`ADVREGEN` writes, which nothing polls.
+- **TIM1 routes to the phase pins on AF1** where the F0 and G0 use AF2
+  (`timerAf` on the bridge), and the throttle pin PA2 is TIM15_CH1 on
+  **AF14**, past the 8 alternate functions the M0 families have.
+- **DMA request routing is the CSELR register**, which falls past the
+  DMA model's channel block and is ignored - routing stays hardwired in
+  the platform, the same deliberate deviation as the G0's DMAMUX stub.
+- **`PerformanceInMips` is 48, not the other families' one instruction
+  per cycle.** The L431 runs from 4-wait-state flash with no cache, so
+  under one instruction per cycle is the honest number - and the number
+  is load-bearing. At 80 MIPS the dshot DMA re-arm in the capture ISR
+  fits inside the first bit's 1.25us high time, so a capture window
+  that locked one edge late misses the frame's first edge again on
+  every re-arm, measures ~250us frametimes for exactly the eight
+  windows `computeDshotDMA()` averages into its accept bounds, and the
+  ESC then arms deaf with every real 51us frame silently discarded. At
+  48 MIPS the re-arm overruns the first bit, the window drifts into the
+  inter-frame gap and alignment becomes the only stable state, as on
+  hardware.
+
+The L431 also exposed a harness bug the other families could not hit:
+the firmware ELF was picked by globbing `AM32_<target>_*.elf`, and for
+a target with a `_CAN` sibling the sibling sorts last - so the servo
+suite quietly loaded `AM32_VIMDRONES_L431_CAN_2.20.elf`, whose vector
+table lives at 0x08004000, and the CPU halted at reset. `find_elf()`
+now matches the version suffix exactly.
+
+Known L431 fidelity gaps, both harmless to the suite: USART1 TX DMA
+telemetry is not modelled (the stock USART raises no TX DMA request;
+nothing in the tests enables interval telemetry), and the `APB2RSTR`
+reset pulse `receiveDshotDma()` sends TIM15 every direction change is
+ignored by the RCC stub, as it is on the other families.
 
 ### One target is skipped
 
@@ -183,8 +238,8 @@ below.
 ## Running
 
 Renode is not vendored; install it into the gitignored `tools/` tree the
-same way the ARM toolchain is installed. Then, for any F051 or G071
-target:
+same way the ARM toolchain is installed. Then, for any F051, G071 or
+non-CAN L431 target:
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --run
 
@@ -424,12 +479,14 @@ from a scratch directory, as the SITL suite does.
 
 ## What is here
 
-    gen_target.py                   builds a platform for any F051 or G071
-                                    target out of Inc/targets.h
+    gen_target.py                   builds a platform for any F051, G071 or
+                                    non-CAN L431 target out of Inc/targets.h
     platforms/stm32f051_base.repl   MCU-common. Vendored from Renode's
     platforms/stm32g071_base.repl   platforms/cpus/stm32f0.repl and
                                     stm32g0.repl (Antmicro, MIT - header
                                     retained) and edited
+    platforms/stm32l431_base.repl   MCU-common, written from RM0394 and the
+                                    SVD - Renode ships no stm32l4 platform
     peripherals/stm32/              our peripheral models, GPL-3, loaded at
                                     runtime with `include @...cs`; no Renode
                                     rebuild needed
@@ -437,9 +494,10 @@ from a scratch directory, as the SITL suite does.
                                     the throttle generator, the guilink
                                     server that serves the SITL wire
                                     protocols, the comparator interface
-                                    both families implement
+                                    every family implements
     scripts/am32_f051.resc          one per family, shared by every generated
     scripts/am32_g071.resc          target script of that family
+    scripts/am32_l431.resc
 
 ### Adding a target
 
@@ -467,7 +525,7 @@ loudly when wrong**:
 - the **bridge pin map**. Most targets put phase A on PA10/PB1, but a
   third of them rotate the phases across the same six pins.
 - the **capture timer and DMA channel**: TIM15 or TIM3 on the F051,
-  TIM3 or TIM16 on the G071.
+  TIM3 or TIM16 on the G071, always TIM15 on the L431.
 - the **bridge topology**. Most targets drive a high and a low side per
   phase, but `USE_INVERTED_LOW` ones turn the low FET on by writing BRR,
   and `PWM_ENABLE_BRIDGE` ones have a gate driver with one PWM and one
