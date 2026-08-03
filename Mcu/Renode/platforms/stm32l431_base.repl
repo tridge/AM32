@@ -219,6 +219,14 @@ sram2: Memory.MappedMemory @ sysbus 0x10000000
 systemMemory: Memory.MappedMemory @ sysbus 0x1FFF7000
     size: 0x1000
 
+// bxCAN, the same IP as the F4's at the same base with the same four
+// NVIC lines. libcanard's driver needs the MSR.INAK handshake and the
+// TSR/RFxR mailbox semantics; the frames themselves go to a CANHub
+// created by the .resc on CAN targets, where an AM32_CanMcast bridge
+// puts them on the SITL's multicast bus for dronecan_gui_tool.
+can1: CAN.STMCAN @ sysbus <0x40006400, +0x400>
+    [0-3] -> nvic@[19-22]
+
 // The bridge, the throttle generator, the guilink, the capture timer,
 // the comparator and the ADC are declared by the target overlay: their
 // pin maps, channels and scaling differ per target. The made-up
@@ -228,7 +236,6 @@ sysbus:
     init:
         Tag <0x40002800, 0x40002BFF> "RTC"
         Tag <0x40002C00, 0x40002FFF> "WWDG"
-        Tag <0x40006400, 0x400067FF> "CAN1"
         Tag <0x40007C00, 0x40007FFF> "LPTIM1"
         Tag <0x40008000, 0x400083FF> "LPUART1"
         Tag <0x40009400, 0x400097FF> "LPTIM2"

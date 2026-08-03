@@ -223,10 +223,13 @@ FAMILY = {
 # reads at boot, and what the GUI parameter editor fetches and writes
 EEPROM_SIZE = 192
 
-# where the application is linked, above the 4K bootloader region. Also
+# where the application is linked, above the bootloader region. Also
 # what the .resc points the reset vector at, since no bootloader is
-# loaded. A PC below this is executing in the bootloader region.
+# loaded. A PC below this is executing in the bootloader region. The
+# DroneCAN targets link above a 16K bootloader instead of the plain 4K
+# one; per-target the value is cfg['app_base'].
 APP_BASE = 0x08001000
+APP_BASE_CAN = 0x08004000
 
 
 class Unsupported(Exception):
@@ -314,9 +317,11 @@ def config(target, nm='arm-none-eabi-gcc'):
                           'platform base so far' % target)
 
     # DRONECAN_SUPPORT is always defined - 0 on a plain target, 1 on a
-    # _CAN one - so the value is the test, not the name or definedness
-    if m.get('DRONECAN_SUPPORT', '0').strip() not in ('', '0'):
-        raise Unsupported('%s: CAN is not modelled yet' % target)
+    # _CAN one - so the value is the test, not the name or definedness.
+    # Only the L431 has a CAN peripheral modelled (bxCAN).
+    dronecan = m.get('DRONECAN_SUPPORT', '0').strip() not in ('', '0')
+    if dronecan and family != 'l431':
+        raise Unsupported('%s: CAN is only modelled on the L431' % target)
 
     timer = m.get('IC_TIMER_REGISTER')
     if timer not in CAPTURE_TIMER[family]:
@@ -400,6 +405,8 @@ def config(target, nm='arm-none-eabi-gcc'):
         'dead_time': m.get('DEAD_TIME', '?'),
         'loop_hz': number('LOOP_FREQUENCY_HZ', 20000),
         'eeprom_addr': eeprom_addr,
+        'dronecan': dronecan,
+        'app_base': APP_BASE_CAN if dronecan else APP_BASE,
         'comps': comps,
         'comp_of': comp_of,
         'main_comp': main,
@@ -608,7 +615,14 @@ def platform(cfg):
         '    eepromAddress: 0x%08X' % cfg['eeprom_addr'],
         '    eepromSize: %d' % EEPROM_SIZE,
         '',
-    ]
+    ] + ([
+        '// Bridges the bxCAN to the SITL multicast CAN bus, so',
+        '// dronecan_gui_tool on mcast:N sees the emulated ESC. The',
+        '// registers are a debug window; the socket stays closed until',
+        '// the launcher sets Bus.',
+        'canmcast: CAN.AM32_CanMcast @ sysbus 0x%08X' % (spec['guilink'] + 0x400),
+        '',
+    ] if cfg['dronecan'] else [])
     return '\n'.join(L)
 
 
@@ -627,9 +641,18 @@ def script(cfg, repl_path):
         # the eeprom address is per target, not per family: a 128k part
         # keeps its settings at 0x0801F800 where a 64k one uses 0x0800F800
         '$eeprom_addr=0x%08X' % cfg['eeprom_addr'],
+        # so is the app base: DroneCAN builds link above a 16K bootloader
+        '$app_base=0x%08X' % cfg['app_base'],
         'include $repo/Mcu/Renode/scripts/am32_%s.resc' % cfg['family'],
         '',
-    ])
+    ] + ([
+        # after the include, so the machine exists. The hub is wiring
+        # only; no host socket opens until something sets canmcast Bus.
+        'emulation CreateCANHub "canhub"',
+        'connector Connect sysbus.can1 canhub',
+        'connector Connect sysbus.canmcast canhub',
+        '',
+    ] if cfg['dronecan'] else []))
 
 
 def throttle_address(target, nm='arm-none-eabi-gcc'):
@@ -658,12 +681,13 @@ def generate(target, outdir, nm='arm-none-eabi-gcc'):
     return resc, repl
 
 
-def default_eeprom(path, model):
+def default_eeprom(path, model, extra=None):
     '''An eeprom is not optional: Renode zero-fills unbacked memory where
        erased flash reads 0xFF, so a missing one sends loadEEpromSettings()
        down the migration path. INPUT_SIGNAL_TYPE 0 is mandatory too - the
        default is DSHOT_IN, and with dshot set detectInput() never calls
-       checkServo(), so a servo signal is ignored with no diagnostic.'''
+       checkServo(), so a servo signal is ignored with no diagnostic.
+       extra: additional overrides, e.g. CAN_NODE for a DroneCAN target.'''
     sys.path.insert(0, os.path.join(REPO, 'Mcu', 'SITL'))
     try:
         import sitl_params
@@ -671,6 +695,7 @@ def default_eeprom(path, model):
         raise Unsupported('cannot build a default eeprom (Mcu/SITL not '
                           'importable); pass --eeprom')
     overrides = {'INPUT_SIGNAL_TYPE': 0}
+    overrides.update(extra or {})
     try:
         import json
         motor = json.load(open(model)).get('motor', {})
@@ -907,16 +932,19 @@ def renode_env():
     return env
 
 
-def launch_gui(port, state_port):
+def launch_gui(port, state_port, can_bus=-1):
     '''start Mcu/SITL/sitl_gui.py against the link ports. It needs PySide6,
        which the SITL keeps in its own venv, so prefer that interpreter -
        the GUI's own diagnostic for a missing PySide6 tells you to run it
-       from there anyway.'''
+       from there anyway. can_bus >= 0 enables the DroneCAN panel on the
+       matching mcast bus, for targets whose CAN is emulated.'''
     gui = os.path.join(REPO, 'Mcu', 'SITL', 'sitl_gui.py')
     venv = os.path.join(REPO, 'Mcu', 'SITL', 'venv', 'bin', 'python3')
     python = venv if os.path.exists(venv) else sys.executable
     cmd = [python, gui, '--port', str(port), '--state-port', str(state_port),
            '--backend', 'renode']
+    if can_bus >= 0:
+        cmd += ['--renode-can', '--can-uri', 'mcast:%d' % can_bus]
     try:
         return subprocess.Popen(cmd)
     except OSError as e:
@@ -993,6 +1021,15 @@ def main():
                          'this is the cheapest way to buy emulation speed when '
                          'the wire is not what is under test (default 250, '
                          '4kHz)')
+    ap.add_argument('--can-bus', type=int, default=0,
+                    help='mcast CAN bus number for a DroneCAN target: the '
+                         'emulated bxCAN appears on 239.65.82.<N>:57732, '
+                         'where dronecan_gui_tool mcast:<N> sees it '
+                         '(default 0; -1 leaves the bus disconnected)')
+    ap.add_argument('--can-node', type=int, default=11,
+                    help='DroneCAN node id written into the generated '
+                         'eeprom of a CAN target (0 = dynamic allocation, '
+                         'which needs an allocator on the bus)')
     ap.add_argument('--gdb-port', type=int, default=3333)
     ap.add_argument('--gdb-bin', default=None,
                     help='default: the toolchain under tools/')
@@ -1032,6 +1069,7 @@ def main():
 
     outdir = args.outdir or os.path.join(REPO, 'obj', 'renode')
     try:
+        cfg = config(args.target, args.nm)
         resc, repl = generate(args.target, outdir, args.nm)
     except Unsupported as e:
         print('SKIP: %s' % e)
@@ -1059,8 +1097,17 @@ def main():
     eeprom = args.eeprom
     if eeprom is None:
         eeprom = os.path.join(outdir, '%s_eeprom.bin' % args.target)
+        # A fixed node id, because an anonymous node does nothing until
+        # a DNA allocator answers, and a bare bench run has none. Input
+        # type 5 (dronecan only) as a real CAN ESC would be configured:
+        # it turns the capture interrupts off in DroneCAN_Startup(), and
+        # without that the throttle generator's self-started zero-servo
+        # signal fights set_input() over newinput and the flapping input
+        # keeps resetting the arming counter.
+        extra = ({'CAN_NODE': args.can_node, 'INPUT_SIGNAL_TYPE': 5}
+                 if cfg['dronecan'] else None)
         try:
-            default_eeprom(eeprom, args.model)
+            default_eeprom(eeprom, args.model, extra)
         except Unsupported as e:
             print('SKIP: %s' % e)
             return 77
@@ -1081,6 +1128,11 @@ def main():
     else:
         print('no %s, so the motor will not turn; build it with '
               '"make -C Mcu/Renode/sim"' % so)
+
+    # the emulated ESC on the SITL's multicast CAN bus, where
+    # dronecan_gui_tool mcast:N (and the GUI's DroneCAN panel) can see it
+    if cfg['dronecan'] and args.can_bus >= 0:
+        setup += '; canmcast Bus %d' % args.can_bus
 
     # status()/watch() at the monitor prompt, since there is no GUI
     status_py = os.path.join(outdir, '%s_status.py' % args.target)
@@ -1119,8 +1171,8 @@ def main():
     gui_proc = None
     if args.gui or args.link:
         setup += '; guilink DshotFrameUs %d' % args.gui_dshot_us
-        setup += '; guilink AppBase 0x%08X' % APP_BASE
-        setup += '; guilink LoopHz %d' % config(args.target, args.nm)['loop_hz']
+        setup += '; guilink AppBase 0x%08X' % cfg['app_base']
+        setup += '; guilink LoopHz %d' % cfg['loop_hz']
         # so a client can say what firmware is running and how far
         # through arming it is, neither of which is on the wire
         addrs = symbol_addresses(elf, ('filename', 'armed_timeout_count',
@@ -1138,7 +1190,8 @@ def main():
         if not args.gdb:
             setup += '; start'
     if args.gui:
-        gui_proc = launch_gui(args.gui_port, args.gui_state_port)
+        gui_proc = launch_gui(args.gui_port, args.gui_state_port,
+                              can_bus=args.can_bus if cfg['dronecan'] else -1)
 
     for c in args.commands:
         setup += '; %s' % c

@@ -27,6 +27,8 @@ include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
 # after the bridge and the generator, whose types it names
 include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+# the mcast CAN bridge the _CAN target overlays declare
+include $repo/Mcu/Renode/peripherals/common/AM32_CanMcast.cs
 
 mach create "am32"
 machine LoadPlatformDescription $platform
@@ -34,8 +36,10 @@ machine LoadPlatformDescription $platform
 sysbus LoadELF $elf
 
 # set by the generated per-target script: a 128k part keeps its settings
-# at 0x0801F800 where a 64k one uses 0x0800F800
+# at 0x0801F800 where a 64k one uses 0x0800F800, and a DroneCAN build
+# links at 0x08004000 above the 16K CAN bootloader
 $eeprom_addr?=0x0800F800
+$app_base?=0x08001000
 sysbus LoadBinary $eeprom $eeprom_addr
 
 # Factory temperature calibration. The L4 shares the G0's addresses and
@@ -47,15 +51,16 @@ sysbus WriteWord 0x1FFF75CA 1379
 
 # The L4 app never writes VTOR itself - initAfterJump() only enables
 # interrupts - so the CPU must be pointed at the app vector table here.
-cpu VectorTableOffset 0x08001000
+cpu VectorTableOffset $app_base
 
 # ... and again after every reset. The firmware reboots itself on signal
-# loss, and Renode restores the CPU's default vector table at 0 when it
-# resets; nothing is mapped there but the empty bootloader region, so
-# without this the CPU halts while the emulation looks healthy.
+# loss (and DroneCAN's RestartNode does the same on request), and Renode
+# restores the CPU's default vector table at 0 when it resets; nothing
+# is mapped there but the empty bootloader region, so without this the
+# CPU halts while the emulation looks healthy.
 macro reset
 """
-    cpu VectorTableOffset 0x08001000
+    cpu VectorTableOffset $app_base
 """
 
 
