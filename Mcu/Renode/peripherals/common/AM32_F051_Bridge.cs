@@ -111,19 +111,37 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // absolute path to libam32sim.so. Setting it loads the library
-        // RTLD_GLOBAL so the DllImports below resolve to it, which is
+        // RTLD_GLOBAL so mono's DllImports below resolve to it, which is
         // how the physics gets in without putting the build tree on the
-        // system library path.
+        // system library path. CoreCLR does not consult the global
+        // namespace for DllImport, so under the dotnet build the
+        // launcher must also put obj/ on LD_LIBRARY_PATH; renode_env()
+        // in gen_target.py does.
         public string LibraryPath
         {
             set
             {
-                if(dlopen(value, RtldNow | RtldGlobal) == IntPtr.Zero)
+                if(DlOpenGlobal(value) == IntPtr.Zero)
                 {
                     throw new RecoverableException(string.Format(
                         "could not load the motor library from '{0}'", value));
                 }
                 loaded = true;
+            }
+        }
+
+        // mono resolves the "dl" import name; CoreCLR does not, and on
+        // modern glibc dlopen lives in libc with libdl.so.2 kept only as
+        // a compatibility stub, so try both spellings
+        private static IntPtr DlOpenGlobal(string path)
+        {
+            try
+            {
+                return dlopen(path, RtldNow | RtldGlobal);
+            }
+            catch(DllNotFoundException)
+            {
+                return dlopen_libdl2(path, RtldNow | RtldGlobal);
             }
         }
 
@@ -487,6 +505,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         [DllImport("dl", EntryPoint = "dlopen")]
         private static extern IntPtr dlopen(string path, int flags);
+        [DllImport("libdl.so.2", EntryPoint = "dlopen")]
+        private static extern IntPtr dlopen_libdl2(string path, int flags);
 
         [DllImport("am32sim")]
         private static extern int am32sim_init(string configPath);
