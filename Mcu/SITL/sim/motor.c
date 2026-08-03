@@ -185,6 +185,11 @@ void motor_init(void)
     m.sensors.temperature_c = sitl_cfg.esc.temperature_c;
 }
 
+void motor_set_theta(double theta)
+{
+    m.theta = theta;
+}
+
 /*
   normalised trapezoidal BEMF shape over one electrical revolution.
   Rising zero crossing at 0, falling at pi, flat top from pi/6..5pi/6
