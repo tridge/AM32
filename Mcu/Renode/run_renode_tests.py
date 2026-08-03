@@ -102,6 +102,13 @@ LINK_DSHOT_VALUE = 632
 # be the recorded one, not merely "turning".
 LINK_TOLERANCE = 0.05
 
+# the DroneCAN throttle the --can test commands: 2400/8191 maps onto
+# AM32 input 633, one count from the 632 the dshot tests use, so the
+# recorded spin figures apply to both
+CAN_THROTTLE = 2400 / 8191.0
+# node id written into the test eeprom; 0 would need a DNA allocator
+CAN_NODE_ID = 11
+
 
 def report_link(res, target, motor):
     a = res.get('armed', {})
@@ -377,6 +384,117 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
             proc.kill()
 
 
+def run_can(renode, target_resc, elf, eeprom, model, so, scratch,
+            port, state_port, bus, seconds,
+            gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm'):
+    '''Drive the target over DroneCAN: the emulated bxCAN is bridged to
+       the mcast bus, and the GUI's own CanPanel arms and throttles it
+       there, exactly as dronecan_gui_tool or a flight controller would.
+       The guilink state stream is only read, for the physics rpm the
+       telemetry is checked against.
+
+       Paced by the ESC's own NodeStatus uptime, which is simulated
+       time, so emulation speed does not matter; `seconds` is only a
+       backstop.'''
+    from sitl_gui_backend import CanPanel, SimStream
+
+    proc = start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
+                        port, state_port, 250, gcc, nm, can_bus=bus)
+
+    tail = collections.deque(maxlen=40)
+    threading.Thread(target=drain, args=(proc, tail), daemon=True).start()
+
+    can = sim = None
+    try:
+        deadline = time.time() + seconds
+        can = CanPanel('mcast:%d' % bus)
+        can.started.wait(10.0)
+        if can.error is not None:
+            check('the DroneCAN node starts', False, can.error)
+            return {}
+        can.rate = 100          # wall clock; well inside the 250ms
+        can.armed = True        # simulated-time RawCommand failsafe
+        can.throttle = 0.0
+        can.enabled = True
+        sim = SimStream('127.0.0.1', state_port, period_us=1000)
+        sim.enabled = True
+
+        def wait_uptime(until):
+            '''ESC uptime is simulated seconds; None on the backstop'''
+            while time.time() < deadline:
+                if can.node_id is not None and can.uptime >= until:
+                    return can.uptime
+                time.sleep(0.2)
+            return None
+
+        # esc.Status is what identifies the node, so this is also the
+        # "the ESC is alive on the bus" gate
+        if wait_uptime(3) is None:
+            print('\n'.join(tail))
+            check('the ESC appears on the mcast bus', False,
+                  'no esc.Status within the backstop')
+            return {}
+        # arming needs about 1.5 simulated seconds at zero throttle
+        first = can.uptime
+        if wait_uptime(first + 4) is None:
+            check('reaches the arming window', False, 'uptime stalled')
+            return {}
+        armed = dict(can.status)
+        can.throttle = CAN_THROTTLE
+        if wait_uptime(first + 10) is None:
+            check('reaches the settled window', False, 'uptime stalled')
+            return {}
+        s = sim.latest()
+        spin = dict(can.status)
+        spin['sim_rpm'] = s[1] * 60.0 / (2 * 3.14159265358979)
+        spin['esc_frames'] = can.esc_rate.count
+        return {'armed': armed, 'spin': spin, 'node_id': can.node_id}
+    finally:
+        for c in (can, sim):
+            if c is not None:
+                c.running = False
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def report_can(res, target, node_id):
+    a = res.get('armed')
+    s = res.get('spin')
+    if a is None or s is None:
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+    check('the ESC appears on the mcast bus as node %d' % node_id,
+          res.get('node_id') == node_id,
+          'esc.Status from node %s' % res.get('node_id'))
+    check('does not spin unarmed', a.get('rpm', -1) == 0,
+          'rpm=%s at zero throttle' % a.get('rpm'))
+    check('the telemetry carries the bus voltage',
+          8.0 < a.get('voltage', 0) < 30.0, 'voltage=%.1f' % a.get('voltage', 0))
+    want = expected(target)
+    rpm = s.get('rpm', 0)
+    if want is not None:
+        check('RawCommand spins it at the recorded speed',
+              abs(rpm - want['rpm']) <= LINK_TOLERANCE * want['rpm'],
+              'rpm=%d, expected %d' % (rpm, want['rpm']))
+    else:
+        check('RawCommand spins it', 500 < rpm < 20000,
+              'rpm=%d, no recorded figure for this target' % rpm)
+    check('telemetry reaches the client', s.get('esc_frames', 0) > 100,
+          'esc.Status frames=%d' % s.get('esc_frames', 0))
+    sim_rpm = s.get('sim_rpm', 0)
+    check('the reported rpm is the rpm being simulated',
+          sim_rpm > 0 and abs(rpm - sim_rpm) <= LINK_TOLERANCE * sim_rpm,
+          'telemetry %d, physics %d' % (rpm, sim_rpm))
+    if failures:
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+    print('\nall tests passed')
+    return 0
+
+
 def run_gui(renode, target_resc, elf, eeprom, model, so, scratch,
             port, state_port, dshot_us, value, seconds, gui_python,
             gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm'):
@@ -524,18 +642,22 @@ def report_gui(res, target):
 
 def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
                  port, state_port, dshot_us, gcc='arm-none-eabi-gcc',
-                 nm='arm-none-eabi-nm'):
+                 nm='arm-none-eabi-nm', can_bus=None):
     # what a client needs to say which firmware is running and how far
     # through arming it is; absent symbols simply lose that readout
     addrs = gen_target.symbol_addresses(
         elf, ('filename', 'armed_timeout_count', 'armed'), nm)
-    info = ['guilink AppBase 0x%08X' % gen_target.APP_BASE]
+    app_base = gen_target.APP_BASE
     try:
-        info.append('guilink LoopHz %d'
-                    % gen_target.config(os.path.basename(target_resc)
-                                        .replace('.resc', ''), gcc)['loop_hz'])
+        cfg = gen_target.config(os.path.basename(target_resc)
+                                .replace('.resc', ''), gcc)
     except gen_target.Unsupported:
-        pass
+        cfg = None
+    if cfg is not None:
+        app_base = cfg['app_base']
+    info = ['guilink AppBase 0x%08X' % app_base]
+    if cfg is not None:
+        info.append('guilink LoopHz %d' % cfg['loop_hz'])
     for prop, sym in (('FirmwareNameAddress', 'filename'),
                       ('ArmedCountAddress', 'armed_timeout_count'),
                       ('ArmedAddress', 'armed')):
@@ -556,6 +678,9 @@ def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
             '\n'.join(info),
             'guilink InputPort %d' % port,
             'guilink StatePort %d' % state_port,
+        ] + ([
+            'canmcast Bus %d' % can_bus,
+        ] if can_bus is not None else []) + [
             'start',
             '']))
     # stdin stays open: the monitor treats EOF as "quit", and this run has
@@ -662,6 +787,16 @@ def main():
                          'port. Implies --link')
     ap.add_argument('--gui-python', default=None,
                     help='interpreter with PySide6; default the SITL venv')
+    # DroneCAN over the emulated bxCAN, bridged to the SITL mcast bus -
+    # only the L431 _CAN targets have the peripheral
+    ap.add_argument('--can', action='store_true',
+                    help='arm and throttle over DroneCAN through the mcast '
+                         'CAN bridge, as dronecan_gui_tool would; needs the '
+                         'python dronecan package')
+    ap.add_argument('--can-bus', type=int, default=7,
+                    help='mcast bus number for the --can test, off the '
+                         'default bus 0 so a live SITL or GUI on the same '
+                         'machine is not disturbed')
     ap.add_argument('--link-seconds', type=float, default=600,
                     help='wall clock backstop; the test itself is paced by '
                          'simulated time')
@@ -672,6 +807,11 @@ def main():
         args.bdshot = True
     if args.bdshot and not args.dshot:
         args.dshot = 600
+    if args.can:
+        try:
+            import dronecan  # noqa: F401
+        except ImportError:
+            skip('the python dronecan package is not installed')
 
     if args.elf is None:
         args.elf = gen_target.find_elf(args.target)
@@ -696,14 +836,24 @@ def main():
             target_resc, _ = gen_target.generate(args.target, scratch, args.gcc)
             throttle_addr = gen_target.throttle_address(args.target, args.gcc)
             timer_name = gen_target.capture_timer_name(args.target, args.gcc)
+            if args.can and not gen_target.config(args.target,
+                                                  args.gcc)['dronecan']:
+                skip('%s has no CAN peripheral' % args.target)
         except gen_target.Unsupported as e:
             skip(str(e))
 
         eeprom = os.path.join(scratch, 'eeprom.bin')
         # INPUT_SIGNAL_TYPE 0 is mandatory: the default is DSHOT_IN, and
         # with dshot set detectInput() never calls checkServo(), so a
-        # servo signal is ignored with no diagnostic
-        overrides = {'INPUT_SIGNAL_TYPE': 0}
+        # servo signal is ignored with no diagnostic. The CAN test wants
+        # type 5 (dronecan only) instead - without it the throttle
+        # generator's self-started zero-servo signal fights the CAN
+        # input over newinput and the ESC never arms - plus a fixed
+        # node id so no DNA allocator is needed.
+        if args.can:
+            overrides = {'INPUT_SIGNAL_TYPE': 5, 'CAN_NODE': CAN_NODE_ID}
+        else:
+            overrides = {'INPUT_SIGNAL_TYPE': 0}
         # MOTOR_KV and MOTOR_POLES have to agree with the motor being
         # simulated or the firmware is tuned for a different machine:
         # AM32 scales low rpm power protection from MOTOR_KV, and poles
@@ -726,6 +876,12 @@ def main():
                                           for k, v in sorted(overrides.items()))))
         with open(eeprom, 'wb') as f:
             f.write(bytes(image))
+
+        if args.can:
+            res = run_can(renode, target_resc, args.elf, eeprom, args.model,
+                          so, scratch, args.link_port, args.link_state_port,
+                          args.can_bus, args.link_seconds, args.gcc, args.nm)
+            return report_can(res, args.target, CAN_NODE_ID)
 
         if args.gui:
             # the SITL keeps PySide6 in a venv of its own, but a system
