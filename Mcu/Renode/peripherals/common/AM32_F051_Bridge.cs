@@ -62,10 +62,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 ulong gpioCBase = 0x48000800,
                                 uint timerHz = 48000000,
                                 bool invertedLow = false, bool invertedHigh = false,
-                                string topology = "highlow")
+                                string topology = "highlow", uint timerAf = 2,
+                                ulong syscfgBase = 0)
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
+            this.timerAf = timerAf;
+            this.syscfgBase = syscfgBase;
             gpioBase = new[] { gpioABase, gpioBBase, gpioCBase };
             this.invertedLow = invertedLow;
             // no AM32 target defines USE_INVERTED_HIGH today, so rather
@@ -251,16 +254,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 moder[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i]);
                 odr[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + OdrOffset);
+                afrl[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + AfrlOffset);
+                afrh[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + AfrhOffset);
             }
 
-            var moe = timer.MainOutputEnabled;
+            // CEN gates everything: a counter that never advances never
+            // matches a compare, whatever the pins say
+            var moe = timer.MainOutputEnabled && timer.CounterEnabled;
             var mode = new int[3];
             var ccr = new uint[3];
             for(var p = 0; p < 3; p++)
             {
                 var ph = phases[p];
-                mode[p] = PhaseMode(moe, moder[ph.HighPort], odr[ph.HighPort], ph.HighPin,
-                                    moder[ph.LowPort], odr[ph.LowPort], ph.LowPin);
+                // a pin only carries the timer output when it is in
+                // alternate mode AND selects the timer's AF AND the
+                // channel is connected to it
+                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin)
+                    && timer.ChannelEnabled(ph.CcrChannel)
+                    && RemapOk(ph.RemapBit);
+                var loTimer = TimerDrives(ph.LowPort, ph.LowPin)
+                    && timer.ComplementaryEnabled(ph.CcrChannel);
+                mode[p] = PhaseMode(moe, hiTimer, odr[ph.HighPort], ph.HighPin,
+                                    loTimer, odr[ph.LowPort], ph.LowPin);
                 // the shadow, not the register: see ActiveCcr
                 ccr[p] = timer.ActiveCcr(ph.CcrChannel);
             }
@@ -298,6 +313,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // out on those pads, so a target naming PA11 or PA12
                 // means channel 2 or 3.
                 var channelPin = HighPin == 11 ? 9 : (HighPin == 12 ? 10 : HighPin);
+                // that alias only holds while the remap is on, so
+                // remember which SYSCFG bit has to be set for it
+                RemapBit = HighPin == 11 ? Pa11Rmp
+                    : (HighPin == 12 ? Pa12Rmp : 0u);
                 if(HighPort != 0 || channelPin < 8 || channelPin > 10)
                 {
                     throw new RecoverableException(string.Format(
@@ -328,19 +347,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public readonly int LowPin;
             // 0, 1 or 2 for TIM1_CH1..CH3
             public readonly int CcrChannel;
+            public readonly uint RemapBit;
         }
 
         // SITL_PHASE_*: 0 float, 1 low, 2 pwm, 3 pwm without
         // complementary, 4 proportional brake
-        private int PhaseMode(bool moe, uint moderHi, uint odrHi, int pinHi,
-                              uint moderLo, uint odrLo, int pinLo)
+        private int PhaseMode(bool moe, bool hiTimer, uint odrHi, int pinHi,
+                              bool loTimer, uint odrLo, int pinLo)
         {
             if(!moe)
             {
                 return 0;
             }
-            var hi = (moderHi >> (2 * pinHi)) & 3;
-            var lo = (moderLo >> (2 * pinLo)) & 3;
 
             if(enableBridge)
             {
@@ -352,14 +370,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     return 0;
                 }
-                return hi == ModeAlternate ? 2 : 1;
+                return hiTimer ? 2 : 1;
             }
 
-            if(hi == ModeAlternate)
+            if(hiTimer)
             {
-                return lo == ModeAlternate ? 2 : 3;
+                return loTimer ? 2 : 3;
             }
-            if(lo == ModeAlternate)
+            if(loTimer)
             {
                 // high side held off, low side switching: proportionalBrake()
                 return 4;
@@ -381,8 +399,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return 1;
         }
 
+        // A pin carries the timer output only in alternate mode and with
+        // the AF that selects this timer. MODER alone is not enough: an
+        // alternate pin pointing at the wrong AF drives nothing useful,
+        // and that is a live porting bug on a new target.
+        private bool TimerDrives(int port, int pin)
+        {
+            if(((moder[port] >> (2 * pin)) & 3) != ModeAlternate)
+            {
+                return false;
+            }
+            var afr = pin < 8 ? afrl[port] : afrh[port];
+            return ((afr >> (4 * (pin & 7))) & 0xF) == timerAf;
+        }
+
+        // PA11/PA12 carry TIM1_CH2 and CH3 only while the G0's SYSCFG
+        // remap is set. Without it those pins are not channels 2 and 3
+        // at all, so a target that forgot the remap must not drive.
+        private bool RemapOk(uint bit)
+        {
+            if(bit == 0 || syscfgBase == 0)
+            {
+                return true;
+            }
+            return (machine.SystemBus.ReadDoubleWord(syscfgBase) & bit) != 0;
+        }
+
+        private const uint Pa11Rmp = 1u << 3;
+        private const uint Pa12Rmp = 1u << 4;
         private const uint ModeAlternate = 2;
         private const ulong OdrOffset = 0x14;
+        private const ulong AfrlOffset = 0x20;
+        private const ulong AfrhOffset = 0x24;
         private const ulong Tim1Base = 0x40012C00;
 
         private const int RtldNow = 2;
@@ -416,7 +464,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly ulong[] gpioBase;
         private readonly uint[] moder = new uint[3];
         private readonly uint[] odr = new uint[3];
+        private readonly uint[] afrl = new uint[3];
+        private readonly uint[] afrh = new uint[3];
         private readonly bool invertedLow;
+        // AF number that routes TIM1 to a pin; 2 on both F0 and G0
+        private readonly uint timerAf;
+        // SYSCFG_CFGR1, 0 on families without the remap
+        private readonly ulong syscfgBase;
         private readonly bool enableBridge;
         private readonly uint batchUs;
         private readonly uint tickPs;

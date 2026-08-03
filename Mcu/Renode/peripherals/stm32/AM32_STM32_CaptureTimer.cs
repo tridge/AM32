@@ -38,8 +38,18 @@ namespace Antmicro.Renode.Peripherals.Timers
     public class AM32_STM32_CaptureTimer : IDoubleWordPeripheral, IKnownSize,
                                            INumberedGPIOOutput, IGPIOReceiver
     {
-        public AM32_STM32_CaptureTimer(IMachine machine, ulong frequency = 48000000)
+        // inputBase/inputPin/inputAf describe the pin the throttle
+        // arrives on. Without them a capture happens whatever the pin is
+        // configured as, so firmware that never put it in alternate mode
+        // or picked the wrong AF still decodes perfectly.
+        public AM32_STM32_CaptureTimer(IMachine machine, ulong frequency = 48000000,
+                                       ulong inputBase = 0, int inputPin = 0,
+                                       uint inputAf = 0)
         {
+            this.machine = machine;
+            this.inputBase = inputBase;
+            this.inputPin = inputPin;
+            this.inputAf = inputAf;
             this.frequency = frequency;
             var conns = new Dictionary<int, IGPIO>();
             conns[DmaRequestLine] = new GPIO();
@@ -186,7 +196,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             // in output mode the channel drives the wire, it does not
             // listen to it; capturing our own reply would corrupt
             // dma_buffer
-            if(!Counting || OutputMode)
+            if(!Counting || OutputMode || !CaptureEnabled || !PinRouted)
             {
                 return;
             }
@@ -379,6 +389,36 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private bool OutputEnabled => (regs[CCER / 4] & CC1E) != 0;
 
+        // CC1E gates the capture as well as the output: with the channel
+        // disabled the pin is not connected to CCR1 at all
+        private bool CaptureEnabled => (regs[CCER / 4] & CC1E) != 0;
+
+        // the pin only reaches the timer in alternate mode with the AF
+        // that selects this timer's channel 1. inputBase 0 means the
+        // platform did not say, so do not gate on it.
+        private bool PinRouted
+        {
+            get
+            {
+                if(inputBase == 0)
+                {
+                    return true;
+                }
+                var moder = machine.SystemBus.ReadDoubleWord(inputBase);
+                if(((moder >> (2 * inputPin)) & 3) != ModeAlternate)
+                {
+                    return false;
+                }
+                var afr = machine.SystemBus.ReadDoubleWord(
+                    inputBase + (ulong)(inputPin < 8 ? AfrlOffset : AfrhOffset));
+                return ((afr >> (4 * (inputPin & 7))) & 0xF) == inputAf;
+            }
+        }
+
+        private const uint ModeAlternate = 2;
+        private const long AfrlOffset = 0x20;
+        private const long AfrhOffset = 0x24;
+
         private void UpdateIrq()
         {
             var pending = (regs[SR / 4] & regs[DIER / 4] & CC1IE) != 0;
@@ -416,6 +456,10 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const int OutputLine = 2;
 
         private readonly ulong frequency;
+        private readonly IMachine machine;
+        private readonly ulong inputBase;
+        private readonly int inputPin;
+        private readonly uint inputAf;
         private readonly LimitTimer counter;
         private readonly uint[] regs = new uint[0x100];
         private bool lastPinState;
