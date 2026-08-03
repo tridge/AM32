@@ -14,13 +14,16 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Three MCU families are supported, F051, G071 and L431**, covering all
-52 F051, 54 G071 and 18 L431 targets with no per-target file to write -
-the platform is generated from `Inc/targets.h` on demand. What differs
-between the families is a table in `gen_target.py`, not a second code
-path. The `_CAN` L431 targets run their DroneCAN firmware on an
-emulated bxCAN (see below); they are recognised by the value the
-preprocessor gives `DRONECAN_SUPPORT`, not by their names.
+**Four MCU families are supported: F051, G071, L431 and G431**,
+covering the 52 F051, 54 G071, 18 L431 and 6 G431 targets with no
+per-target file to write - the platform is generated from
+`Inc/targets.h` on demand. What differs between the families is a
+table in `gen_target.py`, not a second code path. The `_CAN` targets
+run their DroneCAN firmware on an emulated CAN peripheral - the
+L431's bxCAN, the G431's FDCAN (see below); they are recognised by the
+value the preprocessor gives `DRONECAN_SUPPORT`, not by their names.
+The SEQURE_G431 pair currently fails its spin assertions to a known
+low-speed startup fidelity gap described below.
 
 Targets are classified by asking the preprocessor which MCU each one
 resolves to, not by their names - a cheap substring prefilter narrows
@@ -134,6 +137,62 @@ And the bridge deliberately keeps its sockets across a firmware reset:
 `RestartNode` and the signal-loss reboot both go through
 `NVIC_SystemReset()`, and the node has to come back on the same bus as
 it would on real wire.
+
+### The G431
+
+The fourth family, 160MHz off HSI or HSE (the SEQURE pair), base
+written from RM0440 and the SVD like the L431's. Much of it is a
+recombination: the G0's comparator layout (four-bit INMSEL at [7:4])
+on the F051's EXTI lines 21/22, the L4's ADCv3 SQR sequencer with ADC1
+back at 0x50000000, DMAMUX stubbed exactly as on the G0. What was
+genuinely new:
+
+- **every G431 group splits the phases across COMP1 and COMP2** with
+  `PHASE_x_COMP_NUMBER` but without `N_VARIANT`, so the generator now
+  keys the split on the macro that actually says so.
+- **the SEQURE converts on both ADC instances** (`USE_ADC_1_2`):
+  temperature and the NTC on ADC1, voltage and current on ADC2 with
+  its own DMA channel - two model instances with `<base, +0x100>`
+  registrations so ADC1 stops short of ADC2, and a register-file stub
+  for the common page.
+- **phase pins reach GPIOF** (PF0 low sides on two groups) and the
+  SEQURE's TIM1_CH3N sits on PB15 at **AF4** where every other low
+  side is AF6 - the bridge gained a fourth port and a second accepted
+  AF (`timerAfAlt`).
+- **DMA1_Channel2's NVIC line is deliberately not wired** even though
+  the ADC transfers on that channel: the firmware enables the IRQ but
+  ships no handler, so a delivered interrupt would land in
+  Default_Handler's infinite loop. The ADC callback is polled from the
+  1kHz loop.
+- **the FDCAN is a new model** (`AM32_STM32_FDCAN`): the CCCR
+  INIT/CCE/CSR handshake, the G4's fixed message RAM layout reached
+  through the system bus, RX FIFO0 with real fill/get/put counters,
+  and the grouped ILS interrupt-line select. Host-side senders burst
+  in wall time while the emulation runs slower, so frames the 3-deep
+  FIFO cannot hold yet wait in a queue that stands in for the 1Mbit/s
+  wire's own serialization - without it a fast sender loses 97% of its
+  commands. Classic 8-byte frames only; FD frames are rejected at the
+  mcast bridge.
+
+`PerformanceInMips` is 64, for the same dshot-alignment reason as the
+L431's 48.
+
+**Known gap: the SEQURE_G431 startup.** SEQURE defines
+`NO_POLLING_START`, handing commutation to comparator edges after two
+zero crossings, and in the emulation the motor locks into a stable
+low-speed rocking resonance: each mechanical oscillation produces
+exactly one clean comparator edge at the true crossing, so commutation
+perfectly follows the rock instead of leading it, and the rpm
+oscillates around zero at any throttle. The other four G431 targets
+start in polled mode and pass everything. Circuit analysis (and a
+negative sub-microsecond edge-delivery experiment) puts the missing
+physics in the comparator front end: the model applies no divider gain
+- so the low-speed BEMF towers over the modelled noise band where the
+real board's divider brings them within reach - and its identical
+phase/neutral gains cancel PWM common-mode exactly, where real
+resistor mismatch feeds it through as differential transients. Both
+need values measured from the real board; until then the SEQURE pair
+has no recorded spin figures.
 
 The L431 also exposed a harness bug the other families could not hit:
 the firmware ELF was picked by globbing `AM32_<target>_*.elf`, and for
@@ -540,14 +599,15 @@ from a scratch directory, as the SITL suite does.
 
 ## What is here
 
-    gen_target.py                   builds a platform for any F051, G071 or
-                                    non-CAN L431 target out of Inc/targets.h
+    gen_target.py                   builds a platform for any F051, G071,
+                                    L431 or G431 target out of Inc/targets.h
     platforms/stm32f051_base.repl   MCU-common. Vendored from Renode's
     platforms/stm32g071_base.repl   platforms/cpus/stm32f0.repl and
                                     stm32g0.repl (Antmicro, MIT - header
                                     retained) and edited
-    platforms/stm32l431_base.repl   MCU-common, written from RM0394 and the
-                                    SVD - Renode ships no stm32l4 platform
+    platforms/stm32l431_base.repl   MCU-common, written from RM0394/RM0440
+    platforms/stm32g431_base.repl   and the SVDs - Renode ships no stm32l4
+                                    or stm32g4 platform
     peripherals/stm32/              our peripheral models, GPL-3, loaded at
                                     runtime with `include @...cs`; no Renode
                                     rebuild needed
@@ -560,6 +620,7 @@ from a scratch directory, as the SITL suite does.
     scripts/am32_f051.resc          one per family, shared by every generated
     scripts/am32_g071.resc          target script of that family
     scripts/am32_l431.resc
+    scripts/am32_g431.resc
 
 ### Adding a target
 
@@ -587,7 +648,7 @@ loudly when wrong**:
 - the **bridge pin map**. Most targets put phase A on PA10/PB1, but a
   third of them rotate the phases across the same six pins.
 - the **capture timer and DMA channel**: TIM15 or TIM3 on the F051,
-  TIM3 or TIM16 on the G071, always TIM15 on the L431.
+  TIM3 or TIM16 on the G071, always TIM15 on the L431 and G431.
 - the **bridge topology**. Most targets drive a high and a low side per
   phase, but `USE_INVERTED_LOW` ones turn the low FET on by writing BRR,
   and `PWM_ENABLE_BRIDGE` ones have a gate driver with one PWM and one

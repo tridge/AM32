@@ -55,6 +55,10 @@
   "rpm": 2710,
   "zero_crosses": 2622
  },
+ "AS_G431": {
+  "rpm": 3090,
+  "zero_crosses": 3034
+ },
  "BLPWR_F051": {
   "rpm": 3110,
   "zero_crosses": 3033
@@ -271,6 +275,10 @@
   "rpm": 2856,
   "zero_crosses": 2787
  },
+ "PROTONDRIVE_G431": {
+  "rpm": 3090,
+  "zero_crosses": 3032
+ },
  "PWM_ENABLE_G071": {
   "rpm": 2990,
   "zero_crosses": 2884
@@ -278,6 +286,10 @@
  "RAZOR32_F051": {
   "rpm": 2985,
   "zero_crosses": 2904
+ },
+ "REF_G431": {
+  "rpm": 3090,
+  "zero_crosses": 3034
  },
  "REF_L431": {
   "rpm": 2983,
@@ -298,6 +310,10 @@
  "RRIOT_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
+ },
+ "SCAR_G431": {
+  "rpm": 3090,
+  "zero_crosses": 3034
  },
  "SDMODEL_F051": {
   "rpm": 2985,
