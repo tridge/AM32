@@ -8,6 +8,10 @@
 
 void motor_init(void);
 
+// mechanical rotor angle in radians, for starting from a chosen rest
+// position instead of motor_init()'s zero
+void motor_set_theta(double theta);
+
 // advance the electrical/mechanical model by dt_ns. Called from the sim
 // thread only
 void motor_step(uint64_t now_ns, uint32_t dt_ns);
