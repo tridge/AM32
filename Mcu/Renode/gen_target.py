@@ -15,6 +15,7 @@ usage:
     gen_target.py TARGET [--outdir DIR]      write the pair, print both paths
     gen_target.py TARGET --run               generate, then launch renode
     gen_target.py TARGET --run --exec CMD    ... and script it
+    gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py --list                     targets this can emulate
 
 F051 and G071 targets work; those are the two AM32 MCU families with a
@@ -39,6 +40,9 @@ WANTED = [
     'MCU_F051', 'MCU_G071',
     'IC_TIMER_REGISTER', 'INPUT_DMA_CHANNEL', 'INPUT_PIN', 'INPUT_PIN_PORT',
     'DEAD_TIME', 'FILE_NAME', 'EEPROM_START_ADD',
+    # tenKhzRoutine()'s rate: armed_timeout_count counts to it, so it is
+    # what turns that counter into "seconds held at zero throttle"
+    'LOOP_FREQUENCY_HZ',
     'PHASE_A_COMP', 'PHASE_B_COMP', 'PHASE_C_COMP',
     # N_VARIANT targets put the three phases across both G0 comparators
     'N_VARIANT', 'MAIN_COMP',
@@ -118,6 +122,7 @@ FAMILY = {
         'gpio_a': 0x48000000,
         'throttle': 0x50000000,
         'bridge': 0x50000400,
+        'guilink': 0x50000800,
         'dma_irq': 11,
         'adc_dma': 0,
         'adc_irq': 'nvicInput12@2',
@@ -139,6 +144,7 @@ FAMILY = {
         'syscfg': 0x40010000,
         'throttle': 0x60000000,
         'bridge': 0x60000400,
+        'guilink': 0x60000800,
         'dma_irq': 9,
         'adc_dma': 1,
         'adc_irq': 'nvicInput12@2',
@@ -146,6 +152,16 @@ FAMILY = {
         'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 130, 3000),
     },
 }
+
+
+# EEprom_t.buffer in Inc/eeprom.h - the settings block the firmware
+# reads at boot, and what the GUI parameter editor fetches and writes
+EEPROM_SIZE = 192
+
+# where the application is linked, above the 4K bootloader region. Also
+# what the .resc points the reset vector at, since no bootloader is
+# loaded. A PC below this is executing in the bootloader region.
+APP_BASE = 0x08001000
 
 
 class Unsupported(Exception):
@@ -312,6 +328,7 @@ def config(target, nm='arm-none-eabi-gcc'):
             family, timer, m['INPUT_PIN_PORT'][4:],
             int(m['INPUT_PIN'][len('LL_GPIO_PIN_'):])),
         'dead_time': m.get('DEAD_TIME', '?'),
+        'loop_hz': number('LOOP_FREQUENCY_HZ', 20000),
         'eeprom_addr': eeprom_addr,
         'comps': comps,
         'comp_of': comp_of,
@@ -482,6 +499,14 @@ def platform(cfg):
         % spec['throttle'],
         '    0 -> %s@0 | gpioPort%s@%s' % (cap, tp[1], tp[2:]),
         '',
+        '// Serves the SITL wire protocols to sitl_gui.py. The ports are',
+        '// left closed here and opened from the .resc, so a run that is',
+        '// not driving a GUI cannot collide with a real SITL on the same',
+        '// machine.',
+        'guilink: Miscellaneous.AM32_GuiLink @ sysbus 0x%08X' % spec['guilink'],
+        '    eepromAddress: 0x%08X' % cfg['eeprom_addr'],
+        '    eepromSize: %d' % EEPROM_SIZE,
+        '',
     ]
     return '\n'.join(L)
 
@@ -647,6 +672,22 @@ def save(path):
 '''
 
 
+def symbol_addresses(elf, names, nm='arm-none-eabi-nm'):
+    '''address of each named symbol, for the ones the ELF has. Absent
+       symbols are simply left out: a target built without one should
+       lose that readout, not fail to start.'''
+    try:
+        out = subprocess.check_output([nm, elf]).decode()
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    found = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 3 and f[2] in names:
+            found[f[2]] = int(f[0], 16)
+    return found
+
+
 def write_status(path, elf, nm='arm-none-eabi-nm'):
     '''per-target monitor helpers, with the symbol table baked in'''
     try:
@@ -715,6 +756,23 @@ def write_gdb_launcher(path, gdb, elf, port):
     os.chmod(path, 0o755)
 
 
+def launch_gui(port, state_port):
+    '''start Mcu/SITL/sitl_gui.py against the link ports. It needs PySide6,
+       which the SITL keeps in its own venv, so prefer that interpreter -
+       the GUI's own diagnostic for a missing PySide6 tells you to run it
+       from there anyway.'''
+    gui = os.path.join(REPO, 'Mcu', 'SITL', 'sitl_gui.py')
+    venv = os.path.join(REPO, 'Mcu', 'SITL', 'venv', 'bin', 'python3')
+    python = venv if os.path.exists(venv) else sys.executable
+    cmd = [python, gui, '--port', str(port), '--state-port', str(state_port),
+           '--backend', 'renode']
+    try:
+        return subprocess.Popen(cmd)
+    except OSError as e:
+        print('could not start the GUI (%s): %s' % (' '.join(cmd), e))
+        return None
+
+
 def find_terminal():
     '''an xterm to put gdb in, or None to run it inline'''
     for t in ('xterm', 'x-terminal-emulator', 'gnome-terminal', 'konsole'):
@@ -764,6 +822,22 @@ def main():
     ap.add_argument('--gdb', action='store_true',
                     help='also start a gdb server and attach gdb in a '
                          'terminal window (implies --run)')
+    ap.add_argument('--gui', action='store_true',
+                    help='serve the SITL wire protocols and open sitl_gui.py '
+                         'on them (implies --run)')
+    ap.add_argument('--link', action='store_true',
+                    help='serve the SITL wire protocols without opening a GUI, '
+                         'for driving the emulated ESC from a script')
+    ap.add_argument('--gui-port', type=int, default=57733,
+                    help='udp port carrying throttle in and telemetry out')
+    ap.add_argument('--gui-state-port', type=int, default=57734,
+                    help='udp port carrying physics samples, eeprom and model')
+    ap.add_argument('--gui-dshot-us', type=int, default=250,
+                    help='dshot frame period on the emulated wire, in virtual '
+                         'microseconds. Every edge is a timer event, so raising '
+                         'this is the cheapest way to buy emulation speed when '
+                         'the wire is not what is under test (default 250, '
+                         '4kHz)')
     ap.add_argument('--gdb-port', type=int, default=3333)
     ap.add_argument('--gdb-bin', default=None,
                     help='default: the toolchain under tools/')
@@ -805,7 +879,7 @@ def main():
     print(repl)
     print(resc)
 
-    if not (args.run or args.gdb):
+    if not (args.run or args.gdb or args.gui or args.link):
         return 0
 
     elf = args.elf
@@ -884,6 +958,30 @@ def main():
             print('gdb attaching in %s; -O3 build, so expect inlined frames '
                   'and optimised-out locals' % os.path.basename(term))
 
+    gui_proc = None
+    if args.gui or args.link:
+        setup += '; guilink DshotFrameUs %d' % args.gui_dshot_us
+        setup += '; guilink AppBase 0x%08X' % APP_BASE
+        setup += '; guilink LoopHz %d' % config(args.target, args.nm)['loop_hz']
+        # so a client can say what firmware is running and how far
+        # through arming it is, neither of which is on the wire
+        addrs = symbol_addresses(elf, ('filename', 'armed_timeout_count',
+                                       'armed'), args.nm_bin)
+        for prop, sym in (('FirmwareNameAddress', 'filename'),
+                          ('ArmedCountAddress', 'armed_timeout_count'),
+                          ('ArmedAddress', 'armed')):
+            if sym in addrs:
+                setup += '; guilink %s 0x%08X' % (prop, addrs[sym])
+        setup += '; guilink InputPort %d; guilink StatePort %d' % (
+            args.gui_port, args.gui_state_port)
+        # Under gdb the machine is deliberately halted at reset so the
+        # debugger gets control first; otherwise there is nothing to wait
+        # for and a GUI attached to a stopped machine looks broken.
+        if not args.gdb:
+            setup += '; start'
+    if args.gui:
+        gui_proc = launch_gui(args.gui_port, args.gui_state_port)
+
     for c in args.commands:
         setup += '; %s' % c
     cmd = [os.path.join(REPO, 'tools', 'linux', 'renode_1.16.1_portable',
@@ -891,8 +989,9 @@ def main():
     try:
         return subprocess.call(cmd)
     finally:
-        if gdb_proc is not None and gdb_proc.poll() is None:
-            gdb_proc.terminate()
+        for p in (gdb_proc, gui_proc):
+            if p is not None and p.poll() is None:
+                p.terminate()
 
 
 if __name__ == '__main__':
