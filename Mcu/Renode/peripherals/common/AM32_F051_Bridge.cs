@@ -236,6 +236,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             started = false;
             timer = null;
             comp = null;
+            syscfg = null;
+            Array.Clear(gpio, 0, gpio.Length);
             Array.Clear(lastMode, 0, lastMode.Length);
             LastSensedPhase = 2;
             LastCompOut = false;
@@ -263,21 +265,53 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     batch.Enabled = false;
                     return;
                 }
+                // The registers this tick polls are read on the
+                // peripheral objects, not through the bus: a SystemBus
+                // read pays a range lookup, locking and an allocation on
+                // every access, and at 100k ticks a simulated second the
+                // twelve GPIO reads alone were over half of all bus
+                // traffic in the emulation.
+                for(var i = 0; i < 3; i++)
+                {
+                    gpio[i] = machine.SystemBus.WhatPeripheralIsAt(gpioBase[i])
+                        as IDoubleWordPeripheral;
+                    if(gpio[i] == null)
+                    {
+                        this.Log(LogLevel.Error,
+                                 "no GPIO port at 0x{0:X}; bridge disabled",
+                                 gpioBase[i]);
+                        batch.Enabled = false;
+                        return;
+                    }
+                }
+                if(syscfgBase != 0)
+                {
+                    syscfg = machine.SystemBus.WhatPeripheralIsAt(syscfgBase)
+                        as IDoubleWordPeripheral;
+                    if(syscfg == null)
+                    {
+                        this.Log(LogLevel.Error,
+                                 "no SYSCFG at 0x{0:X}; bridge disabled",
+                                 syscfgBase);
+                        batch.Enabled = false;
+                        return;
+                    }
+                }
             }
 
             for(var i = 0; i < 3; i++)
             {
-                moder[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i]);
-                odr[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + OdrOffset);
-                afrl[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + AfrlOffset);
-                afrh[i] = machine.SystemBus.ReadDoubleWord(gpioBase[i] + AfrhOffset);
+                moder[i] = gpio[i].ReadDoubleWord(0);
+                odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
+                afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
+                afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
             }
 
             // CEN gates everything: a counter that never advances never
             // matches a compare, whatever the pins say
             var moe = timer.MainOutputEnabled && timer.CounterEnabled;
-            var mode = new int[3];
-            var ccr = new uint[3];
+            var mode = tickMode;
+            var ccr = tickCcr;
             for(var p = 0; p < 3; p++)
             {
                 var ph = phases[p];
@@ -298,10 +332,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             mode.CopyTo(lastMode, 0);
 
             var arr = timer.ActiveArr;
-            // PSC is preloaded too, but AM32 writes it once at init and
-            // never again, so the register and the shadow agree
-            var psc = machine.SystemBus.ReadDoubleWord(Tim1Base + 0x28);
-            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2], (psc + 1) * tickPs,
+            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2],
+                             (timer.Prescaler + 1) * tickPs,
                              timer.DeadTimeNs);
 
             var sensed = comp.SensedPhase;
@@ -436,20 +468,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // at all, so a target that forgot the remap must not drive.
         private bool RemapOk(uint bit)
         {
-            if(bit == 0 || syscfgBase == 0)
+            if(bit == 0 || syscfg == null)
             {
                 return true;
             }
-            return (machine.SystemBus.ReadDoubleWord(syscfgBase) & bit) != 0;
+            return (syscfg.ReadDoubleWord(0) & bit) != 0;
         }
 
         private const uint Pa11Rmp = 1u << 3;
         private const uint Pa12Rmp = 1u << 4;
         private const uint ModeAlternate = 2;
-        private const ulong OdrOffset = 0x14;
-        private const ulong AfrlOffset = 0x20;
-        private const ulong AfrhOffset = 0x24;
-        private const ulong Tim1Base = 0x40012C00;
+        private const long OdrOffset = 0x14;
+        private const long AfrlOffset = 0x20;
+        private const long AfrhOffset = 0x24;
 
         private const int RtldNow = 2;
         private const int RtldGlobal = 0x100;
@@ -494,6 +525,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint batchUs;
         private readonly uint tickPs;
         private readonly LimitTimer batch;
+        // scratch for Tick, hoisted: two fresh arrays per tick is 200k
+        // allocations a simulated second
+        private readonly int[] tickMode = new int[3];
+        private readonly uint[] tickCcr = new uint[3];
+        private readonly IDoubleWordPeripheral[] gpio = new IDoubleWordPeripheral[3];
+        private IDoubleWordPeripheral syscfg;
         private AM32_STM32_AdvancedTimer timer;
         private IAM32Comparator comp;
         private string configPath;
