@@ -63,13 +63,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 uint timerHz = 48000000,
                                 bool invertedLow = false, bool invertedHigh = false,
                                 string topology = "highlow", uint timerAf = 2,
+                                uint timerAfAlt = 0, ulong gpioFBase = 0,
                                 ulong syscfgBase = 0)
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
             this.timerAf = timerAf;
+            this.timerAfAlt = timerAfAlt;
             this.syscfgBase = syscfgBase;
-            gpioBase = new[] { gpioABase, gpioBBase, gpioCBase };
+            // index 3 is GPIOF, for the G431 groups whose phase A low
+            // side is PF0; base 0 means the platform declares no port F
+            gpioBase = new[] { gpioABase, gpioBBase, gpioCBase, gpioFBase };
             this.invertedLow = invertedLow;
             // no AM32 target defines USE_INVERTED_HIGH today, so rather
             // than model it untested, refuse loudly if one appears
@@ -98,6 +102,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 new Phase(phaseBHigh, phaseBLow),
                 new Phase(phaseCHigh, phaseCLow),
             };
+            foreach(var ph in phases)
+            {
+                if((ph.HighPort == PortF || ph.LowPort == PortF)
+                   && gpioFBase == 0)
+                {
+                    throw new RecoverableException(
+                        "a phase pin is on port F but gpioFBase is not set");
+                }
+            }
 
             // matches sitl_comp_phase's initial value in the shim
             LastSensedPhase = 2;
@@ -157,8 +170,30 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 configPath = value ?? "";
                 am32sim_init(configPath);
+                am32sim_set_theta(initialTheta);
                 started = true;
                 batch.Enabled = true;
+            }
+        }
+
+        // Mechanical rotor angle to start from, radians. A real rotor
+        // rests at an arbitrary detent; motor_init()'s zero sits exactly
+        // on the startup ramp's unstable anti-alignment, which a target
+        // that trusts its comparator from the second zero crossing
+        // cannot rock free of in a noiseless simulation.
+        // physics comparator transitions delivered, for diagnostics
+        public uint TotalToggles { get; private set; }
+
+        public double RotorAngle
+        {
+            get { return Theta; }
+            set
+            {
+                initialTheta = value;
+                if(started)
+                {
+                    am32sim_set_theta(value);
+                }
             }
         }
 
@@ -262,6 +297,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(loaded && configPath != null)
             {
                 am32sim_init(configPath);
+                am32sim_set_theta(initialTheta);
                 started = true;
                 batch.Enabled = true;
             }
@@ -289,8 +325,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // every access, and at 100k ticks a simulated second the
                 // twelve GPIO reads alone were over half of all bus
                 // traffic in the emulation.
-                for(var i = 0; i < 3; i++)
+                for(var i = 0; i < gpioBase.Length; i++)
                 {
+                    if(gpioBase[i] == 0)
+                    {
+                        continue;
+                    }
                     gpio[i] = machine.SystemBus.WhatPeripheralIsAt(gpioBase[i])
                         as IDoubleWordPeripheral;
                     if(gpio[i] == null)
@@ -317,8 +357,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            for(var i = 0; i < 3; i++)
+            for(var i = 0; i < gpio.Length; i++)
             {
+                if(gpio[i] == null)
+                {
+                    continue;
+                }
                 moder[i] = gpio[i].ReadDoubleWord(0);
                 odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
                 afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
@@ -365,7 +409,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // a bridge that is off cannot change a motor that is not
             // turning; the shim skips those steps, which is most of boot
             var driven = (mode[0] != 0 || mode[1] != 0 || mode[2] != 0) ? 1 : 0;
+            var before = LastCompOut;
             LastCompOut = am32sim_advance(nowNs, driven) != 0;
+            // Replay every comparator transition the physics produced
+            // inside this batch, not just the final level. Near a zero
+            // crossing the modelled front-end noise chatters, and losing
+            // that chatter to batch sampling strands the targets whose
+            // startup only escapes low speed because a fresh edge always
+            // follows the blanking window.
+            var toggles = am32sim_get_comp_toggles();
+            TotalToggles += toggles;
+            for(var t = 1; t < toggles; t++)
+            {
+                comp.CompOutput = before ^ ((t & 1) != 0);
+            }
             comp.CompOutput = LastCompOut;
         }
 
@@ -397,14 +454,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private static void Decode(string pin, out int port, out int number)
             {
                 var n = 0;
-                if(pin == null || pin.Length < 3 || pin[0] != 'P'
-                   || pin[1] < 'A' || pin[1] > 'C'
-                   || !int.TryParse(pin.Substring(2), out n) || n < 0 || n > 15)
+                var ok = pin != null && pin.Length >= 3 && pin[0] == 'P'
+                    && ((pin[1] >= 'A' && pin[1] <= 'C') || pin[1] == 'F')
+                    && int.TryParse(pin.Substring(2), out n) && n >= 0 && n <= 15;
+                if(!ok)
                 {
                     throw new RecoverableException(string.Format(
-                        "'{0}' is not a pin name like PA10, PB1 or PC6", pin));
+                        "'{0}' is not a pin name like PA10, PB1, PC6 or PF0", pin));
                 }
-                port = pin[1] - 'A';
+                port = pin[1] == 'F' ? PortF : pin[1] - 'A';
                 number = n;
             }
 
@@ -478,7 +536,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return false;
             }
             var afr = pin < 8 ? afrl[port] : afrh[port];
-            return ((afr >> (4 * (pin & 7))) & 0xF) == timerAf;
+            var af = (afr >> (4 * (pin & 7))) & 0xF;
+            // timerAfAlt covers a pin whose channel sits on a second AF
+            // number, like the G4 SEQURE's TIM1_CH3N on PB15 at AF4
+            return af == timerAf || (timerAfAlt != 0 && af == timerAfAlt);
         }
 
         // PA11/PA12 carry TIM1_CH2 and CH3 only while the G0's SYSCFG
@@ -511,6 +572,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         [DllImport("am32sim")]
         private static extern int am32sim_init(string configPath);
         [DllImport("am32sim")]
+        private static extern void am32sim_set_theta(double theta);
+        [DllImport("am32sim")]
+        private static extern uint am32sim_get_comp_toggles();
+        [DllImport("am32sim")]
         private static extern void am32sim_set_bridge(int a, int b, int c);
         [DllImport("am32sim")]
         private static extern void am32sim_set_tim1(uint arr, uint ccrA, uint ccrB,
@@ -528,17 +593,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private static extern void am32sim_get_sensors(ref double volts, ref double amps,
                                                        ref double degrees);
 
+        // port index of GPIOF in the arrays below
+        private const int PortF = 3;
+
         private readonly IMachine machine;
         private readonly Phase[] phases;
         private readonly ulong[] gpioBase;
-        private readonly uint[] moder = new uint[3];
-        private readonly uint[] odr = new uint[3];
-        private readonly uint[] afrl = new uint[3];
-        private readonly uint[] afrh = new uint[3];
+        private readonly uint[] moder = new uint[4];
+        private readonly uint[] odr = new uint[4];
+        private readonly uint[] afrl = new uint[4];
+        private readonly uint[] afrh = new uint[4];
         private readonly int[] lastMode = new int[3];
         private readonly bool invertedLow;
-        // AF number that routes TIM1 to a pin; 2 on both F0 and G0
+        // AF number that routes TIM1 to a pin; 2 on F0 and G0, 1 on the
+        // L4, 6 on the G4
         private readonly uint timerAf;
+        private readonly uint timerAfAlt;
         // SYSCFG_CFGR1, 0 on families without the remap
         private readonly ulong syscfgBase;
         private readonly bool enableBridge;
@@ -549,11 +619,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // allocations a simulated second
         private readonly int[] tickMode = new int[3];
         private readonly uint[] tickCcr = new uint[3];
-        private readonly IDoubleWordPeripheral[] gpio = new IDoubleWordPeripheral[3];
+        private readonly IDoubleWordPeripheral[] gpio = new IDoubleWordPeripheral[4];
         private IDoubleWordPeripheral syscfg;
         private AM32_STM32_AdvancedTimer timer;
         private IAM32Comparator comp;
         private string configPath;
+        private double initialTheta;
         private bool loaded;
         private bool started;
     }
