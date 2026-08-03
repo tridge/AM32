@@ -540,8 +540,9 @@ def main():
                     help='what is serving the ports. "renode" is the emulator '
                          '(Mcu/Renode), which runs a real firmware ELF on an '
                          'emulated MCU and serves the same wire protocols, but '
-                         'has no CAN peripheral, no tone or audio stream and no '
-                         'speedup control, and runs far below real time')
+                         'has no CAN peripheral and no tone or audio stream, '
+                         'and runs below real time - the speedup slider can '
+                         'only slow it further')
     ap.add_argument('--poles', type=int, default=14)
     ap.add_argument('--control-port', type=int, default=0,
                     help='TCP port on localhost accepting UI control commands '
@@ -1263,13 +1264,18 @@ def main():
     speed_1x.clicked.connect(lambda: speed_slider.setValue(150))
     g4.addWidget(speed_1x, 2, 4)
     if renode:
-        # the emulator has no pacing control: it runs as fast as the host
-        # lets it, which is already far below real time
-        for w in (speed_slider, speed_1x):
-            w.setEnabled(False)
-            w.setToolTip('The emulator has no speedup control - it runs as '
-                         'fast as it can, which is well under real time '
-                         'already. The rate it achieves is shown on the right.')
+        # the emulator cannot go faster than the host lets it, but the
+        # same command paces it downward for slow motion: the link sleeps
+        # the emulation thread to hold sim/wall time at the slider value
+        speed_slider.setToolTip(
+            'Emulation pace relative to wall clock. The emulator cannot\n'
+            'reach real time, so at and above what the host achieves the\n'
+            'slider does nothing and it runs flat out; below that it is\n'
+            'slow motion, down to 0.001x for the motor view. The label\n'
+            'shows the rate actually achieved.')
+        speed_1x.setText('max')
+        speed_1x.setToolTip('Back to flat out (the emulator cannot reach '
+                            'real time).')
         speed_label.setText('measuring...')
 
     # stuck rotor: block the prop with a virtual obstruction, from
