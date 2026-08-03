@@ -766,6 +766,12 @@ def renode_env():
     explicit MONO_GC_PARAMS in the caller's environment wins.'''
     env = dict(os.environ)
     env.setdefault('MONO_GC_PARAMS', 'nursery-size=64m')
+    # for a CoreCLR renode: DllImport("am32sim") does not consult the
+    # RTLD_GLOBAL namespace there, so the library has to be findable by
+    # name. Harmless under the bundled mono.
+    obj = os.path.join(REPO, 'obj')
+    prior = env.get('LD_LIBRARY_PATH')
+    env['LD_LIBRARY_PATH'] = obj if not prior else obj + os.pathsep + prior
     return env
 
 
