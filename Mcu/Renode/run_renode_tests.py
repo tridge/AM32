@@ -7,19 +7,29 @@ it arms and then spins a simulated motor closed loop on BEMF.
 Mirrors Mcu/SITL/run_ci_tests.py in style. Only needs the python
 standard library, plus arm-none-eabi-nm for the symbol table.
 
+The throttle is written straight into the generator's registers from the
+monitor, so a run is scripted in virtual time and takes seconds. --link
+and --gui instead drive it the way a person does, over the udp ports the
+guilink peripheral serves: slower, wall clock bound, and the only way to
+cover the path sitl_gui.py actually uses.
+
 usage: run_renode_tests.py [--target ...] [--elf ...] [--renode ...]
-                           [--model ...]
+                           [--model ...] [--link | --gui]
 exits non-zero if any test fails, or 77 if the harness cannot run.
 '''
 
 import argparse
+import collections
 import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 # lives at the module root, next to the .repl/.resc it drives, mirroring
 # Mcu/SITL/run_ci_tests.py. Not under a tools/ subdirectory: .gitignore
@@ -79,6 +89,59 @@ UNSPINNABLE = {
         'commanded throttle applies, so 2000us and 1300us give byte '
         'identical rpm and rotor angle.',
 }
+
+
+# what AM32 makes of a 1300us servo pulse, the same internal throttle the
+# scripted tests use, so a link run is comparable with them
+LINK_DSHOT_VALUE = 632
+
+# Wider than SPIN_TOLERANCE, and not for want of determinism in the
+# emulator: a real client decides when to change the throttle, so the
+# simulated instant it lands on moves between runs and the settle window
+# starts from a slightly different place. The speed itself still has to
+# be the recorded one, not merely "turning".
+LINK_TOLERANCE = 0.05
+
+
+def report_link(res, target, motor):
+    a = res.get('armed', {})
+    s = res.get('spin', {})
+    if not s:
+        if not failures:
+            check('link run produces a result', False, 'no samples')
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+
+    check('the state stream carries the bus voltage',
+          8.0 < a.get('vbus', 0) < 30.0, 'vbus=%.2fV' % a.get('vbus', 0))
+    check('does not spin unarmed', a.get('sim_rpm', 1) < 1.0,
+          'rpm=%.0f' % a.get('sim_rpm', -1))
+
+    rpm = s.get('sim_rpm', 0)
+    want = expected(target)
+    if want is None:
+        check('setpoints over the link spin the motor', 500 < rpm < 20000,
+              'rpm=%.0f, no recorded figure for this target' % rpm)
+    else:
+        check('setpoints over the link spin it at the recorded speed',
+              abs(rpm - want['rpm']) <= LINK_TOLERANCE * want['rpm'],
+              'rpm=%.0f, expected %d' % (rpm, want['rpm']))
+    # the reply the client decoded against the motor the client is
+    # watching: both ends of the link, checked against each other
+    telem = s.get('telem_rpm', 0)
+    check('telemetry reaches the client', s.get('replies', 0) > 100,
+          'replies=%d' % s.get('replies', 0))
+    check('the reported rpm is the rpm being simulated',
+          rpm > 0 and abs(telem - rpm) < 0.05 * rpm,
+          'telemetry %.0f, physics %.0f' % (telem, rpm))
+    check('no reply CRC failures', s.get('badcrc') == 0,
+          'badcrc=%d' % s.get('badcrc', -1))
+
+    if failures:
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+    print('\nall tests passed')
+    return 0
 
 
 def symbols(elf, nm):
@@ -221,6 +284,300 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
     return results
 
 
+def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
+             port, state_port, dshot_us, value, seconds,
+             gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm'):
+    '''Drive the target the way the GUI does: setpoints in over udp,
+       BDShot telemetry and physics samples back, with nothing scripted
+       through the monitor. That covers what the scripted tests cannot -
+       that the link latches setpoints onto the generator, that the
+       replies reach a client and that the state stream carries the same
+       motor the firmware is sensing.
+
+       Paced by SIMULATED time read out of the state stream, not by the
+       wall clock, so it holds the same throttle for the same emulated
+       interval as the scripted tests however slowly the host runs.
+       `seconds` is only a backstop.'''
+    from sitl_gui_backend import DshotPanel, SimStream
+    import sitl_dshot as sd
+
+    proc = start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
+                        port, state_port, dshot_us, gcc, nm)
+
+    # drained from the start: a full stdout pipe stalls the emulator, and
+    # there is nothing to wait for in it - the port messages are Info and
+    # this run sets logLevel 3
+    tail = collections.deque(maxlen=40)
+    threading.Thread(target=drain, args=(proc, tail), daemon=True).start()
+
+    ds = sim = None
+    try:
+        deadline = time.time() + seconds
+        ds = DshotPanel('127.0.0.1', port)
+        ds.ptype = sd.TYPE_DSHOT300
+        ds.bidir = True
+        ds.rate = 500
+        ds.value = 0
+        ds.enabled = True
+        sim = SimStream('127.0.0.1', state_port, period_us=1000)
+        sim.enabled = True
+
+        # the readiness check as well as the first timestamp: samples only
+        # flow once the state port is open and the physics has started
+        t0 = wait_sim(sim, 0.0, deadline, ds)
+        if t0 is None:
+            print('\n'.join(tail))
+            check('state stream delivers samples', False, 'no samples arrived')
+            return {}
+        # the same windows the scripted test uses: past the frames and the
+        # counter gate at zero, then a settle at throttle
+        if wait_sim(sim, t0 + 2.5, deadline, ds) is None:
+            check('reaches the arming window', False,
+                  'simulated time did not advance')
+            return {}
+        armed = link_sample(ds, sim)
+        ds.value = value
+        if wait_sim(sim, t0 + 4.0, deadline, ds) is None:
+            check('reaches the settled window', False,
+                  'simulated time did not advance')
+            return {}
+        return {'armed': armed, 'spin': link_sample(ds, sim)}
+    finally:
+        for c in (ds, sim):
+            if c is not None:
+                c.running = False
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def run_gui(renode, target_resc, elf, eeprom, model, so, scratch,
+            port, state_port, dshot_us, value, seconds, gui_python,
+            gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm'):
+    """The same link, driven by the real GUI instead of by its backend
+       classes: sitl_gui.py under Qt's offscreen platform, scripted
+       through its control port. That covers what run_link cannot - that
+       the UI a person actually uses works against the emulator, not just
+       the protocol underneath it."""
+    gui = os.path.join(REPO, 'Mcu', 'SITL', 'sitl_gui.py')
+    control = free_port()
+    proc = start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
+                        port, state_port, dshot_us, gcc, nm)
+    tail = collections.deque(maxlen=40)
+    threading.Thread(target=drain, args=(proc, tail), daemon=True).start()
+
+    env = dict(os.environ)
+    env['QT_QPA_PLATFORM'] = 'offscreen'
+    gp = subprocess.Popen(
+        [gui_python, gui, '--backend', 'renode', '--port', str(port),
+         '--state-port', str(state_port), '--control-port', str(control)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+
+    sock = None
+    replies = []
+    try:
+        deadline = time.time() + seconds
+        # the first launch builds a Qt font cache, which is slow
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection(('127.0.0.1', control), timeout=5)
+                break
+            except OSError:
+                if gp.poll() is not None:
+                    check('the GUI starts', False,
+                          (gp.stdout.read() or '')[-500:])
+                    return {}
+                time.sleep(1.0)
+        if sock is None:
+            check('the GUI control port comes up', False, 'timed out')
+            return {}
+        sock.settimeout(None)
+        f = sock.makefile('r')
+        threading.Thread(target=lambda: [replies.append(l.rstrip()) for l in f],
+                         daemon=True).start()
+
+        def send(cmd):
+            sock.sendall((cmd + '\n').encode())
+
+        for cmd in ('ds_type dshot300', 'ds_bidir 1', 'ds_enable 1'):
+            send(cmd)
+            time.sleep(0.2)
+
+        t0 = gui_wait_sim(send, replies, 0.0, deadline)
+        if t0 is None:
+            print('\n'.join(tail))
+            check('the GUI sees the state stream', False, 'no stream_t')
+            return {}
+        if gui_wait_sim(send, replies, t0 + 2.5, deadline) is None:
+            check('the GUI reaches the arming window', False, 'stalled')
+            return {}
+        send('ds_value %d' % value)
+        if gui_wait_sim(send, replies, t0 + 4.0, deadline) is None:
+            check('the GUI reaches the settled window', False, 'stalled')
+            return {}
+        send('status')
+        time.sleep(1.0)
+        bds = last_reply(replies, 'STATUS BDShot:')
+        # ask the GUI to exit rather than killing it, so its own shutdown
+        # runs and a traceback on the way out is still visible
+        try:
+            send('quit')
+        except OSError:
+            pass
+        sock.close()
+        sock = None
+        try:
+            gp.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            gp.terminate()
+        return {'bds': bds, 'out': gp.stdout.read() or ''}
+    finally:
+        if sock is not None:
+            sock.close()
+        if gp.poll() is None:
+            gp.kill()
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def last_reply(replies, prefix):
+    for line in reversed(list(replies)):
+        if line.startswith(prefix):
+            return line
+    return ''
+
+
+def gui_wait_sim(send, replies, until, deadline):
+    """simulated time as the GUI reports it, from its own state stream"""
+    while time.time() < deadline:
+        send('status')
+        time.sleep(1.0)
+        line = last_reply(replies, 'STATUS rpmhist:')
+        m = re.search(r'stream_t=(-?[\d.]+)', line)
+        if m and float(m.group(1)) >= until:
+            return float(m.group(1))
+    return None
+
+
+def report_gui(res, target):
+    bds = res.get('bds', '')
+    if not bds:
+        check('the GUI reports telemetry', False, 'no BDShot status line')
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+    m = re.search(r'rpm=(\d+)', bds)
+    rpm = int(m.group(1)) if m else 0
+    want = expected(target)
+    if want is None:
+        check('the GUI drives the emulated ESC', 500 < rpm < 20000,
+              'rpm=%d, no recorded figure for this target' % rpm)
+    else:
+        check('the GUI drives it to the recorded speed',
+              abs(rpm - want['rpm']) <= LINK_TOLERANCE * want['rpm'],
+              'rpm=%d, expected %d' % (rpm, want['rpm']))
+    check('the GUI shows the motor spinning', 'spinning' in bds, bds)
+    check('no reply CRC failures', 'badcrc=0' in bds, bds)
+    out = res.get('out', '')
+    check('the GUI raises nothing', 'Traceback' not in out,
+          out[-500:] if 'Traceback' in out else 'clean')
+    if failures:
+        print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
+        return 1
+    print('\nall tests passed')
+    return 0
+
+
+def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
+                 port, state_port, dshot_us, gcc='arm-none-eabi-gcc',
+                 nm='arm-none-eabi-nm'):
+    # what a client needs to say which firmware is running and how far
+    # through arming it is; absent symbols simply lose that readout
+    addrs = gen_target.symbol_addresses(
+        elf, ('filename', 'armed_timeout_count', 'armed'), nm)
+    info = ['guilink AppBase 0x%08X' % gen_target.APP_BASE]
+    try:
+        info.append('guilink LoopHz %d'
+                    % gen_target.config(os.path.basename(target_resc)
+                                        .replace('.resc', ''), gcc)['loop_hz'])
+    except gen_target.Unsupported:
+        pass
+    for prop, sym in (('FirmwareNameAddress', 'filename'),
+                      ('ArmedCountAddress', 'armed_timeout_count'),
+                      ('ArmedAddress', 'armed')):
+        if sym in addrs:
+            info.append('guilink %s 0x%08X' % (prop, addrs[sym]))
+    resc = os.path.join(scratch, 'link.resc')
+    with open(resc, 'w') as f:
+        f.write('\n'.join([
+            '$repo=@%s' % REPO,
+            '$elf=@%s' % elf,
+            '$eeprom=@%s' % eeprom,
+            'include @%s' % target_resc,
+            'logLevel 3',
+            'cpu AddSymbolHook "delayMillis" "execfile(\'%s/Mcu/Renode/scripts/skip_delays.py\')"' % REPO,
+            'bridge LibraryPath "%s"' % so,
+            'bridge ConfigPath "%s"' % model,
+            'guilink DshotFrameUs %d' % dshot_us,
+            '\n'.join(info),
+            'guilink InputPort %d' % port,
+            'guilink StatePort %d' % state_port,
+            'start',
+            '']))
+    # stdin stays open: the monitor treats EOF as "quit", and this run has
+    # to outlive the command that started it
+    return subprocess.Popen(
+        [renode, '--disable-xwt', '--console', '-e', 'include @%s' % resc],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+
+
+def drain(proc, tail):
+    for line in proc.stdout:
+        tail.append(line.decode(errors='replace').rstrip())
+
+
+def wait_sim(sim, until, deadline, ds=None):
+    '''simulated time from the state stream, once it has reached `until`.
+       None if the wall clock backstop expires first.'''
+    said = 0.0
+    while time.time() < deadline:
+        s = sim.latest()
+        if s is not None and s[0] >= until:
+            return s[0]
+        # a run is minutes long and mostly waiting; say where it is, so a
+        # stall is distinguishable from slow progress
+        if time.time() - said > 15.0:
+            said = time.time()
+            print('  ... simulated %.2fs of %.2fs, %d replies'
+                  % (s[0] if s else 0.0, until,
+                     ds.replies.count if ds else 0))
+            sys.stdout.flush()
+        time.sleep(0.2)
+    return None
+
+
+def link_sample(ds, sim):
+    s = sim.latest()
+    return {
+        'sim_rpm': s[1] * 60.0 / (2 * 3.14159265358979),
+        'vbus': s[10],
+        'telem_rpm': ds.rpm,
+        'replies': ds.replies.count,
+        'badcrc': ds.badcrc,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--target', default='FD6288_F051',
@@ -259,6 +616,31 @@ def main():
     # one frame in two with eRPM
     ap.add_argument('--edt', action='store_true',
                     help='enable extended dshot telemetry; implies --bdshot')
+    # the GUI's path rather than the monitor's: udp setpoints in,
+    # telemetry and physics samples back
+    ap.add_argument('--link', action='store_true',
+                    help='drive through the guilink udp ports as sitl_gui.py '
+                         'does, instead of scripting the monitor. Costs about a '
+                         'minute a target rather than seconds, because a real '
+                         'client has to be on the other end')
+    # off the SITL's own 57733/57734 so a running SITL or GUI does not
+    # collide with a test
+    ap.add_argument('--link-port', type=int, default=57833)
+    ap.add_argument('--link-state-port', type=int, default=57834)
+    ap.add_argument('--link-dshot-us', type=int, default=1000,
+                    help='dshot frame period on the wire, virtual us. 1000 is '
+                         '1kHz: four times cheaper to emulate than the 250 the '
+                         'GUI defaults to, and the wire rate is not what this '
+                         'test is about')
+    ap.add_argument('--gui', action='store_true',
+                    help='drive the real Mcu/SITL/sitl_gui.py against the link, '
+                         'under Qt offscreen and scripted through its control '
+                         'port. Implies --link')
+    ap.add_argument('--gui-python', default=None,
+                    help='interpreter with PySide6; default the SITL venv')
+    ap.add_argument('--link-seconds', type=float, default=600,
+                    help='wall clock backstop; the test itself is paced by '
+                         'simulated time')
     args = ap.parse_args()
     if args.target in UNSPINNABLE:
         skip('%s: %s' % (args.target, UNSPINNABLE[args.target]))
@@ -322,6 +704,26 @@ def main():
                                           for k, v in sorted(overrides.items()))))
         with open(eeprom, 'wb') as f:
             f.write(bytes(image))
+
+        if args.gui:
+            # the SITL keeps PySide6 in a venv of its own, but a system
+            # python that has it works just as well; the GUI prints its
+            # own diagnostic if neither does
+            venv = os.path.join(REPO, 'Mcu', 'SITL', 'venv', 'bin', 'python3')
+            gui_python = args.gui_python or (
+                venv if os.path.exists(venv) else sys.executable)
+            res = run_gui(renode, target_resc, args.elf, eeprom, args.model,
+                          so, scratch, args.link_port, args.link_state_port,
+                          args.link_dshot_us, LINK_DSHOT_VALUE,
+                          args.link_seconds, gui_python, args.gcc, args.nm)
+            return report_gui(res, args.target)
+
+        if args.link:
+            res = run_link(renode, target_resc, args.elf, eeprom, args.model,
+                           so, scratch, args.link_port, args.link_state_port,
+                           args.link_dshot_us, LINK_DSHOT_VALUE,
+                           args.link_seconds, args.gcc, args.nm)
+            return report_link(res, args.target, motor)
 
         res = run(renode, target_resc, args.elf, eeprom, args.model, so, syms,
                   scratch, throttle_addr, timer_name,
