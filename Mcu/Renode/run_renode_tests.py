@@ -168,13 +168,9 @@ def build_library():
 
 
 def find_renode(explicit):
-    if explicit:
-        return explicit
-    for cand in [os.path.join(REPO, 'tools', 'linux', 'renode_1.16.1_portable', 'renode'),
-                 'renode']:
-        if cand == 'renode' or os.path.exists(cand):
-            return cand
-    return None
+    # the launcher's rule, shared: dotnet portable if installed, else
+    # the vendored mono one
+    return gen_target.find_renode(explicit)
 
 
 READER = r'''
