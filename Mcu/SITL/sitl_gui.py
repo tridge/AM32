@@ -15,6 +15,12 @@ panels can be added on this foundation. Install the dependencies with
 
 usage: sitl_gui.py [--port 57733] [--can-uri mcast:0]
 
+--backend renode points it at the Renode emulator instead of the SITL
+(start one with Mcu/Renode/gen_target.py TARGET --gui, which opens this
+GUI itself). Both serve the same two wire protocols, so the UI is the
+same; what the emulator has no source for is disabled rather than left
+silently dead.
+
 with --control-port N the UI can additionally be driven by commands over
 a localhost TCP connection (one per line), for scripted testing of the
 actual UI paths:
@@ -23,7 +29,8 @@ actual UI paths:
   can_value X, can_rate N, param NAME VALUE, rpm_graph 0|1,
   rpm_window SECONDS, i_window MS, v_window MS,
   wave sine|square FREQ AMP BASE [dshot|can], wave off,
-  usb 0|1, usb_status, snap FILE [rpm], status, quit
+  usb 0|1, usb_status, reset_esc (renode backend),
+  snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
 --log FILE records every UI action with a timestamp; --replay FILE plays
@@ -529,6 +536,12 @@ def main():
     ap.add_argument('--port', type=int, default=57733)
     ap.add_argument('--state-port', type=int, default=57734)
     ap.add_argument('--can-uri', default='mcast:0')
+    ap.add_argument('--backend', choices=('sitl', 'renode'), default='sitl',
+                    help='what is serving the ports. "renode" is the emulator '
+                         '(Mcu/Renode), which runs a real firmware ELF on an '
+                         'emulated MCU and serves the same wire protocols, but '
+                         'has no CAN peripheral, no tone or audio stream and no '
+                         'speedup control, and runs far below real time')
     ap.add_argument('--poles', type=int, default=14)
     ap.add_argument('--control-port', type=int, default=0,
                     help='TCP port on localhost accepting UI control commands '
@@ -538,6 +551,11 @@ def main():
     ap.add_argument('--replay', metavar='FILE',
                     help='replay a --log action file with its original timing')
     args = ap.parse_args()
+    # The emulator serves the same two wire protocols, so nearly all of
+    # this UI works against it unchanged. What it cannot serve is left
+    # visibly disabled rather than silently dead: a control that does
+    # nothing is worse than one that says why.
+    renode = args.backend == 'renode'
 
     t0 = time.time()
     logf = open(args.log, 'w') if args.log else None
@@ -583,14 +601,16 @@ def main():
     # Ctrl-C only interrupts this process and the child is shut down
     # through node.close() instead of dying with a traceback
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    can = CanPanel(args.can_uri) if HAVE_DRONECAN else None
+    # the emulated F051 and G071 have no CAN peripheral, so there is
+    # nothing on the other end of a DroneCAN node here
+    can = CanPanel(args.can_uri) if HAVE_DRONECAN and not renode else None
     if can is not None:
         can.started.wait(5.0)
 
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     win = QWidget()
-    win.setWindowTitle('AM32 SITL control')
+    win.setWindowTitle('AM32 Renode control' if renode else 'AM32 SITL control')
     top = QGridLayout(win)
 
     # ---- PWM/DShot input panel
@@ -1077,6 +1097,9 @@ def main():
         apply_btn.setToolTip('Set the parameter over CAN, save to eeprom and reboot the ESC.')
         apply_btn.clicked.connect(param_apply)
         gp.addWidget(apply_btn, 0, 3)
+    elif renode:
+        g2.addWidget(QLabel('neither emulated family has a CAN peripheral'),
+                     0, 0)
     else:
         g2.addWidget(QLabel('pydronecan not available'), 0, 0)
 
@@ -1239,6 +1262,15 @@ def main():
     speed_1x.setToolTip('Back to real time.')
     speed_1x.clicked.connect(lambda: speed_slider.setValue(150))
     g4.addWidget(speed_1x, 2, 4)
+    if renode:
+        # the emulator has no pacing control: it runs as fast as the host
+        # lets it, which is already far below real time
+        for w in (speed_slider, speed_1x):
+            w.setEnabled(False)
+            w.setToolTip('The emulator has no speedup control - it runs as '
+                         'fast as it can, which is well under real time '
+                         'already. The rate it achieves is shown on the right.')
+        speed_label.setText('measuring...')
 
     # stuck rotor: block the prop with a virtual obstruction, from
     # free to completely stuck, to exercise the firmware's stuck
@@ -1305,6 +1337,14 @@ def main():
         'plays clean synthesized tones instead). Pitch follows the\n'
         'speedup slider - slow motion sounds lower, as physics should.')
     g4.addWidget(motor_audio_check, 4, 3)
+    if renode:
+        # both audio sources come from the SITL's own state port streams:
+        # tones from its fake output timer, motor audio from the physics
+        # accumulated per sub-step. The emulator serves neither.
+        for w in (audio_check, audio_slider, motor_audio_check):
+            w.setEnabled(False)
+            w.setToolTip('Not available on the emulator: the tone and motor '
+                         'audio streams are generated by the SITL.')
     tones = None
     tone_synth = None
     phys_stream = None
@@ -1725,6 +1765,37 @@ def main():
         'Edit the simulated ESC eeprom directly over the simulator link\n'
         '(no 4-way or DroneCAN parameter protocol involved).')
     gs.addWidget(param_btn, 0, 1)
+    if renode:
+        # AM32 latches the input protocol it detected and only ever
+        # re-checks that one, so switching between servo and dshot - or
+        # writing the eeprom - needs a reboot, exactly as it would on the
+        # bench. Under the SITL that is the process panel; the emulator
+        # has no process here to restart, so it gets a button.
+        reset_btn = QPushButton('Restart ESC')
+        reset_btn.setToolTip(
+            'Power cycle the emulated ESC. Needed after changing the input\n'
+            'type once the firmware has detected one (detectInput() only\n'
+            're-checks the protocol it already latched) and after writing\n'
+            'eeprom settings, which are read at boot.')
+
+        def reset_esc_clicked():
+            log_action('reset_esc')
+            sim.reset_esc()
+
+        reset_btn.clicked.connect(reset_esc_clicked)
+        gs.addWidget(reset_btn, 0, 2)
+        # which firmware is loaded and where the core is executing.
+        # Neither is visible on the wire, and both are the first thing
+        # you want when an ESC is not responding: a halted core and one
+        # sitting in the bootloader look identical from outside.
+        fw_label = QLabel('firmware: -')
+        fw_label.setFont(fixed)
+        fw_label.setToolTip(
+            'The firmware string the running image carries (the filename\n'
+            'symbol in its own flash section, where a configurator reads\n'
+            'it too), and what the core is doing: which region the program\n'
+            'counter is in, or that it has halted.')
+        gs.addWidget(fw_label, 1, 0, 1, 3)
     eeprom_client = EepromClient(args.host, args.state_port)
     param_state = {'dialog': None, 'mismatch': None, 'next_check': 0.0,
                    'input_hint': None}
@@ -1891,6 +1962,12 @@ def main():
 
     sim_start_btn.clicked.connect(sim_launch)
     sim_stop_btn.clicked.connect(sim_halt)
+    if renode:
+        # Mcu/Renode/gen_target.py owns the emulator, the firmware ELF and
+        # the platform, and its console is the Renode monitor: there is
+        # nothing here to launch and nothing to show, so the panel does
+        # not take up the space.
+        fl.hide()
     top.addWidget(fl, 5, 0, 1, 2)
 
     # the virtual USB serial device and the fake FC behind it. Bringing
@@ -2140,6 +2217,8 @@ def main():
             motor_audio_check.setChecked(bool(int(cargs[0])))
         elif cmd == 'audio_volume':
             audio_slider.setValue(int(cargs[0]))
+        elif cmd == 'reset_esc':
+            sim.reset_esc()
         elif cmd == 'snap':
             # screenshot a window to a file, for scripted visual checks
             tgt = win
@@ -2196,8 +2275,7 @@ def main():
         elif cmd == 'status':
             reply('STATUS %s' % bds_label.text())
             reply('STATUS %s' % can_label.text())
-            reply('STATUS ds: %s' % (param_state['input_hint'] or ds.status
-                                     or '-'))
+            reply('STATUS ds: %s' % (ds_status.text() or '-'))
             reply('STATUS sim: %s rate=%.0f/s' % (sim.model_status or '-', sim.rate.hz()))
             smp = sim.latest()
             reply('STATUS rpmhist: n=%d stream_t=%.3f taxis_last=%.3f acc=%.3f'
@@ -2265,6 +2343,61 @@ def main():
     if args.control_port > 0 or args.replay:
         cmd_timer.start(50)
 
+    # simulated seconds per wall second, from the state stream's own
+    # timestamps. Only shown for a backend that cannot keep up.
+    sim_ratio_state = {'t': None, 'wall': None, 'value': None,
+                       'next_info': 0.0}
+
+    def sim_ratio():
+        """simulated seconds per wall second, over a 2s window. The
+        emulator has no pacing control, so this is what the speedup
+        control shows instead: what it is actually achieving."""
+        s = sim.latest()
+        now = time.time()
+        if s is None:
+            return sim_ratio_state['value']
+        last_t, last_wall = sim_ratio_state['t'], sim_ratio_state['wall']
+        if last_t is None or now - last_wall > 2.0:
+            sim_ratio_state['t'], sim_ratio_state['wall'] = s[0], now
+            if last_t is not None and s[0] >= last_t:
+                sim_ratio_state['value'] = (s[0] - last_t) / (now - last_wall)
+        return sim_ratio_state['value']
+
+    def arming_hint():
+        """how far through arming the firmware is. tenKhzRoutine() counts
+        armed_timeout_count up at the loop rate while the input reads
+        zero and needs a full second of it, so the counter is the
+        progress bar - and on a backend this slow, knowing whether the
+        wait is progressing at all is the difference between patience and
+        debugging."""
+        info = sim.info if renode else None
+        if info is None or not info['loop_hz'] or info['armed']:
+            return ''
+        held = info['armed_count'] / float(info['loop_hz'])
+        if held <= 0:
+            return ''
+        return 'arming: %.2fs of the 1.00s at zero throttle' % held
+
+    def update_renode_info():
+        """firmware identity, core state and arming progress, none of
+        which the wire carries. Polled once a second."""
+        now = time.time()
+        if now >= sim_ratio_state['next_info']:
+            sim_ratio_state['next_info'] = now + 1.0
+            sim.request_info()
+        info = sim.info
+        if info is None:
+            return
+        if info['halted']:
+            where = 'HALTED at 0x%08X' % info['pc']
+            fw_label.setStyleSheet('color: red; font-weight: bold')
+        else:
+            where = '%s pc=0x%08X' % (
+                'bootloader' if info['bootloader'] else 'app', info['pc'])
+            fw_label.setStyleSheet('')
+        fw_label.setText('firmware: %-16s core: %s'
+                         % (info['name'] or '(unreadable)', where))
+
     def update_sim_status():
         smp = sim.latest()
         if smp is None:
@@ -2272,8 +2405,11 @@ def main():
                                '(enable a scope or motor view to stream state)')
         else:
             rpm = smp[1] * 60.0 / (2 * math.pi)
-            armed = 'yes' if (ds.spinning or (can is not None and
-                                              can.status.get('rpm', 0))) else '-'
+            if renode and sim.info is not None:
+                armed = 'yes' if sim.info['armed'] else 'no'
+            else:
+                armed = 'yes' if (ds.spinning or (can is not None and
+                                                  can.status.get('rpm', 0))) else '-'
             sim_status.setText(
                 'rpm=%-8.0f volt=%-6.2f current=%-6.2f armed=%s'
                 % (rpm, smp[10], smp[11], armed))
@@ -2330,7 +2466,10 @@ def main():
             slider.setValue(wave['value'])
             slider.blockSignals(False)
         ds_value_label.setText(str(ds_value.value()))
-        ds_status.setText(param_state['input_hint'] or ds.status
+        # while it is counting up, the progress is what you want to see;
+        # ds.status (mostly EDT chatter) comes back once it has armed
+        ds_status.setText(param_state['input_hint'] or arming_hint()
+                          or ds.status
                           or 'arm: enable + hold zero throttle >1.5s')
         edt = ' '.join('%s=%s' % kv for kv in sorted(ds.edt_fresh().items()))
         bds_label.setText('BDShot:   rpm=%-6.0f %-8s EDT:%-3s sent=%.0f/s replies=%.0f/s badcrc=%u %s'
@@ -2369,7 +2508,15 @@ def main():
                 can_dna_label.setText('')
                 can_dna_label.setStyleSheet('')
         model_status.setText(sim.model_status)
+        # against a backend far below real time the sample rate alone is
+        # not the interesting number - how fast simulated time is moving
+        # is what explains why arming takes half a minute
         sim_rate_label.setText('%.0f samples/s' % sim.rate.hz())
+        if renode:
+            ratio = sim_ratio()
+            if ratio is not None:
+                speed_label.setText('%.3fx' % ratio)
+            update_renode_info()
         if can_fps.available:
             can_fps_label.setText('FPS: %.0f' % can_fps.rate.hz())
 

@@ -495,6 +495,7 @@ class SimStream(object):
     MAGIC_CMD = 0x5353
     MAGIC_DATA = 0x5354
     MAGIC_REPLY = 0x5355
+    MAGIC_INFO = 0x5359
 
     def __init__(self, host='127.0.0.1', port=57734, period_us=50, maxlen=40000):
         self.addr = (host, port)
@@ -504,6 +505,9 @@ class SimStream(object):
         self.lock = threading.Lock()  # guards samples against the reader
         self.rate = RateCounter()
         self.model_status = ''
+        # what the emulator says about the firmware it is running: only
+        # the Renode backend answers, so this stays None against the SITL
+        self.info = None
         self.running = True
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(('127.0.0.1', 0))
@@ -543,6 +547,21 @@ class SimStream(object):
             magic, b2, b3 = struct.unpack('<HBB', d[:4])
             if magic == self.MAGIC_REPLY:
                 self.model_status = d[4:].split(b'\0')[0].decode(errors='replace')
+                continue
+            if magic == self.MAGIC_INFO and len(d) >= 20:
+                pc, app_base, armed_count, loop_hz = struct.unpack_from('<IIII',
+                                                                       d, 4)
+                self.info = {
+                    'name': d[20:].split(b'\0')[0].decode(errors='replace'),
+                    'pc': pc,
+                    'app_base': app_base,
+                    'halted': bool(b3 & 1),
+                    'bootloader': bool(b3 & 2),
+                    'armed': bool(b3 & 4),
+                    'armed_count': armed_count,
+                    'loop_hz': loop_hz,
+                    't': time.time(),
+                }
                 continue
             if magic != self.MAGIC_DATA or b2 != 2:
                 continue
@@ -594,6 +613,27 @@ class SimStream(object):
         """stuck rotor fraction 0..1 (prop blocked by an obstruction,
         e.g. a tree branch): 0 is free, 1.0 locks the rotor rigidly"""
         pkt = struct.pack('<HBBf', self.MAGIC_CMD, 7, 0, fraction)
+        try:
+            self.sock.sendto(pkt, self.addr)
+        except OSError:
+            pass
+
+    def request_info(self):
+        '''ask what firmware is running, where the core is and how far
+        through arming it is - none of which is visible on the wire.
+        Answered by the Renode backend only; the reply lands in .info'''
+        pkt = struct.pack('<HBB', self.MAGIC_CMD, 9, 0)
+        try:
+            self.sock.sendto(pkt, self.addr)
+        except OSError:
+            pass
+
+    def reset_esc(self):
+        '''restart the emulated ESC (Renode backend only). AM32 latches
+        the input protocol it detected and only re-checks that one, so
+        changing protocol - or writing the eeprom - needs a reboot, as it
+        would on the bench. The SITL has its process panel for this.'''
+        pkt = struct.pack('<HBB', self.MAGIC_CMD, 8, 0)
         try:
             self.sock.sendto(pkt, self.addr)
         except OSError:
