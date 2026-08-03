@@ -269,6 +269,23 @@ namespace Antmicro.Renode.Peripherals.Timers
         // reply yet" from "a reply of zero"
         public uint ReplyCount { get; private set; }
 
+        // A short history of decoded frames, indexed by reply number, so a
+        // client that polls slower than the reply rate still receives
+        // every frame rather than every Nth. That matters beyond neatness:
+        // extended telemetry interleaves temperature, voltage and current
+        // between the eRPM frames, so dropping three replies in four drops
+        // three quarters of each telemetry kind.
+        public bool TryGetReply(uint index, out uint frame)
+        {
+            frame = 0;
+            if(index >= ReplyCount || ReplyCount - index > (uint)replyRing.Length)
+            {
+                return false;
+            }
+            frame = replyRing[index % (uint)replyRing.Length];
+            return true;
+        }
+
         // the last reply's levels packed LSB-first, one bit per period,
         // for diagnosing a decode that does not line up
         public ulong ReplyRaw { get; private set; }
@@ -366,6 +383,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
             LastReplyFrame = frame;
             ReplyTypeMask |= 1u << (int)((frame >> 12) & 0xF);
+            replyRing[ReplyCount % (uint)replyRing.Length] = frame;
             ReplyCount++;
         }
 
@@ -382,6 +400,11 @@ namespace Antmicro.Renode.Peripherals.Timers
         };
 
         private const int ReplyPeriods = 21;
+
+        // 64 frames is 16ms of simulated time at 4kHz, far longer than a
+        // client's polling interval; a slower one loses the oldest, which
+        // TryGetReply reports rather than hides
+        private readonly uint[] replyRing = new uint[64];
 
         // CC1S = 00 means channel 1 is an output; receiveDshotDma() sets
         // it to 01 for input capture
