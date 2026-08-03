@@ -37,6 +37,7 @@ using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -184,6 +185,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 haveSetpoint = false;
             }
+            // the pace setting survives a firmware reboot, like the
+            // SITL's does; only the anchor is dropped
+            paceValid = false;
             tick.Limit = IdleTickUs;
             tick.Enabled = inputSocket != null || stateSocket != null;
         }
@@ -424,6 +428,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     continue;
                 }
+                // The pace target lands here as well as in the queue: the
+                // queue is only serviced by the emulation thread, which is
+                // exactly the thread Pace() may be holding asleep for
+                // seconds at the lowest settings, so a new setting has to
+                // be able to cut a sleep short from this thread.
+                if(buf[2] == 2 && n >= 8)
+                {
+                    paceTarget = BitConverter.ToSingle(buf, 4);
+                }
                 if(commands.Count > 32)
                 {
                     // a paused emulation is not a reason to accumulate
@@ -464,8 +477,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     LoadModel(Encoding.UTF8.GetString(d, 4, d.Length - 4)
                                       .TrimEnd('\0'), c.From);
                     break;
-                case 2: // speedup, which Renode has no equivalent of
-                    Reply(c.From, false, "no speedup control on the emulator");
+                case 2: // pace the emulation, simulated time over wall
+                    // time. The receive thread already stored the value;
+                    // this is the acknowledgement.
+                    var pace = paceTarget;
+                    if(pace > 0 && pace < 1.0f)
+                    {
+                        this.Log(LogLevel.Info, "pacing to {0:F3}x", pace);
+                        Reply(c.From, true,
+                              string.Format("pacing to {0:F3}x", pace));
+                    }
+                    else
+                    {
+                        this.Log(LogLevel.Info, "pacing off");
+                        Reply(c.From, true, "unpaced: the emulator runs as "
+                              + "fast as it can below real time");
+                    }
                     break;
                 case 9: // what firmware is running, and where it is
                     DeviceInfo(c.From);
@@ -763,6 +790,50 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ApplySetpoint();
             PumpReplies();
             SampleState();
+            Pace();
+        }
+
+        // Hold simulated time to paceTarget times wall time by sleeping
+        // the emulation thread at the end of its own tick - the GUI's
+        // slow motion, which the emulator otherwise has no equivalent
+        // of. The anchor slides whenever the emulation cannot keep up,
+        // so a target at or above what the host achieves costs nothing
+        // and accumulates no debt to sprint off later. Sleeps are sliced
+        // so a new setting from the wire cuts them short.
+        private void Pace()
+        {
+            var target = paceTarget;
+            if(float.IsNaN(target) || target <= 0 || target >= 1.0f)
+            {
+                paceValid = false;
+                return;
+            }
+            var virtMs = machine.ElapsedVirtualTime.TimeElapsed.TotalMilliseconds;
+            var wallMs = paceClock.Elapsed.TotalMilliseconds;
+            if(!paceValid || target != paceApplied)
+            {
+                paceValid = true;
+                paceApplied = target;
+                paceVirtMs = virtMs;
+                paceWallMs = wallMs;
+                return;
+            }
+            var wantWall = paceWallMs + (virtMs - paceVirtMs) / target;
+            if(wantWall <= wallMs)
+            {
+                paceVirtMs = virtMs;
+                paceWallMs = wallMs;
+                return;
+            }
+            while(true)
+            {
+                var ahead = wantWall - paceClock.Elapsed.TotalMilliseconds;
+                if(ahead <= 0 || paceTarget != target)
+                {
+                    break;
+                }
+                Thread.Sleep((int)Math.Min(Math.Ceiling(ahead), 50));
+            }
         }
 
         private void Send(Socket s, byte[] data, int length, EndPoint to)
@@ -872,5 +943,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private int batchCount;
         private ulong lastFlushNs;
         private uint lastReplyCount;
+
+        // pacing (cmd 2): simulated over wall time to hold, 0 or >=1 is
+        // unpaced. Written by the state socket thread, read in Pace().
+        private volatile float paceTarget;
+        private readonly Stopwatch paceClock = Stopwatch.StartNew();
+        private bool paceValid;
+        private float paceApplied;
+        private double paceVirtMs;
+        private double paceWallMs;
     }
 }
