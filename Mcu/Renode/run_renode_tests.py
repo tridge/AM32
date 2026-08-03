@@ -86,7 +86,14 @@ READER = r'''
 import sys
 sb = monitor.Machine['sysbus']
 b = monitor.Machine['sysbus.bridge']
+ic = monitor.Machine['sysbus.%s']
 S = %s
+def report_reply(tag):
+    # what the ESC drove back on the shared wire, GCR decoded by the
+    # capture timer from the levels it output
+    print 'RESULT %%s replies=%%d types=%%d gcr_errors=%%d crc_errors=%%d frame=%%d' %% (
+        tag, ic.ReplyCount, ic.ReplyTypeMask, ic.ReplyGcrErrors,
+        ic.ReplyCrcErrors, ic.LastReplyFrame)
 def rd(name):
     addr, size = S[name]
     if size == 1:
@@ -102,7 +109,8 @@ def report(tag):
 
 
 def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
-        throttle_addr, physics=True):
+        throttle_addr, timer_name, physics=True, dshot=0, bidir=False,
+        edt=False):
     want = ['armed', 'running', 'zero_crosses', 'bemf_timeout_happened',
             'desync_happened']
     missing = [n for n in want if n not in syms]
@@ -112,7 +120,7 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
 
     reader = os.path.join(scratch, 'reader.py')
     with open(reader, 'w') as f:
-        f.write(READER % repr(table))
+        f.write(READER % (timer_name, repr(table)))
 
     resc = os.path.join(scratch, 'spin.resc')
     with open(resc, 'w') as f:
@@ -126,14 +134,33 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
             'bridge LibraryPath "%s"' % so if physics else '',
             'bridge ConfigPath "%s"' % model if physics else '',
             'python "execfile(\'%s\')"' % reader,
+            # dshot is selected before the run so detectInput() sees it
+            # from the first capture; servo needs nothing, being the
+            # generator's default
+            'sysbus WriteDoubleWord 0x%08X %d' % (throttle_addr + 8, dshot)
+            if dshot else '',
+            # inverted framing: the ESC recognises bidirectional mode
+            # from the idle-high line and then replies on the same wire
+            'sysbus WriteDoubleWord 0x%08X 1' % (throttle_addr + 16)
+            if bidir else '',
             # past the ~0.62s of frames and the ~1.02s counter gate
             'emulation RunFor "2.5"',
             'python "report(\'armed\')"',
-            # 1300us: above the 1100us dead band, low enough to stay in
-            # the startup ramp rather than saturating
+            # dshot command 13 enables extended telemetry, and only
+            # counts while armed and stopped. It has to be repeated 6
+            # times, which at 4kHz is well inside this window.
+            'sysbus WriteDoubleWord 0x%08X 13' % (throttle_addr + 12)
+            if edt else '',
+            'emulation RunFor "0.2"' if edt else '',
+            # 632 is what AM32 makes of a 1300us servo pulse, which is
+            # above the dead band but still inside the startup ramp; the
+            # dshot value lands on the same internal scale
+            'sysbus WriteDoubleWord 0x%08X 632' % (throttle_addr + 12)
+            if dshot else
             'sysbus WriteDoubleWord 0x%08X 1300' % throttle_addr,
             'emulation RunFor "1.5"',
             'python "report(\'spin\')"',
+            'python "report_reply(\'reply\')"' if bidir else '',
             'quit',
             '']))
 
@@ -179,7 +206,32 @@ def main():
     # leaves the bridge unstarted, so there is no motor to sense. Used to
     # confirm the spin assertions can actually fail.
     ap.add_argument('--no-physics', action='store_true')
+    # drives the ESC with dshot at this bitrate instead of a servo pulse,
+    # which exercises detectInput()/checkDshot() and computeDshotDMA() on
+    # real captures rather than the two edge servo path.
+    #
+    # 150 is deliberately absent: AM32's input auto-detection cannot see
+    # it. checkDshot() classifies on the smallest gap between consecutive
+    # edges and accepts 1-3 or 4-8 counts at the detection prescaler of
+    # CPU_FREQUENCY_MHZ/6. Detection runs at zero throttle, where every
+    # bit is a zero, so that gap is a zero's high time - 0.375 of a bit
+    # period, 13 counts for dshot150 at 48MHz, measured. The SITL reached
+    # the same conclusion independently; see Mcu/SITL/sitl_gui.py.
+    ap.add_argument('--dshot', type=int, default=0, choices=(0, 300, 600),
+                    help='dshot bitrate in kbaud; 0 (default) is servo')
+    # inverted dshot, where the ESC answers on the same wire. Exercises
+    # sendDshotDma(), which reuses the capture timer as a PWM output
+    ap.add_argument('--bdshot', action='store_true',
+                    help='bidirectional dshot; implies --dshot 600 if unset')
+    # extended telemetry rides on the bidirectional reply, interleaved
+    # one frame in two with eRPM
+    ap.add_argument('--edt', action='store_true',
+                    help='enable extended dshot telemetry; implies --bdshot')
     args = ap.parse_args()
+    if args.edt:
+        args.bdshot = True
+    if args.bdshot and not args.dshot:
+        args.dshot = 600
 
     if args.elf is None:
         found = sorted(glob.glob(os.path.join(REPO, 'obj',
@@ -205,6 +257,7 @@ def main():
         try:
             target_resc, _ = gen_target.generate(args.target, scratch, args.gcc)
             throttle_addr = gen_target.throttle_address(args.target, args.gcc)
+            timer_name = gen_target.capture_timer_name(args.target, args.gcc)
         except gen_target.Unsupported as e:
             skip(str(e))
 
@@ -237,12 +290,17 @@ def main():
             f.write(bytes(image))
 
         res = run(renode, target_resc, args.elf, eeprom, args.model, so, syms,
-                  scratch, throttle_addr, physics=not args.no_physics)
+                  scratch, throttle_addr, timer_name,
+                  physics=not args.no_physics,
+                  dshot=args.dshot, bidir=args.bdshot, edt=args.edt)
 
     a = res.get('armed', {})
     s = res.get('spin', {})
     if a:
-        check('arms on a servo signal', a.get('armed') == 1,
+        check('arms on a %s signal'
+              % ('%sdshot%d' % ('bi' if args.bdshot else '', args.dshot)
+                 if args.dshot else 'servo'),
+              a.get('armed') == 1,
               'armed=%d' % a.get('armed', -1))
         check('does not spin unarmed', a.get('running') == 0 and a.get('rpm', 0) == 0,
               'running=%d rpm=%d' % (a.get('running', -1), a.get('rpm', -1)))
@@ -262,6 +320,44 @@ def main():
               'bemf_timeout_happened=%d' % s.get('bemf_timeout', -1))
         check('no desyncs', s.get('desync') == 0,
               'desync_happened=%d' % s.get('desync', -1))
+
+    r = res.get('reply', {})
+    if r:
+        replies = r.get('replies', 0)
+        check('replies on the shared wire', replies > 100,
+              'replies=%d' % replies)
+        # a decode that lines up on the wrong period still produces
+        # frames, so the line code and the CRC both have to hold
+        check('reply line code is legal', r.get('gcr_errors') == 0,
+              'gcr_errors=%d' % r.get('gcr_errors', -1))
+        check('reply CRC is correct', r.get('crc_errors') == 0,
+              'crc_errors=%d' % r.get('crc_errors', -1))
+    # the payload is the electrical period in us, mantissa and shift.
+    # Checking it against the physics closes the loop: the firmware
+    # sensed the emulated motor and reported the speed it is turning.
+    # Only with plain bidirectional dshot, where every frame is eRPM;
+    # extended telemetry interleaves and the last frame could be either.
+    if r and not args.edt:
+        frame = r.get('frame', 0)
+        payload = frame >> 4
+        period = (payload & 0x1FF) << (payload >> 9)
+        poles = int(motor.get('poles', 14))
+        erpm = 60e6 / period if period else 0
+        want = s.get('rpm', 0)
+        got = erpm / (poles / 2)
+        check('reply reports the measured rpm',
+              want and abs(got - want) < 0.02 * want,
+              'frame=0x%04X period=%dus -> %drpm, physics %drpm'
+              % (frame, period, got, want))
+    if r and args.edt:
+        # each telemetry kind carries a different top nibble, so one run
+        # shows whether all three went out. The divisors are 40 frames
+        # for current and 200 for voltage and temperature.
+        types = r.get('types', 0)
+        for name, nibble in (('temperature', 2), ('voltage', 4),
+                             ('current', 6)):
+            check('sends %s telemetry' % name, types & (1 << nibble),
+                  'type mask 0x%04X' % types)
 
     if failures:
         print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
