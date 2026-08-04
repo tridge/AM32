@@ -1,0 +1,138 @@
+// STM32F031 common to every AM32 F031 target. Not loadable on its own:
+// the capture timer, the ADC, the BEMF pins, the bridge and the
+// throttle wiring come from a generated target overlay.
+//
+// A pared-down sibling of stm32f051_base.repl: the same F0 peripheral
+// generation, but this die has NO comparator (the boards put external
+// comparator chips on GPIO pins, watched through EXTI - see
+// AM32_ExtiBemf), no TIM6/TIM15, no USART2, a five-channel DMA and 4K
+// of SRAM. The timer roles rotate too: TIM3 is the free-running
+// interval timer here (TIM2 on the F051), and TIM2/TIM16 trade the
+// capture and 20kHz-loop roles per hardware group.
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 48000000
+    IRQ -> cpu@0
+
+exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 32
+    [0, 1] -> nvicInput5@[0, 1]
+    [2, 3] -> nvicInput6@[0, 1]
+    [4-15] -> nvicInput7@[0-11]
+
+nvicInput5: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@5
+
+nvicInput6: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@6
+
+nvicInput7: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 12
+    -> nvic@7
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0"
+    nvic: nvic
+
+usart1: UART.STM32F7_USART @ sysbus 0x40013800
+    frequency: 48000000
+    IRQ -> nvic@27
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x48000000, +0x400>
+    modeResetValue: 0x28000000
+    pullUpPullDownResetValue: 0x24000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x48000400, +0x400>
+    modeResetValue: 0x00000000
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x48000800, +0x400>
+    modeResetValue: 0x00000000
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+// PF0/PF1 are BEMF inputs on every F031 group; PF6/PF7 are gate-driver
+// standby pins written once at init
+gpioPortF: GPIOPort.STM32_GPIOPort @ sysbus <0x48001400, +0x400>
+    modeResetValue: 0x28000000
+    pullUpPullDownResetValue: 0x24000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+// motor PWM, the same model the other families use
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 48000000
+    0 -> nvic@13
+    1 -> nvic@14
+
+// timer2 and timer16 are declared by the target overlay: groups A/B
+// capture the throttle on TIM2_CH3 and run the 20kHz loop on TIM16,
+// group C does the reverse (TIM16_CH1 capture, TIM2 loop).
+
+// the free-running 2MHz interval timer (the F051 uses TIM2 for this)
+timer3: Timers.STM32_Timer @ sysbus 0x40000400
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@16
+
+timer14: Timers.STM32_Timer @ sysbus 0x40002000
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@19
+
+timer17: Timers.STM32_Timer @ sysbus 0x40014800
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@22
+
+rcc: Miscellaneous.AM32_STM32F0_RCC @ sysbus 0x40021000
+
+// write-readback, unlike the F051's tag: this firmware POLLS the ACR
+// latency it just wrote, and a zero readback hangs SystemClock_Config
+flash_ctrl: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+// SYSCFG holds the EXTICR port selections, the MEM_MODE remap
+// initAfterJump() writes, and the ADC/USART DMA-channel remap bits.
+// Stored and read back, not interpreted: EXTICR routing is fixed by
+// the platform wiring and the DMA remaps by the overlay's channel
+// numbers. There is no COMP page behind it on this die.
+syscfg: Miscellaneous.AM32_RegisterFile @ sysbus <0x40010000, +0x400>
+
+// 32K flash / 4K SRAM; app at 0x08001000 above an empty 4K bootloader
+// region, as on the F051
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x8000
+
+flashAlias: Memory.MappedMemory @ sysbus 0x0
+    size: 0x8000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x1000
+
+// factory calibration page: TS_CAL1/TS_CAL2 at the F0 addresses
+systemMemory: Memory.MappedMemory @ sysbus 0x1FFFF000
+    size: 0x1000
+
+// five channels on this die where the F051 has seven; the ADC arrives
+// on channel 2 via the SYSCFG remap and USART1 TX on channel 4
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 5
+
+sysbus:
+    init:
+        Tag <0x40002C00, 0x40002FFF> "WWDG"
+        Tag <0x40005400, 0x400057FF> "I2C1"
+        Tag <0x40007000, 0x400073FF> "PWR"
+        Tag <0x40013000, 0x400133FF> "SPI1"
+        Tag <0x40015800, 0x40015BFF> "DBGMCU"
+        Tag <0x40023000, 0x400233FF> "CRC"

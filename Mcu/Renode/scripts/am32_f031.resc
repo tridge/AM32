@@ -1,0 +1,66 @@
+:name: AM32 F031
+:description: boots an AM32 STM32F031 firmware ELF
+
+# Common to every F031 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the differences from
+# the F051 are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_RCC.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# the die has no comparator: external comparator chips drive GPIO pins,
+# modelled by the EXTI-watching BEMF block
+include $repo/Mcu/Renode/peripherals/common/AM32_ExtiBemf.cs
+# after the bridge, which it samples for the physics sensor values
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+$eeprom_addr?=0x08007C00
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# Factory temperature calibration, the same F0 addresses and values the
+# F051 uses: TS_CAL1 at 30C, TS_CAL2 at 110C, 3.3V reference, voltage
+# falling with temperature.
+sysbus WriteWord 0x1FFFF7B8 1774
+sysbus WriteWord 0x1FFFF7C2 1348
+
+# The M0 has no VTOR; initAfterJump() copies the app vector table into
+# SRAM and remaps it to address zero via SYSCFG MEM_MODE, which the
+# emulation does not model. Renode's CortexM VectorTableOffset serves
+# the same purpose directly.
+cpu VectorTableOffset 0x08001000
+
+macro reset
+"""
+    cpu VectorTableOffset 0x08001000
+"""
+
+
+# 48MHz Cortex-M0, one instruction per cycle, as on the F051
+cpu PerformanceInMips 48
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
