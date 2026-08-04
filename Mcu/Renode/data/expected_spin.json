@@ -71,6 +71,10 @@
   "rpm": 2985,
   "zero_crosses": 2904
  },
+ "CRAWLMASTER_F031": {
+  "rpm": 2799,
+  "zero_crosses": 2738
+ },
  "CRTEENSY_HILARIESC_F051": {
   "rpm": 2985,
   "zero_crosses": 2879
@@ -119,6 +123,14 @@
   "rpm": 2863,
   "zero_crosses": 2757
  },
+ "FVT_LITTLEBEE_50_F031": {
+  "rpm": 2800,
+  "zero_crosses": 2735
+ },
+ "GD32DEV_A_E230": {
+  "rpm": 2986,
+  "zero_crosses": 2924
+ },
  "GEN_128K_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
@@ -126,6 +138,10 @@
  "GEN_64K_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
+ },
+ "GEN_G031": {
+  "rpm": 2990,
+  "zero_crosses": 2973
  },
  "GSPACE_F051": {
   "rpm": 2985,
@@ -291,6 +307,10 @@
   "rpm": 2985,
   "zero_crosses": 2904
  },
+ "REF_F031": {
+  "rpm": 2799,
+  "zero_crosses": 2738
+ },
  "REF_G431": {
   "rpm": 3090,
   "zero_crosses": 3034
@@ -307,6 +327,10 @@
   "rpm": 2985,
   "zero_crosses": 2908
  },
+ "RHINO40A_E230": {
+  "rpm": 2986,
+  "zero_crosses": 2924
+ },
  "RHINO80A_F051": {
   "rpm": 3111,
   "zero_crosses": 3036
@@ -322,6 +346,10 @@
  "SDMODEL_F051": {
   "rpm": 2985,
   "zero_crosses": 2904
+ },
+ "SEQURE_4IN1_E230": {
+  "rpm": 2986,
+  "zero_crosses": 2924
  },
  "SEQURE_4IN1_F051": {
   "rpm": 2985,
@@ -363,13 +391,29 @@
   "rpm": 2990,
   "zero_crosses": 2884
  },
+ "SKYSTARS_AM45_E230": {
+  "rpm": 3084,
+  "zero_crosses": 3029
+ },
+ "SKYSTARS_AM60_E230": {
+  "rpm": 3084,
+  "zero_crosses": 3029
+ },
  "SKYSTARS_F051": {
   "rpm": 2985,
   "zero_crosses": 2904
  },
+ "SKYSTARS_KM55_E230": {
+  "rpm": 3084,
+  "zero_crosses": 3029
+ },
  "SKYSTARS_KM80_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
+ },
+ "SKYSTARS_SL40_E230": {
+  "rpm": 2986,
+  "zero_crosses": 2924
  },
  "SP_CRUSTCORE_G071": {
   "rpm": 2989,

@@ -14,10 +14,11 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Five MCU families are supported: F051, G071, L431, G431 and the
-RISC-V CH32V203**, covering the 52 F051, 54 G071, 18 L431, 6 G431 and
-1 V203 targets with no per-target file to write - the platform is
-generated from
+**Eight MCU families are supported: F051, F031, G071, G031, L431,
+G431, the RISC-V CH32V203 and the GigaDevice GD32E230**, covering the
+52 F051, 3 F031, 54 G071, 1 G031, 18 L431, 6 G431, 1 V203 and 8 E230
+targets with no per-target file to write - the platform is generated
+from
 `Inc/targets.h` on demand. What differs between the families is a
 table in `gen_target.py`, not a second code path. The `_CAN` targets
 run their DroneCAN firmware on an emulated CAN peripheral - the
@@ -288,6 +289,89 @@ reloading the ELF - a RISC-V CPU reset does not re-read an entry
 point the way a Cortex-M re-reads its vector table, and without the
 reload the signal-loss reboot would leave the firmware running past
 the call with half-cleared state.
+
+### The F031 and G031 - no comparator at all
+
+Two more STM32s, and the first pair whose dies have **no analog
+comparator**: their boards put external comparator chips on three GPIO
+pins and the firmware watches them through EXTI, polling the pin level
+directly during startup and taking edges once running. The phase being
+sensed is never written to any peripheral - the firmware keeps it in
+globals - but it is observable, and `AM32_ExtiBemf` recovers it two
+different ways:
+
+- **the F031's `changeCompInput()` assigns RTSR/FTSR**, leaving
+  exactly one phase line armed, so reading the trigger registers back
+  names the phase;
+- **the G031's only ORs and clears the current line's bits**, leaving
+  all three lines armed forever - there the phase is named by which
+  line's bits a write *changed* (each phase alternates edge between
+  visits, so its revisit always flips its bits), which the G0 EXTI
+  model reports through a `TriggerChanged` event.
+
+The model then drives the real GPIO pins, so both the polled IDR reads
+and the EXTI edge path are the firmware's own. Two bring-up findings
+worth keeping:
+
+- **a parked-rotor chatter edge before the first commutation is
+  unrecoverable on these MCUs**: `interruptRoutine()`'s filter loop
+  reads through a still-NULL port pointer and returns before masking,
+  so one early edge storms forever. Real external comparators sit
+  quietly on a rail until there is signal - their hysteresis eats the
+  noise our physics models - so the model holds the pins idle until
+  the firmware has actually selected a phase.
+- **`FVT_LITTLEBEE_50_F031` defines `INVERTED_EXTI`**: its comparator
+  has the opposite output polarity, the firmware flips its edge
+  bookkeeping, and without the matching `inverted` flag on the model
+  the motor "spins" backwards at -543 rpm with a desync a second.
+
+The rest is family bookkeeping. The F031 rotates the timer roles (TIM3
+interval, TIM16/TIM2 trading capture and 20kHz loop per group) and its
+A/B groups capture the throttle on **TIM2 channel 3** - the capture
+timer model grew a channel parameter for it. Its DMA requests are
+remapped onto a five-channel controller through SYSCFG bits the
+platform hardwires, its SystemClock_Config polls the flash-latency
+readback (a register file where the F051 gets away with a tag), and it
+has 4K of SRAM. The firmware's EXTI handlers also write the pending
+register with the line *number* rather than a mask - a real quirk that
+works because `maskPhaseInterrupts()` does the actual clearing. The
+G031 is a G071 minus the comparators, TIM6 and TIM15 (TIM16 is the
+20kHz loop timer), with 8K of SRAM and its dshot deferral software
+interrupt on EXTI line 3 rather than 15. Its phase-A low-side FET pin
+(PB14) shares a line number with the phase-A BEMF input (PC14), and
+since EXTICR is stored but not honoured the generated overlay
+disconnects PB14 from the EXTI.
+
+### The GD32E230
+
+GigaDevice's Cortex-M23, and a faithful clone of the STM32F0
+generation: GPIO, the timer block including CCHP=BDTR, EXTI, the
+five-channel DMA, the FWDGT watchdog and the single CMP - bit-identical
+to the F051's COMP1 half at the same address, with the same
+input-select encodings and the same EXTI line 21 - all run against the
+existing STM32 models unchanged, under GD names (TIMERn is ST's
+TIM(n+1)). The two real divergences:
+
+- **the ADC is the F1-generation register file** (RSQ rank sequencer,
+  RDATA at 0x4C, CLB/RSTCLB self-clearing calibration) - the same
+  layout the CH32V203 has, so `AM32_WCH_Adc` serves. The GD part has
+  no factory calibration page; the firmware applies fixed datasheet
+  constants (1.43V at 25C, -4.3mV/C), which the .resc seeds as the
+  model's reference word.
+- **`GD32DEV_B_E230` is refused at generation**: that board wires a
+  phase's high side to the *complementary* TIMER0 output and
+  compensates with an inverted PWM mode on that one channel, a pairing
+  the bridge cannot represent. The other seven buildable E230 targets
+  use the straight mapping. (`CM_MINI_E230` exists in targets.h but
+  has no Makefile rule, so there is no firmware to run; and
+  `SKYSTARS_SL40_E230`'s LED strip rides a timer-PWM DMA chain rather
+  than the bit-banged GPIO the WS2812 decoder understands, so its LED
+  is not modelled.)
+
+`PA6_VOLTAGE` on `GD32DEV_A_E230` does not change the ADC channel
+setup - it swaps which DMA slot the firmware reads as voltage versus
+current, so the generator swaps which channel the model scales as
+which.
 
 ### One target is skipped
 
