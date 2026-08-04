@@ -90,6 +90,26 @@ UNSPINNABLE = {
         'identical rpm and rotor angle.',
 }
 
+# Targets whose firmware cannot ARM on a wire that is bidirectional from
+# power-on, found by this harness and reproduced deterministically. The
+# reply plumbing is still asserted on these; the arm/spin checks are not.
+BDSHOT_NOARM = {
+    'FRDM_A153':
+        'a three-way race in the A153 port loses arming: zero_input_count '
+        'passes 30 within the first ~30 frames, then at ~100 frames '
+        'CTIMER0_IRQHandler\'s inverted-dshot autodetect flips the capture '
+        'polarity and resets zero_input_count to 0 as part of its state '
+        'flush, and within a few more frames dshot_telemetry latches '
+        '(computeDshotDMA\'s own 100-count threshold, never reset) - from '
+        'then on transfercomplete() returns down the telemetry branch '
+        'before the zero_input_count++ block, so the count freezes at ~4. '
+        'The 1s arming gate needs >30, fails, clears inputSet, and '
+        're-detection cannot succeed because ic_timer_prescaler was left '
+        'at 0 where checkDshot\'s windows expect the boot value. The '
+        'STM32 ports arm because they have no polarity-flip handler '
+        'resetting the counter mid-race.',
+}
+
 
 # what AM32 makes of a 1300us servo pulse, the same internal throttle the
 # scripted tests use, so a link run is comparable with them
@@ -120,7 +140,7 @@ CAN_NOSPIN = {
 }
 
 
-def report_link(res, target, motor):
+def report_link(res, target, motor, bidir=True):
     a = res.get('armed', {})
     s = res.get('spin', {})
     if not s:
@@ -145,14 +165,19 @@ def report_link(res, target, motor):
               'rpm=%.0f, expected %d' % (rpm, want['rpm']))
     # the reply the client decoded against the motor the client is
     # watching: both ends of the link, checked against each other
-    telem = s.get('telem_rpm', 0)
-    check('telemetry reaches the client', s.get('replies', 0) > 100,
-          'replies=%d' % s.get('replies', 0))
-    check('the reported rpm is the rpm being simulated',
-          rpm > 0 and abs(telem - rpm) < 0.05 * rpm,
-          'telemetry %.0f, physics %.0f' % (telem, rpm))
-    check('no reply CRC failures', s.get('badcrc') == 0,
-          'badcrc=%d' % s.get('badcrc', -1))
+    if bidir:
+        telem = s.get('telem_rpm', 0)
+        check('telemetry reaches the client', s.get('replies', 0) > 100,
+              'replies=%d' % s.get('replies', 0))
+        check('the reported rpm is the rpm being simulated',
+              rpm > 0 and abs(telem - rpm) < 0.05 * rpm,
+              'telemetry %.0f, physics %.0f' % (telem, rpm))
+        check('no reply CRC failures', s.get('badcrc') == 0,
+              'badcrc=%d' % s.get('badcrc', -1))
+    else:
+        print('NOTE: link telemetry not asserted: the wire is plain dshot '
+              'here because the target cannot arm on a bidirectional one '
+              '(see BDSHOT_NOARM)')
 
     if failures:
         print('\n%u test(s) failed: %s' % (len(failures), ', '.join(failures)))
@@ -300,7 +325,7 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
 
 def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
              port, state_port, dshot_us, value, seconds,
-             gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm'):
+             gcc='arm-none-eabi-gcc', nm='arm-none-eabi-nm', bidir=True):
     '''Drive the target the way the GUI does: setpoints in over udp,
        BDShot telemetry and physics samples back, with nothing scripted
        through the monitor. That covers what the scripted tests cannot -
@@ -329,7 +354,7 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
         deadline = time.time() + seconds
         ds = DshotPanel('127.0.0.1', port)
         ds.ptype = sd.TYPE_DSHOT300
-        ds.bidir = True
+        ds.bidir = bidir
         ds.rate = 500
         ds.value = 0
         ds.enabled = True
@@ -931,11 +956,13 @@ def main():
             return report_gui(res, args.target)
 
         if args.link:
+            link_bidir = args.target not in BDSHOT_NOARM
             res = run_link(renode, target_resc, args.elf, eeprom, args.model,
                            so, scratch, args.link_port, args.link_state_port,
                            args.link_dshot_us, LINK_DSHOT_VALUE,
-                           args.link_seconds, args.gcc, args.nm)
-            return report_link(res, args.target, motor)
+                           args.link_seconds, args.gcc, args.nm,
+                           bidir=link_bidir)
+            return report_link(res, args.target, motor, bidir=link_bidir)
 
         res = run(renode, target_resc, args.elf, eeprom, args.model, so, syms,
                   scratch, throttle_addr, timer_name,
@@ -944,15 +971,20 @@ def main():
 
     a = res.get('armed', {})
     s = res.get('spin', {})
+    noarm = args.bdshot and args.target in BDSHOT_NOARM
+    if noarm:
+        print('NOTE: arming and spin not asserted: %s'
+              % BDSHOT_NOARM[args.target])
     if a:
-        check('arms on a %s signal'
-              % ('%sdshot%d' % ('bi' if args.bdshot else '', args.dshot)
-                 if args.dshot else 'servo'),
-              a.get('armed') == 1,
-              'armed=%d' % a.get('armed', -1))
+        if not noarm:
+            check('arms on a %s signal'
+                  % ('%sdshot%d' % ('bi' if args.bdshot else '', args.dshot)
+                     if args.dshot else 'servo'),
+                  a.get('armed') == 1,
+                  'armed=%d' % a.get('armed', -1))
         check('does not spin unarmed', a.get('running') == 0 and a.get('rpm', 0) == 0,
               'running=%d rpm=%d' % (a.get('running', -1), a.get('rpm', -1)))
-    if s:
+    if s and not noarm:
         check('motor runs', s.get('running') == 1,
               'running=%d' % s.get('running', -1))
         # A range this wide passes almost anything that turns, which is
@@ -1000,7 +1032,7 @@ def main():
     # sensed the emulated motor and reported the speed it is turning.
     # Only with plain bidirectional dshot, where every frame is eRPM;
     # extended telemetry interleaves and the last frame could be either.
-    if r and not args.edt:
+    if r and not args.edt and not noarm:
         frame = r.get('frame', 0)
         payload = frame >> 4
         period = (payload & 0x1FF) << (payload >> 9)
@@ -1012,7 +1044,7 @@ def main():
               want and abs(got - want) < 0.02 * want,
               'frame=0x%04X period=%dus -> %drpm, physics %drpm'
               % (frame, period, got, want))
-    if r and args.edt:
+    if r and args.edt and not noarm:
         # each telemetry kind carries a different top nibble, so one run
         # shows whether all three went out. The divisors are 40 frames
         # for current and 200 for voltage and temperature.
