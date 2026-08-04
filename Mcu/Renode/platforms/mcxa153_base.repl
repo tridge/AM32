@@ -174,8 +174,9 @@ flexpwm0: Timers.MCXA_FlexPwm @ sysbus 0x400A9000
 lpspi0: SPI.MCXA_Lpspi @ sysbus 0x4009C000
     IRQ -> nvic@28
 
-// APA102 LED strip
+// APA102 LED strip; not the reply wire
 lpspi1: SPI.MCXA_Lpspi @ sysbus 0x4009D000
+    decodesReplies: false
 
 // declared by the target overlay: cmpmux + cmp0/cmp1 (phase map from
 // targets.h), adc0 (channel and scaling arguments), throttle, bridge,

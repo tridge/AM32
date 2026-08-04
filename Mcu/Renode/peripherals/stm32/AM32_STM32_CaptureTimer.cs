@@ -285,6 +285,10 @@ namespace Antmicro.Renode.Peripherals.Timers
             UpdateIrq();
         }
 
+        // always the reply carrier when present: the STM32 families have
+        // exactly one capture timer and it owns the wire
+        public bool DecodesReplies => true;
+
         // The last bidirectional dshot reply this timer actually drove on
         // the wire, GCR decoded back to the 16 bit frame: 12 bits of
         // eRPM-or-EDT payload and a 4 bit CRC. Decoded from the levels

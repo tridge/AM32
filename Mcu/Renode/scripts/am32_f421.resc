@@ -16,7 +16,7 @@ $platform?=@none
 # anything implements it or looks one up
 include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
-include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_EXTI.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_Exti.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
@@ -43,12 +43,11 @@ sysbus LoadBinary $eeprom $eeprom_addr
 # The Artery temperature sensor has no factory calibration page: the
 # firmware applies fixed constants, getConvertedDegrees() being
 # (12800 - raw*33000/4096)/-42 + 25 - a POSITIVE 4.2mV/C slope where the
-# WCH/GD sensors fall with temperature. The ADC model inverts its fixed
-# -4.3mV/C formula around a reference word (degrees high half,
-# millivolts low half), so only the reference point itself can be made
-# exact: 38C (the physics default) at 1337mV lands the firmware's
-# truncating integer math on 38 exactly, and excursions from there read
-# mirrored at ~-1C/C. Exact until the physics models heating.
+# WCH/GD sensors fall with temperature. The ADC model inverts that
+# around a reference word (degrees high half, millivolts low half) with
+# the family's +4.2mV/C slope: 38C (the physics default) at 1337mV
+# lands the firmware's truncating integer math on 38 exactly, and other
+# temperatures track to within the truncation (25C reads 25).
 sysbus WriteDoubleWord 0x1FFFF720 0x00260539
 
 # The M4 has a VTOR and SystemInit() points it at 0x08001000 itself;

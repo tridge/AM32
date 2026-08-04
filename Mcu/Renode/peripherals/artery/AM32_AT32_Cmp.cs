@@ -120,7 +120,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private bool PolarityInverted => (regs[ctrlsts / 4] & polarityBit) != 0;
 
-        private bool Level => PolarityInverted ? !output : output;
+        // a disabled comparator drives nothing, as on the other
+        // families' models; both firmwares enable before use
+        private bool Level => Enabled && (PolarityInverted ? !output : output);
 
         public uint ReadDoubleWord(long offset)
         {

@@ -102,10 +102,10 @@ BDSHOT_NOARM = {
         'flush, and within a few more frames dshot_telemetry latches '
         '(computeDshotDMA\'s own 100-count threshold, never reset) - from '
         'then on transfercomplete() returns down the telemetry branch '
-        'before the zero_input_count++ block, so the count freezes at ~4. '
-        'The 1s arming gate needs >30, fails, clears inputSet, and '
-        're-detection cannot succeed because ic_timer_prescaler was left '
-        'at 0 where checkDshot\'s windows expect the boot value. The '
+        'before the zero_input_count++ block, so the count freezes low. '
+        'The 1s arming gate needs >30, fails, and clears inputSet; '
+        're-detection can succeed, but with dshot_telemetry still latched '
+        'the counter can never rebuild, so the cycle repeats forever. The '
         'STM32 ports arm because they have no polarity-flip handler '
         'resetting the counter mid-race.',
 }
