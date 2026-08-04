@@ -1,0 +1,164 @@
+// STM32G031 common to every AM32 G031 target. Not loadable on its own:
+// the capture timer, the ADC, the BEMF pins, the bridge and the
+// throttle wiring come from a generated target overlay.
+//
+// A pared-down sibling of stm32g071_base.repl: same G0 peripheral
+// generation, but this die has NO comparators (the boards put external
+// comparator chips on GPIO pins, watched through EXTI - see
+// AM32_ExtiBemf), no TIM6/TIM7/TIM15, a five-channel DMA, and 8K of
+// SRAM. TIM16 is the 20kHz loop timer here, where the G071 uses TIM6.
+
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x10000
+
+ram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x2000
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 64000000
+    IRQ -> cpu@0
+
+// the G0 EXTI layout (IMR1 at 0x80, split rising/falling pending);
+// see the G071 base for why the stock F4 model cannot serve. EXTICR
+// is stored, not honoured: every port's pin n reaches line n, which
+// is why the generated overlay disconnects the one output pin that
+// would collide with a BEMF line.
+exti: IRQControllers.AM32_STM32G0_EXTI @ sysbus 0x40021800
+    numberOfOutputLines: 34
+    firstDirectLine: 19
+    [0, 1] -> nvicInput5@[0, 1]
+    [2, 3] -> nvicInput6@[0, 1]
+    [4-15] -> nvicInput7@[0-11]
+
+nvicInput5: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@5
+
+nvicInput6: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@6
+
+nvicInput7: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 12
+    -> nvic@7
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0"
+    nvic: nvic
+
+usart1: UART.STM32F7_USART @ sysbus 0x40013800
+    frequency: 64000000
+    IRQ -> nvic@27
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x50000000, +0x400>
+    modeResetValue: 0xEBFFFFFF
+    pullUpPullDownResetValue: 0x24000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x50000400, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x50000800, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+// dead "stspin specific" writes reach PF6/PF7 with the port clock off;
+// the port exists so they land somewhere silent
+gpioPortF: GPIOPort.STM32_GPIOPort @ sysbus <0x50001400, +0x400>
+    modeResetValue: 0xFFFFFFFF
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+// motor PWM, the same model the other families use
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 64000000
+    0 -> nvic@13
+    1 -> nvic@14
+
+// the free-running 2MHz interval timer
+timer2: Timers.STM32_Timer @ sysbus 0x40000000
+    frequency: 64000000
+    initialLimit: 0xFFFFFFFF
+    -> nvic@15
+
+// timer3 (capture) and timer16 (20kHz loop) are declared by the target
+// overlay: TIM3 is the capture timer on the G031 groups, and the
+// stock-timer mechanism declares whichever of the pair is not capturing.
+
+timer14: Timers.STM32_Timer @ sysbus 0x40002000
+    frequency: 64000000
+    initialLimit: 0xFFFF
+    -> nvic@19
+
+timer17: Timers.STM32_Timer @ sysbus 0x40014800
+    frequency: 64000000
+    initialLimit: 0xFFFF
+    -> nvic@22
+
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    data = {'hsion': 1, 'pllon': 0, 'sw': 0, 'lsion': 0}
+
+if request.IsWrite:
+    if request.Offset == 0x0:
+        # HSION bit 8, PLLON bit 24
+        data['hsion'] = (request.Value >> 8) & 0x1
+        data['pllon'] = (request.Value >> 24) & 0x1
+    elif request.Offset == 0x8:
+        data['sw'] = request.Value & 0x7
+    elif request.Offset == 0x60:
+        data['lsion'] = request.Value & 0x1
+elif request.IsRead:
+    if request.Offset == 0x0:
+        # HSIRDY(10) <- HSION(8), PLLRDY(25) <- PLLON(24)
+        request.Value = (data['hsion'] << 8) | (data['hsion'] << 10) | (data['pllon'] << 25)
+    elif request.Offset == 0x8:
+        # SWS[5:3] mirrors SW[2:0]
+        request.Value = data['sw'] | (data['sw'] << 3)
+    elif request.Offset == 0x60:
+        # LSIRDY(1) <- LSION(0)
+        request.Value = (data['lsion'] << 1)
+    else:
+        request.Value = 0
+'''
+
+// five channels on this die where the G071 has seven
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 5
+
+// DMAMUX request routing is hardwired by the platform, as on the G071
+dmamux: Miscellaneous.AM32_RegisterFile @ sysbus <0x40020800, +0x400>
+
+syscfg: Miscellaneous.AM32_RegisterFile @ sysbus <0x40010000, +0x200>
+
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+flash_ctrl: MTD.STM32F4_FlashController @ sysbus 0x40022000
+    flash: flash
+
+// factory calibration page: the 1kHz ADC path reads the temperature
+// calibration halfwords at 0x1FFF75A8 and 0x1FFF75CA
+systemMemory: Memory.MappedMemory @ sysbus 0x1FFF7000
+    size: 0x1000
+
+sysbus:
+    init:
+        Tag <0x40002C00, 0x40002FFF> "WWDG"
+        Tag <0x40004400, 0x400047FF> "USART2"
+        Tag <0x40005400, 0x400057FF> "I2C1"
+        Tag <0x40005800, 0x40005BFF> "I2C2"
+        Tag <0x40007000, 0x400073FF> "PWR"
+        Tag <0x40013000, 0x400133FF> "SPI1"
+        Tag <0x40015800, 0x40015BFF> "DBG"
+        Tag <0x40023000, 0x400233FF> "CRC"
