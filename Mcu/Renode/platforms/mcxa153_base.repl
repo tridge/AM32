@@ -1,0 +1,188 @@
+// NXP MCXA153 common platform for the AM32 FRDM_A153 target. Nothing
+// on this part is an STM32 descendant: the models under
+// peripherals/nxp/ are all new, and this base carries python stubs for
+// the pure handshake blocks (clock/power controllers whose only
+// observable behaviour is ready bits).
+//
+// The flash driver lives in masked boot ROM reached through a
+// function-pointer tree at 0x03003FE0; the .resc loads a small thumb
+// blob compiled by gen_target.py into the rom region and writes the
+// tree, so save_flash_nolib()'s ROM calls execute real code.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 96000000
+    IRQ -> cpu@0
+
+// 128K flash at 0: bootloader region below 0x4000, app vectors at
+// 0x4000, eeprom page at 0xE000
+flash: Memory.MappedMemory @ sysbus 0x0
+    size: 0x20000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x6000
+
+sramx: Memory.MappedMemory @ sysbus 0x04000000
+    size: 0x3000
+
+// the boot ROM window: the API tree at 0x03003FE0 and the emulation's
+// flash-driver blob, both written by the .resc
+rom: Memory.MappedMemory @ sysbus 0x03000000
+    size: 0x8000
+
+// MRCC + SYSCON + GLIKEY share this window. Everything is
+// store/readback; the _SET registers at +4 OR into their base
+// registers, which is all the SDK-style clock/reset enables need.
+mrcc: Python.PythonPeripheral @ sysbus 0x40091000
+    size: 0x1000
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+sets = {0x04: 0x00, 0x14: 0x10, 0x44: 0x40, 0x54: 0x50}
+if request.IsWrite:
+    if request.Offset in sets:
+        base = sets[request.Offset]
+        regs[base] = regs.get(base, 0) | request.Value
+    else:
+        regs[request.Offset] = request.Value
+elif request.IsRead:
+    request.Value = regs.get(request.Offset, 0)
+'''
+
+// SCG: FIRC/SIRC valid bits mirror their enables, CSR mirrors RCCR
+scg: Python.PythonPeripheral @ sysbus 0x4008F000
+    size: 0x1000
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+if request.IsWrite:
+    regs[request.Offset] = request.Value
+elif request.IsRead:
+    if request.Offset == 0x10:
+        # CSR: the selected source is always already switched
+        request.Value = regs.get(0x14, 0)
+    elif request.Offset in (0x200, 0x300):
+        # SIRCCSR/FIRCCSR: VLD (bit 24) always follows along
+        request.Value = regs.get(request.Offset, 0) | (1 << 24)
+    else:
+        request.Value = regs.get(request.Offset, 0)
+'''
+
+// SPC: the LDO/SRAM voltage handshakes complete instantly
+spc: Python.PythonPeripheral @ sysbus 0x40090000
+    size: 0x1000
+    initable: true
+    script: '''
+if request.IsInit:
+    regs = {}
+if request.IsWrite:
+    regs[request.Offset] = request.Value
+elif request.IsRead:
+    if request.Offset == 0x10:
+        # SC.BUSY reads clear
+        request.Value = 0
+    elif request.Offset == 0x40:
+        # SRAMCTL.ACK (31) follows REQ (30)
+        v = regs.get(0x40, 0)
+        request.Value = v | ((v >> 30 & 1) << 31)
+    else:
+        request.Value = regs.get(request.Offset, 0)
+'''
+
+// UTICK: the delay unit; INTR always set, so delayMicros() returns at
+// once - the emulation's equivalent of skip_delays.py for this family
+utick: Python.PythonPeripheral @ sysbus 0x4000B000
+    size: 0x100
+    initable: true
+    script: '''
+if request.IsWrite:
+    pass
+elif request.IsRead:
+    if request.Offset == 0x4:
+        request.Value = 1
+    else:
+        request.Value = 0
+'''
+
+fmu: Miscellaneous.AM32_RegisterFile @ sysbus <0x40095000, +0x1000>
+
+mbc: Miscellaneous.AM32_RegisterFile @ sysbus <0x4008E000, +0x1000>
+
+inputmux: Miscellaneous.AM32_RegisterFile @ sysbus <0x40001000, +0x1000>
+
+port0: Miscellaneous.AM32_RegisterFile @ sysbus <0x400BC000, +0x1000>
+
+port1: Miscellaneous.AM32_RegisterFile @ sysbus <0x400BD000, +0x1000>
+
+port2: Miscellaneous.AM32_RegisterFile @ sysbus <0x400BE000, +0x1000>
+
+port3: Miscellaneous.AM32_RegisterFile @ sysbus <0x400BF000, +0x1000>
+
+// the watchdog: feed writes accepted, never resets
+wwdt: Miscellaneous.AM32_RegisterFile @ sysbus <0x4000C000, +0x1000>
+
+lpuart1: Miscellaneous.AM32_RegisterFile @ sysbus <0x400A0000, +0x1000>
+
+// GPIO0-3: only byte reads of PDR[n] at +0x60 matter (the input pin
+// state); the nxp GPIO model drives them from wired connections
+gpio0: Miscellaneous.MCXA_Gpio @ sysbus <0x40102000, +0x1000>
+
+gpio1: Miscellaneous.MCXA_Gpio @ sysbus <0x40103000, +0x1000>
+
+gpio2: Miscellaneous.MCXA_Gpio @ sysbus <0x40104000, +0x1000>
+
+gpio3: Miscellaneous.MCXA_Gpio @ sysbus <0x40105000, +0x1000>
+
+// eDMA: CH0 dshot capture, CH1 ADC FIFO, CH2 UART TX. The peripherals'
+// request lines arrive with the eDMA request-source id as the GPIO
+// number, which CH_MUX is matched against.
+edma: DMA.MCXA_Edma @ sysbus 0x40080000
+    0 -> nvic@2
+    1 -> nvic@3
+    2 -> nvic@4
+
+// dshot/servo capture: FRO_HF 192MHz through the /2 functional divider
+ctimer0: Timers.MCXA_Ctimer @ sysbus 0x40004000
+    frequency: 96000000
+    0 -> nvic@39
+    1 -> edma@31
+
+// commutation timer, FRO_12M (PR takes it to 2MHz)
+ctimer1: Timers.MCXA_Ctimer @ sysbus 0x40005000
+    frequency: 12000000
+    0 -> nvic@40
+
+// interval timer, FRO_12M
+ctimer2: Timers.MCXA_Ctimer @ sysbus 0x40006000
+    frequency: 12000000
+    0 -> nvic@41
+
+// the 20kHz loop timer, CLK_1M prescaler-bypassed
+lptmr0: Timers.MCXA_Lptmr @ sysbus 0x400AB000
+    IRQ -> nvic@55
+
+// the three-phase PWM block; the bridge reads it as an IAM32PwmSource
+flexpwm0: Timers.MCXA_FlexPwm @ sysbus 0x400A9000
+
+// bidirectional dshot reply carrier (and its Reply* decode)
+lpspi0: SPI.MCXA_Lpspi @ sysbus 0x4009C000
+    IRQ -> nvic@28
+
+// APA102 LED strip
+lpspi1: SPI.MCXA_Lpspi @ sysbus 0x4009D000
+
+// declared by the target overlay: cmpmux + cmp0/cmp1 (phase map from
+// targets.h), adc0 (channel and scaling arguments), throttle, bridge,
+// guilink
+
+sysbus:
+    init:
+        Tag <0x40002000, 0x40002FFF> "OSTIMER"
+        Tag <0x4000A000, 0x4000AFFF> "WWDT1"
+        Tag <0x40096000, 0x40096FFF> "SMSCM"

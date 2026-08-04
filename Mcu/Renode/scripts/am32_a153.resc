@@ -1,0 +1,73 @@
+:name: AM32 A153
+:description: boots an AM32 NXP MCXA153 firmware ELF
+
+# Common to the A153 family (one target today: FRDM_A153). Do not
+# include this directly - include a generated per-target .resc, which
+# sets $platform and comes here. See am32_f051.resc for what the
+# variables mean.
+#
+# Nothing on this part is an STM32 descendant: the peripherals under
+# peripherals/nxp/ are all new models, the bridge reads the FlexPWM
+# directly (IAM32PwmSource) instead of decoding pins, and the
+# bidirectional dshot reply leaves through LPSPI0, whose model carries
+# the Reply* decode the capture timer holds on other families. The
+# flash driver is a compiled blob in the boot-ROM window; the generated
+# per-target script loads it and writes the API tree after this file
+# has built the machine.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator/pwm-source interfaces have to
+# exist before anything implements them or looks them up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Gpio.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Edma.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Ctimer.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Lptmr.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_FlexPwm.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Lpcmp.cs
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Lpspi.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+# the bridge and guilink name the STM32 timer types even where a pwm
+# source replaces them, so those compile here too
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values
+include $repo/Mcu/Renode/peripherals/nxp/MCXA_Lpadc.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+# the settings page inside the single 128K flash bank
+$eeprom_addr?=0x0000E000
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# The app is linked above the 16K bootloader region. The M33 has a
+# VTOR and initAfterJump() sets it, but the reset vector needs the CPU
+# pointed at the app table before that runs.
+$app_base?=0x00004000
+cpu VectorTableOffset $app_base
+
+# ... and again after every reset (see am32_f051.resc)
+macro reset
+"""
+    cpu VectorTableOffset $app_base
+"""
+
+# 96MHz Cortex-M33
+cpu PerformanceInMips 96
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
