@@ -22,6 +22,7 @@
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Timers;
@@ -42,10 +43,21 @@ namespace Antmicro.Renode.Peripherals.Timers
         // arrives on. Without them a capture happens whatever the pin is
         // configured as, so firmware that never put it in alternate mode
         // or picked the wrong AF still decodes perfectly.
+        // channel selects which capture/compare channel the throttle
+        // rides on: 1 everywhere except the F031's TIM2_CH3 groups
         public AM32_STM32_CaptureTimer(IMachine machine, ulong frequency = 48000000,
                                        ulong inputBase = 0, int inputPin = 0,
-                                       uint inputAf = 0)
+                                       uint inputAf = 0, int channel = 1)
         {
+            if(channel < 1 || channel > 4)
+            {
+                throw new RecoverableException("channel must be 1..4");
+            }
+            this.channel = channel;
+            ccmrOffset = channel <= 2 ? 0x18 : 0x1C;
+            ccsShift = 8 * ((channel - 1) & 1);
+            ccerShift = 4 * (channel - 1);
+            ccrOffset = 0x34 + 4 * (channel - 1);
             this.machine = machine;
             this.inputBase = inputBase;
             this.inputPin = inputPin;
@@ -76,9 +88,9 @@ namespace Antmicro.Renode.Peripherals.Timers
                 regs[i] = 0;
             }
             regs[ARR / 4] = MaxCount;
-            // CC1S = 01: reset into input capture, so a timer that has
+            // CCxS = 01: reset into input capture, so a timer that has
             // not been programmed yet does not drive the shared wire
-            regs[CCMR1 / 4] = 1;
+            regs[ccmrOffset / 4] = 1u << ccsShift;
             counter.Enabled = false;
             counter.Divider = 1;
             counter.Limit = MaxCount + 1;
@@ -126,6 +138,23 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 return;
             }
+            if(offset == ccmrOffset)
+            {
+                regs[idx] = value;
+                if(!OutputMode)
+                {
+                    // the reply is finished; decode what we drove, then
+                    // release the wire
+                    DecodeReply();
+                    ResetReply();
+                    Connections[OutputLine].Set(true);
+                }
+                else
+                {
+                    ResetReply();
+                }
+                return;
+            }
             switch(offset)
             {
             case CR1:
@@ -143,21 +172,6 @@ namespace Antmicro.Renode.Peripherals.Timers
                     counter.Divider = (ulong)((regs[PSC / 4] & MaxCount) + 1);
                     counter.Limit = (regs[ARR / 4] & MaxCount) + 1;
                     counter.Value = 0;
-                }
-                return;
-            case CCMR1:
-                regs[idx] = value;
-                if(!OutputMode)
-                {
-                    // the reply is finished; decode what we drove, then
-                    // release the wire
-                    DecodeReply();
-                    ResetReply();
-                    Connections[OutputLine].Set(true);
-                }
-                else
-                {
-                    ResetReply();
                 }
                 return;
             case ARR:
@@ -200,14 +214,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 return;
             }
-            // CCER: CC1P selects falling, CC1NP with CC1P means both
-            var ccer = regs[CCER / 4];
+            // CCER: CCxP selects falling, CCxNP with CCxP means both
+            var ccer = regs[CCER / 4] >> ccerShift;
             var wantRising = (ccer & CC1P) == 0 || (ccer & CC1NP) != 0;
             var wantFalling = (ccer & CC1P) != 0 || (ccer & CC1NP) != 0;
             // the CH32V203's route to both-edge capture: IC1 mapped to
             // TRC (CC1S=11) with the TI1 edge detector as the trigger
             // (SMCR TS=100), CC1P left at rising (Mcu/v203/Src/IO.c)
-            if((regs[CCMR1 / 4] & CC1S) == CC1S
+            if(((regs[ccmrOffset / 4] >> ccsShift) & CC1S) == CC1S
                && (regs[SMCR / 4] & TsMask) == TsTi1Ed)
             {
                 wantRising = true;
@@ -223,10 +237,10 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private void DoCapture(uint value)
         {
-            regs[CCR1 / 4] = value;
-            regs[SR / 4] |= CC1IF;
+            regs[ccrOffset / 4] = value;
+            regs[SR / 4] |= 1u << channel;
             UpdateIrq();
-            if((regs[DIER / 4] & CC1DE) != 0)
+            if((regs[DIER / 4] & (1u << (8 + channel))) != 0)
             {
                 // edge-triggered request; the DMA samples the line
                 Connections[DmaRequestLine].Blink();
@@ -251,19 +265,19 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 return;
             }
-            var level = (regs[CCR1 / 4] & MaxCount) != 0;
-            if((regs[CCER / 4] & CC1P) != 0)
+            var level = (regs[ccrOffset / 4] & MaxCount) != 0;
+            if(((regs[CCER / 4] >> ccerShift) & CC1P) != 0)
             {
                 level = !level;
             }
             Connections[OutputLine].Set(level && OutputEnabled);
             RecordReplyBit(level && OutputEnabled);
-            if((regs[DIER / 4] & CC1DE) != 0)
+            if((regs[DIER / 4] & (1u << (8 + channel))) != 0)
             {
                 // ask the DMA for the next bit
                 Connections[DmaRequestLine].Blink();
             }
-            regs[SR / 4] |= CC1IF;
+            regs[SR / 4] |= 1u << channel;
             UpdateIrq();
         }
 
@@ -417,13 +431,13 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         // CC1S = 00 means channel 1 is an output; receiveDshotDma() sets
         // it to 01 for input capture
-        private bool OutputMode => (regs[CCMR1 / 4] & CC1S) == 0;
+        private bool OutputMode => ((regs[ccmrOffset / 4] >> ccsShift) & CC1S) == 0;
 
-        private bool OutputEnabled => (regs[CCER / 4] & CC1E) != 0;
+        private bool OutputEnabled => ((regs[CCER / 4] >> ccerShift) & CC1E) != 0;
 
         // CC1E gates the capture as well as the output: with the channel
         // disabled the pin is not connected to CCR1 at all
-        private bool CaptureEnabled => (regs[CCER / 4] & CC1E) != 0;
+        private bool CaptureEnabled => ((regs[CCER / 4] >> ccerShift) & CC1E) != 0;
 
         // the pin only reaches the timer in alternate mode with the AF
         // that selects this timer's channel 1. inputBase 0 means the
@@ -491,6 +505,11 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const int OutputLine = 2;
 
         private readonly ulong frequency;
+        private readonly int channel;
+        private readonly long ccmrOffset;
+        private readonly int ccsShift;
+        private readonly int ccerShift;
+        private readonly long ccrOffset;
         private readonly IMachine machine;
         private readonly ulong inputBase;
         private readonly int inputPin;
