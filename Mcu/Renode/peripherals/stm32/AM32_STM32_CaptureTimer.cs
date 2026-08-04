@@ -204,6 +204,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             var ccer = regs[CCER / 4];
             var wantRising = (ccer & CC1P) == 0 || (ccer & CC1NP) != 0;
             var wantFalling = (ccer & CC1P) != 0 || (ccer & CC1NP) != 0;
+            // the CH32V203's route to both-edge capture: IC1 mapped to
+            // TRC (CC1S=11) with the TI1 edge detector as the trigger
+            // (SMCR TS=100), CC1P left at rising (Mcu/v203/Src/IO.c)
+            if((regs[CCMR1 / 4] & CC1S) == CC1S
+               && (regs[SMCR / 4] & TsMask) == TsTi1Ed)
+            {
+                wantRising = true;
+                wantFalling = true;
+            }
             var rising = value && !wasSet;
             var falling = !value && wasSet;
             if((rising && wantRising) || (falling && wantFalling))
@@ -452,6 +461,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         private uint CurrentCount => (uint)(counter.Value & MaxCount);
 
         private const long CR1 = 0x00;
+        private const long SMCR = 0x08;
         private const long DIER = 0x0C;
         private const long SR = 0x10;
         private const long EGR = 0x14;
@@ -471,6 +481,8 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const uint CC1P = 1u << 1;
         private const uint CC1NP = 1u << 3;
         private const uint CC1S = 3u << 0;
+        private const uint TsMask = 7u << 4;
+        private const uint TsTi1Ed = 4u << 4;
         private const uint MaxCount = 0xFFFF;
 
         private const int DmaRequestLine = 0;
