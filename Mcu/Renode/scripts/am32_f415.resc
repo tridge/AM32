@@ -1,0 +1,86 @@
+:name: AM32 F415
+:description: boots an AM32 AT32F415 firmware ELF
+
+# Common to every AT32F415 target. Do not include this directly -
+# include a generated per-target .resc, which sets $platform and then
+# comes here. See am32_f051.resc for what the variables mean; the
+# Artery specifics are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_Exti.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/artery/AM32_AT32_Cmp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values; the
+# Artery ADC is the F1-generation register file the WCH model implements
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Adc.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+# the mcast CAN bridge the _CAN target overlays declare
+include $repo/Mcu/Renode/peripherals/common/AM32_CanMcast.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+# set by the generated per-target script: most F415 targets keep their
+# settings at 0x08007C00, the TBS 12S boards at 0x0801F800, and a
+# DroneCAN build links at 0x08004000 above the 16K CAN bootloader
+$eeprom_addr?=0x08007C00
+$app_base?=0x08001000
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# No factory temperature calibration on this part: getConvertedDegrees()
+# applies fixed constants - (12600 - raw*33000/4096)/-42 + 5, i.e.
+# 1344mV at 25C rising 4.2mV/C, the OPPOSITE slope to the WCH and GD
+# sensors. The ADC model inverts a linear formula around a reference
+# word - degrees in the high half, millivolts in the low half - with the
+# slope set per platform (tempSlopeTenthsMvPerC 42 in the overlay). The
+# reference is seeded 1mV high (1345 rather than 1344): the firmware's
+# fixed-point conversion truncates, and the exact constant lands
+# integer temperatures half a count low.
+sysbus WriteDoubleWord 0x1FFFF720 0x00190541
+
+# The flash-size halfword: sector_size() in Mcu/f415/Src/eeprom.c reads
+# it to pick 1K sectors (<=128K) over the 256K dev board's 2K. 128
+# covers both the 64K and 128K ESC parts.
+sysbus WriteWord 0x1FFFF7E0 128
+
+# SystemInit() points the VTOR at the app itself, but the reset vector
+# still needs to be fetched through it before that runs.
+cpu VectorTableOffset $app_base
+
+# ... and again after every reset: the firmware reboots itself on signal
+# loss (and DroneCAN's RestartNode does the same on request), and Renode
+# restores the CPU's default vector table at 0 when it resets; nothing
+# is mapped there but the empty bootloader region.
+macro reset
+"""
+    cpu VectorTableOffset $app_base
+"""
+
+
+# NOT one instruction per cycle: 144MHz from 4-wait-state flash retires
+# well under that. The number matters beyond realism - see the L431
+# note about the dshot capture-window alignment, which is what pins the
+# other slow-flash families' values too.
+cpu PerformanceInMips 96
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
