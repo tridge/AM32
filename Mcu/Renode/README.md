@@ -14,11 +14,12 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Eight MCU families are supported: F051, F031, G071, G031, L431,
-G431, the RISC-V CH32V203 and the GigaDevice GD32E230**, covering the
-52 F051, 3 F031, 54 G071, 1 G031, 18 L431, 6 G431, 1 V203 and 8 E230
-targets with no per-target file to write - the platform is generated
-from
+**Nine MCU families are supported: F051, F031, G071, G031, L431,
+G431, the RISC-V CH32V203, the GigaDevice GD32E230 and the NXP
+MCXA153**, covering the
+52 F051, 3 F031, 54 G071, 1 G031, 18 L431, 6 G431, 1 V203, 8 E230 and
+1 A153 targets with no per-target file to write - the platform is
+generated from
 `Inc/targets.h` on demand. What differs between the families is a
 table in `gen_target.py`, not a second code path. The `_CAN` targets
 run their DroneCAN firmware on an emulated CAN peripheral - the
@@ -376,6 +377,68 @@ TIM(n+1)). The two real divergences:
 setup - it swaps which DMA slot the firmware reads as voltage versus
 current, so the generator swaps which channel the model scales as
 which.
+
+### The NXP MCXA153
+
+Nothing on this part descends from an STM32, so every peripheral model
+under `peripherals/nxp/` is new: eDMA (TCD engine, with the 3-bit
+source-address modulo that makes the capture channel alternate between
+CTIMER0's two capture registers inside one 8-byte window), the
+LPC-lineage CTIMER, the LPTMR 20kHz loop timer, the FlexPWM, the LPCMP
+pair, the LPADC and the LPSPI. Four structural differences from every
+other family:
+
+- **the bridge reads the PWM block directly instead of decoding
+  pins.** A153 commutation never touches a GPIO mode register: the
+  phase states live entirely in the FlexPWM's MASK/DTSRCSEL/OUTEN
+  registers, latched by SM0's CTRL2.FORCE strobe. The FlexPWM model
+  decodes them into the SITL's five phase states and hands them to the
+  bridge through `IAM32PwmSource`; when one of those is present the
+  bridge skips the whole GPIO+timer decode.
+- **the comparators are two separate peripherals with separate NVIC
+  lines.** The firmware commutates by enabling exactly one of them and
+  retargeting its minus-input mux, so the phase key is (unit, MSEL) -
+  A and C share CMP0 on different inputs, B is CMP1. A small
+  `MCXA_LpcmpMux` hub owns the phase map and presents the pair to the
+  bridge as one `IAM32Comparator`.
+- **the bidirectional dshot reply leaves through the SPI.**
+  `sendDshotDma()` gray-folds the whole 20-bit GCR into 21 wire levels
+  and writes them to LPSPI0's TDR in one go, where the timer families
+  feed a DMA one level per period. The LPSPI model undoes the fold
+  (`w ^ (w >> 1)`) and carries the same `Reply*` decode surface the
+  capture timers do, now behind `IAM32ReplySource` so the guilink and
+  the test runner find whichever the platform has.
+- **the flash driver is masked boot ROM.** `save_flash_nolib()` calls
+  through a function-pointer tree at 0x03003FE0; there is no
+  memory-mapped flash controller to model, so the generator compiles a
+  small thumb blob (`sim/mcxa_rom_api.c`) with the firmware's own
+  toolchain, loads it into the ROM window and writes the API tree and
+  driver table with the symbol addresses read back from the ELF.
+
+One modelling lesson cost a debugging session: CTIMER0's MR1 is an
+interrupt-without-reset match (the 10us idle-line timeout), and
+modelling it as the counter's periodic limit wrapped TC every 50 ticks
+- which corrupted every capture into the 0-50 range and, worse, fired
+the 10us handler continuously, whose pin sampling then falsely
+triggered the firmware's inverted-dshot autodetect. It is now a
+one-shot rearmed at every point TC restarts from zero while the
+counter free-runs.
+
+The A153 also handed the harness its first firmware find on this
+family: **bidirectional dshot from power-on cannot arm** (servo and
+plain dshot both arm and spin). Three counters race: `zero_input_count`
+passes the arming threshold within ~30 frames, the A153-only
+inverted-dshot autodetect in `CTIMER0_IRQHandler` then flips the
+capture polarity at ~100 frames and resets it to zero, and
+`dshot_telemetry` latches a few frames later - after which
+`transfercomplete()` returns down the telemetry branch before the
+`zero_input_count++` block ever runs again. The 1s arming gate needs
+more than 30, reads ~4 forever, clears `inputSet`, and re-detection is
+impossible because `ic_timer_prescaler` was left at 0 where
+`checkDshot()`'s windows expect the boot value. `BDSHOT_NOARM` in
+`run_renode_tests.py` documents it; the bdshot run still asserts the
+reply plumbing, and the `--link` run drives plain dshot instead so the
+spin assertion stays.
 
 ### One target is skipped
 
