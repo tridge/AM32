@@ -172,14 +172,12 @@ namespace Antmicro.Renode.Peripherals.Timers
                 if(force && index == 0)
                 {
                     // SM0's FORCE fans out (SM1/SM2 use master select):
-                    // latch the commutation state
+                    // latch the commutation state. VAL registers stay
+                    // buffered - with FORCEN's force-init disabled a
+                    // FORCE is an output event, not a load point; only
+                    // LDOK moves them (flexpwm.c leaves LDMOD 0)
                     maskActive = mask;
                     dtsrcselActive = dtsrcsel;
-                    // a force-out event also acts as a load point
-                    foreach(var s in sm)
-                    {
-                        s.Load();
-                    }
                 }
                 return;
             }

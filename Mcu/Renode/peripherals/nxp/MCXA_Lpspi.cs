@@ -35,8 +35,12 @@ namespace Antmicro.Renode.Peripherals.SPI
     public class MCXA_Lpspi : IDoubleWordPeripheral, IKnownSize,
                               Miscellaneous.IAM32ReplySource
     {
-        public MCXA_Lpspi()
+        // decodesReplies marks the instance on the dshot wire (LPSPI0);
+        // the LED strip's LPSPI1 sets it false so the reply lookup can
+        // never bind to it, whatever the enumeration order
+        public MCXA_Lpspi(bool decodesReplies = true)
         {
+            DecodesReplies = decodesReplies;
             IRQ = new GPIO();
             Reset();
         }
@@ -93,7 +97,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             regs.TryGetValue(Tcr, out v);
             var framesz = (int)(v & 0xFFF) + 1;
-            if(framesz == ReplyBits)
+            if(framesz == ReplyBits && DecodesReplies)
             {
                 DecodeReply(value & ((1u << ReplyBits) - 1));
             }
@@ -108,6 +112,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         // ---- the decoded reply, same surface as the capture timers ----
 
+        public bool DecodesReplies { get; }
         public uint LastReplyFrame { get; private set; }
         public uint ReplyCount { get; private set; }
         public ulong ReplyRaw { get; private set; }

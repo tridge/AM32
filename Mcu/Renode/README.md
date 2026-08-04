@@ -434,9 +434,9 @@ capture polarity at ~100 frames and resets it to zero, and
 `dshot_telemetry` latches a few frames later - after which
 `transfercomplete()` returns down the telemetry branch before the
 `zero_input_count++` block ever runs again. The 1s arming gate needs
-more than 30, reads ~4 forever, clears `inputSet`, and re-detection is
-impossible because `ic_timer_prescaler` was left at 0 where
-`checkDshot()`'s windows expect the boot value. `BDSHOT_NOARM` in
+more than 30, reads a frozen handful forever, and clears `inputSet`;
+re-detection succeeds, but with `dshot_telemetry` still latched the
+counter can never rebuild, so the cycle repeats. `BDSHOT_NOARM` in
 `run_renode_tests.py` documents it; the bdshot run still asserts the
 reply plumbing, and the `--link` run drives plain dshot instead so the
 spin assertion stays.
@@ -552,11 +552,11 @@ in for the F0 families' `STM32F7_USART`. What was genuinely new:
   0.7 simulated seconds, starving the 20kHz loop timer (priority 3
   behind the deferral's 2) so `armed_timeout_count` never advanced and
   the ESC sat unarmed with every subsystem apparently healthy.
-  `AM32_STM32F0_EXTI` replaces it on this family with the real
-  semantics - SWIER sets the pending bit, the bit reads back, clearing
-  PR clears SWIER, line output is pending AND unmasked - which also
-  preserves the deliberate non-clearing re-entry the comparator
-  handler uses to wait out the blanking window.
+  `AM32_STM32_Exti` - the model the F415 introduced for its own
+  flavour of the same starvation - replaces it here too with the real
+  semantics: SWIER sets the pending bit, the bit reads back, clearing
+  PR clears SWIER. The deliberate non-clearing re-entry the comparator
+  handler uses to wait out the blanking window is preserved.
 - **the NTC targets are the first whose firmware actually decodes an
   external thermistor**: under `USE_NTC` the ARTERY branch of the 1kHz
   loop calls `getNTCDegrees()` on a fifth ADC rank instead of the

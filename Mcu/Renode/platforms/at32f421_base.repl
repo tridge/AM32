@@ -24,9 +24,12 @@ nvic: IRQControllers.NVIC @ sysbus 0xE000E000
 
 // ours, not the stock STM32F4_EXTI: the F421's EXINT15_4 handler
 // guards its flag clear on reading the pending bit back, which the
-// stock model's software trigger never sets (see AM32_STM32F0_EXTI.cs)
-exti: IRQControllers.AM32_STM32F0_EXTI @ sysbus 0x40010400
-    numberOfOutputLines: 32
+// stock model's software trigger never sets. AM32_STM32_Exti is the
+// stock model plus that latch, shared with the F415; line 21 is the
+// comparator (configurable, so its deliberate non-clearing re-entry
+// works as on the F051)
+exti: IRQControllers.AM32_STM32_Exti @ sysbus 0x40010400
+    numberOfOutputLines: 22
     [0, 1] -> nvicInput5@[0, 1]
     [2, 3] -> nvicInput6@[0, 1]
     [4-15] -> nvicInput7@[0-11]

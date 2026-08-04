@@ -46,8 +46,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // Implemented by whatever peripheral decodes the ESC's bidirectional
     // dshot replies - the capture timer on the STM32 families, the LPSPI
     // on the NXP - so the guilink can stream them without knowing which.
+    // DecodesReplies distinguishes an instance that really carries the
+    // reply wire from a sibling of the same class that does not (the
+    // A153's LED SPI), so the lookup does not depend on enumeration
+    // order.
     public interface IAM32ReplySource : IPeripheral
     {
+        bool DecodesReplies { get; }
         uint ReplyCount { get; }
         bool TryGetReply(uint index, out uint frame);
     }

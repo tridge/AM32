@@ -790,7 +790,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 bridge = machine.GetPeripheralsOfType<AM32_F051_Bridge>()
                     .FirstOrDefault();
                 capture = machine.GetPeripheralsOfType<IAM32ReplySource>()
-                    .FirstOrDefault();
+                    .FirstOrDefault(s => s.DecodesReplies);
                 if(generator == null)
                 {
                     this.Log(LogLevel.Error,

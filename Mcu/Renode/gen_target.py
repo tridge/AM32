@@ -128,6 +128,18 @@ INMSEL = {
              '0x400000D5': (5, 0), '0x400000F5': (7, 0)},
 }
 
+# The raw ADC count an external NTC reads back, chosen so
+# getNTCDegrees() decodes the physics default 38C on the target's own
+# table in Inc/ntc_tables.h - the tables are per-target, and the
+# SKYSTARS boards use a different curve where the common count would
+# read 59C. The count is fixed rather than physics-tracking; the .repl
+# comment at the emission site says so.
+NTC_COUNTS_DEFAULT = 3104
+NTC_COUNTS = {
+    'SKYSTARS_F60_F421': 3536,
+    'SKYSTARS_F80_F421': 3536,
+}
+
 # the capture timer, as (address, nvic line), per family
 CAPTURE_TIMER = {
     'f051': {'TIM3': (0x40000400, 16), 'TIM15': (0x40014000, 20)},
@@ -565,7 +577,10 @@ FAMILY = {
         'temp_channel': 16,
         # no factory calibration on this part: getConvertedDegrees()'s
         # fixed constants are inverted through a seeded reference word
-        # for the F1-generation ADC model, WCH-style (see the .resc)
+        # for the F1-generation ADC model, WCH-style (see the .resc).
+        # The sensor voltage RISES with temperature at 4.2mV/C, the same
+        # relationship as the F415's
+        'temp_slope_tenths': 42,
         'timer_af': 2,
         'extra_dma_irqs': [(0, 9)],
         # the F1-generation (rank-sequenced) ADC model
@@ -907,6 +922,7 @@ def config(target, nm='arm-none-eabi-gcc'):
         'current_channel': current_channel,
         'ntc_channel': suffix_number(ntc, 'LL_ADC_CHANNEL_',
                                      'ntc channel') if ntc else -1,
+        'ntc_counts': NTC_COUNTS.get(target, NTC_COUNTS_DEFAULT),
         'adc12': 'USE_ADC_1_2' in m,
         'voltage_divider': number('TARGET_VOLTAGE_DIVIDER', 110),
         'millivolt_per_amp': number('MILLIVOLT_PER_AMP', 20),
@@ -1334,6 +1350,7 @@ def adc_block(cfg, spec):
             # external NTC; unmapped it reads 0, which decodes to 400C
             # and the thermal clamp cuts the duty before the motor starts
             '    ntcChannel: %d' % cfg['ntc_channel'],
+            '    ntcCounts: %d' % cfg['ntc_counts'],
         ] if cfg['ntc_channel'] >= 0 else []) + [
             '    0 -> dma@%d' % spec['adc_dma'],
         ]
