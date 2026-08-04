@@ -13,22 +13,32 @@
 # hook on it attaches without complaint and then never fires, because
 # the tune reaches the loop through delayMillis.
 #
-# GATED ON PRIMASK. We only skip when the firmware has already disabled
-# interrupts, which is the case the tune runs in (Src/sounds.c:120 does
-# __disable_irq() around its delays). That makes the skip provably free
-# of side effects: with interrupts masked there is nothing that could
-# have been delivered during the wait, so it does not matter whether
-# Renode would have delivered it. Delays called with interrupts live are
-# emulated normally.
+# GATED ON INTERRUPTS BEING MASKED. We only skip when the firmware has
+# already disabled interrupts, which is the case the tune runs in
+# (Src/sounds.c:120 does __disable_irq() around its delays). That makes
+# the skip provably free of side effects: with interrupts masked there
+# is nothing that could have been delivered during the wait, so it does
+# not matter whether Renode would have delivered it. Delays called with
+# interrupts live are emulated normally.
 #
 # Loaded with:
 #   cpu AddSymbolHook "delayMillis" "execfile('.../skip_delays.py')"
 
 from Antmicro.Renode.Time import TimeInterval
 
-if cpu.GetPrimask(False) != 0:
-    # r0 is the millis argument; lr is where it returns to
+if hasattr(cpu, 'GetPrimask'):
+    # Cortex-M: PRIMASK masks; r0 is the millis argument, LR the return
+    masked = cpu.GetPrimask(False) != 0
     ms = cpu.GetRegister(0).RawValue
+    ret = cpu.LR
+else:
+    # RISC-V: masked when mstatus.MIE (bit 3) is clear; the argument is
+    # a0, the return address ra
+    masked = (cpu.MSTATUS.RawValue & 0x8) == 0
+    ms = cpu.GetRegisterUnsafe(10).RawValue
+    ret = cpu.GetRegisterUnsafe(1).RawValue
+
+if masked:
     if ms > 0:
         cpu.SkipTime(TimeInterval.FromMilliseconds(ms))
-    cpu.PC = cpu.LR
+    cpu.PC = ret

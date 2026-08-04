@@ -1,0 +1,68 @@
+:name: AM32 V203
+:description: boots an AM32 CH32V203 firmware ELF
+
+# Common to every CH32V203 target. Do not include this directly -
+# include a generated per-target .resc, which sets $platform and then
+# comes here. See am32_f051.resc for what the variables mean; the
+# RISC-V specifics are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Pfic.cs
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_SysTick.cs
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Opa.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Adc.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+# WCH's custom CSRs, which the startup and the SPL touch before any
+# peripheral exists: corecfgr and intsyscr are configuration writes the
+# emulation can ignore, but 0x800 is an alias of mstatus that
+# __enable_irq()/__disable_irq() go through, so it must write through.
+cpu RegisterCSRStub 0xbc0 "corecfgr"
+cpu RegisterCSRStub 0x804 "intsyscr"
+cpu RegisterCSRHandlerFromFile 0x800 $repo/Mcu/Renode/scripts/wch_mstatus_alias.py
+
+sysbus LoadELF $elf
+
+$eeprom_addr?=0x0800F800
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# Factory temperature calibration word: reference millivolts in the low
+# half, reference degrees in the high half. TempSensor_Volt_To_Temper()
+# applies a fixed -4.3mV/C slope from this point; 1400mV at 25C is a
+# representative part.
+sysbus WriteDoubleWord 0x1FFFF720 0x00190578
+
+# No VectorTableOffset here: this is not a Cortex-M. The startup writes
+# mtvec itself and the PFIC model dispatches from it; see
+# peripherals/wch/AM32_WCH_Pfic.cs for how WCH vectoring and the
+# hardware prologue/epilogue are emulated.
+
+# The 96MHz QingKe V4B runs from flash it can only partly cache; well
+# under one instruction per cycle. The same dshot capture-window
+# alignment concern as the L431's 48 applies (see am32_l431.resc).
+cpu PerformanceInMips 64
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
