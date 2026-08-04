@@ -83,12 +83,31 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             if(offset == IFCR)
             {
-                // write 1 to clear; the global flag clears the other three
+                // Write 1 to clear, PER BIT: only the global CGIF clears
+                // the other three. Clearing the whole nibble on any bit
+                // was a live bug on the CH32V203, the one family whose
+                // capture handler enables the half-transfer interrupt:
+                // when HT and TC accumulated across a masked window (the
+                // arming tune), the HT-branch's clear wiped the pending
+                // TC too, the transfer-complete path never re-armed the
+                // DMA and dshot input went permanently deaf on arming.
                 for(var i = 0; i < channelCount; i++)
                 {
-                    if((value & (0xFu << (4 * i))) != 0)
+                    var nib = (value >> (4 * i)) & 0xF;
+                    if(nib == 0)
                     {
-                        isr &= ~(0xFu << (4 * i));
+                        continue;
+                    }
+                    if((nib & GIF) != 0)
+                    {
+                        nib = 0xF;
+                    }
+                    isr &= ~(nib << (4 * i));
+                    // the line stays asserted while an event flag is
+                    // still set, so a flag cleared separately is still
+                    // serviced by a re-dispatch
+                    if((isr & ((TCIF | HTIF | TEIF) << (4 * i))) == 0)
+                    {
                         Connections[i].Unset();
                     }
                 }
@@ -246,6 +265,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         private const uint GIF = 1u << 0;
         private const uint TCIF = 1u << 1;
         private const uint HTIF = 1u << 2;
+        private const uint TEIF = 1u << 3;
 
         private readonly IMachine machine;
         private readonly int channelCount;
