@@ -159,8 +159,9 @@ fmc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
 // our model ignores); ours rather than a real watchdog, as everywhere
 iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
 
-// 32K-laid-out flash / 16K SRAM; app at 0x08001000 above an empty 4K
-// bootloader region
+// 64K flash with the image using the low 32K; app at 0x08001000 above
+// an empty 4K bootloader region. The K8 die has 8K of SRAM - the
+// linker script declares 16K but places the stack top at 8K
 flash: Memory.MappedMemory @ sysbus 0x08000000
     size: 0x10000
 
@@ -168,7 +169,7 @@ flashAlias: Memory.MappedMemory @ sysbus 0x0
     size: 0x10000
 
 sram: Memory.MappedMemory @ sysbus 0x20000000
-    size: 0x4000
+    size: 0x2000
 
 // no factory calibration on this part - the temperature formula is
 // fixed constants - but the WCH ADC model reads its reference point

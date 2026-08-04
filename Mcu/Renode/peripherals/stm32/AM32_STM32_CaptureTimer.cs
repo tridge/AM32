@@ -220,8 +220,11 @@ namespace Antmicro.Renode.Peripherals.Timers
             var wantFalling = (ccer & CC1P) != 0 || (ccer & CC1NP) != 0;
             // the CH32V203's route to both-edge capture: IC1 mapped to
             // TRC (CC1S=11) with the TI1 edge detector as the trigger
-            // (SMCR TS=100), CC1P left at rising (Mcu/v203/Src/IO.c)
-            if(((regs[ccmrOffset / 4] >> ccsShift) & CC1S) == CC1S
+            // (SMCR TS=100), CC1P left at rising (Mcu/v203/Src/IO.c).
+            // Channel 1 only: TI1F_ED is specifically the channel-1
+            // input's edge detector
+            if(channel == 1
+               && ((regs[ccmrOffset / 4] >> ccsShift) & CC1S) == CC1S
                && (regs[SMCR / 4] & TsMask) == TsTi1Ed)
             {
                 wantRising = true;
@@ -467,7 +470,10 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private void UpdateIrq()
         {
-            var pending = (regs[SR / 4] & regs[DIER / 4] & CC1IE) != 0;
+            // the update flag plus this channel's capture flag, each
+            // gated by its own DIER enable
+            var mask = 1u | (1u << channel);
+            var pending = (regs[SR / 4] & regs[DIER / 4] & mask) != 0;
             Connections[IrqLine].Set(pending);
         }
 

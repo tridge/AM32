@@ -128,13 +128,23 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             switch(offset)
             {
             case Rtsr1:
-                NotifyTriggerChanges(rtsr ^ value);
+            {
+                // commit before notifying: the subscriber drives GPIO
+                // edges from its callback, and those edges must be
+                // evaluated against the trigger state just written,
+                // not the stale one
+                var changed = rtsr ^ value;
                 rtsr = value;
+                NotifyTriggerChanges(changed);
                 return;
+            }
             case Ftsr1:
-                NotifyTriggerChanges(ftsr ^ value);
+            {
+                var changed = ftsr ^ value;
                 ftsr = value;
+                NotifyTriggerChanges(changed);
                 return;
+            }
             case Swier1:
                 // software interrupt: raises the rising pending bit
                 rpr |= value;

@@ -324,6 +324,11 @@ worth keeping:
   has the opposite output polarity, the firmware flips its edge
   bookkeeping, and without the matching `inverted` flag on the model
   the motor "spins" backwards at -543 rpm with a desync a second.
+- **known gap: a reversed-direction start on the G031** would miss its
+  first phase selection - the initial trigger state already matches
+  what `changeCompInput()` writes, so no change event fires until the
+  second commutation. The suite always spins forward; a reversed
+  eeprom would need the model to derive the initial phase another way.
 
 The rest is family bookkeeping. The F031 rotates the timer roles (TIM3
 interval, TIM16/TIM2 trading capture and 20kHz loop per group) and its
@@ -364,9 +369,8 @@ TIM(n+1)). The two real divergences:
   the bridge cannot represent. The other seven buildable E230 targets
   use the straight mapping. (`CM_MINI_E230` exists in targets.h but
   has no Makefile rule, so there is no firmware to run; and
-  `SKYSTARS_SL40_E230`'s LED strip rides a timer-PWM DMA chain rather
-  than the bit-banged GPIO the WS2812 decoder understands, so its LED
-  is not modelled.)
+  `SKYSTARS_SL40_E230`'s `USE_RGB_LED` is three discrete GPIO outputs,
+  which nothing decodes, so its LED is not modelled.)
 
 `PA6_VOLTAGE` on `GD32DEV_A_E230` does not change the ADC channel
 setup - it swaps which DMA slot the firmware reads as voltage versus
