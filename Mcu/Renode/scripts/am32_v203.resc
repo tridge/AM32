@@ -59,6 +59,16 @@ sysbus WriteDoubleWord 0x1FFFF720 0x00190578
 # peripherals/wch/AM32_WCH_Pfic.cs for how WCH vectoring and the
 # hardware prologue/epilogue are emulated.
 
+# NVIC_SystemReset() (the signal-loss reboot) reaches the PFIC's keyed
+# CFGR write, which requests a machine reset. A RISC-V CPU reset does
+# not re-read an entry point the way a Cortex-M re-reads its vector
+# table, so reload the ELF to put the PC back at the startup - the
+# eeprom page is not an ELF section and keeps any saved settings.
+macro reset
+"""
+    sysbus LoadELF $elf
+"""
+
 # The 96MHz QingKe V4B runs from flash it can only partly cache; well
 # under one instruction per cycle. The same dshot capture-window
 # alignment concern as the L431's 48 applies (see am32_l431.resc).

@@ -281,9 +281,13 @@ machinery had to be emulated in `AM32_WCH_Pfic`:
 Two Renode-level gaps are papered over in the PFIC model rather than
 the platform: the CPU requires `mie.MEIE` for external-interrupt
 delivery, which the firmware (correctly, for WCH) never sets, so the
-model sets it when it installs its hooks; and `NVIC_SystemReset` via
-the PFIC CFGR key write is logged and ignored, so the signal-loss
-reboot path halts the machine instead of restarting the firmware.
+model sets it on hook install and re-establishes it after a reset
+clears it; and `NVIC_SystemReset` via the PFIC CFGR key write
+requests a machine reset, with the family script's reset macro
+reloading the ELF - a RISC-V CPU reset does not re-read an entry
+point the way a Cortex-M re-reads its vector table, and without the
+reload the signal-loss reboot would leave the firmware running past
+the call with half-cleared state.
 
 ### One target is skipped
 

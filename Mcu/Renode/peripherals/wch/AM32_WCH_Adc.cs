@@ -101,10 +101,17 @@ namespace Antmicro.Renode.Peripherals.Analog
         {
             switch(offset)
             {
-            case Statr: statr = value; return;
+            // status flags are write-zero-to-clear (the SPL writes the
+            // complement mask), so writing back anything else must not
+            // set them
+            case Statr: statr &= value; return;
             case Ctlr1: ctlr1 = value; return;
             case Ctlr2:
-                ctlr2 = value & ~(Cal | Rstcal);
+                // CAL and RSTCAL complete instantly, and SWSTART
+                // self-clears when conversion begins - retaining it
+                // would let a later unrelated read-modify-write start
+                // another sequence
+                ctlr2 = value & ~(Cal | Rstcal | Swstart);
                 if((value & Swstart) != 0 && (value & Adon) != 0)
                 {
                     Convert();

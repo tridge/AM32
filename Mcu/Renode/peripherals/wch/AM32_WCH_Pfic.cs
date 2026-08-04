@@ -34,6 +34,14 @@
 // An interrupt becomes active at dispatch and stops requesting until
 // its mret, like the real PFIC's IACTR - without this the level-held
 // EXTI lines would re-trap the moment a handler re-enables interrupts.
+// Preemption follows the V4B's nested mode, which the startup enables
+// with INTSYSCR.INESTEN: bit 7 of the priority byte is the preemption
+// class and bits 6:5 only order simultaneous requests, so EXTI/TIM3 at
+// 0x00/0x20 preempt SysTick/DMA handlers at 0xC0/0xE0 but never each
+// other. In that mode the hardware also keeps mstatus.MIE set on
+// interrupt entry - the dispatch here restores it after the generic
+// trap cleared it - so a higher class cuts in immediately and the
+// eligibility gating is what keeps equals and lowers out until mret.
 // VTF registers are accepted and ignored: SetVTFIRQ() points them at
 // the same symbols the vector table already holds, so table dispatch
 // is behaviour-identical.
@@ -71,7 +79,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 Array.Clear(priority, 0, priority.Length);
                 frames.Clear();
                 // hooks survive a reset on purpose: the CPU keeps them,
-                // and installing a second copy would double-dispatch
+                // and installing a second copy would double-dispatch.
+                // mie does NOT survive - the CPU reset clears it - so
+                // Evaluate() re-establishes MEIE on the next delivery
+                meieEnsured = false;
+                resetRequested = false;
             }
         }
 
@@ -176,7 +188,20 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 case Cfgr:
                     if((value & 0xFFFF0000) == Key3 && (value & 0x80) != 0)
                     {
-                        this.Log(LogLevel.Warning, "system reset requested; ignored");
+                        // NVIC_SystemReset(): the signal-loss paths in
+                        // main.c depend on actually restarting. The
+                        // family .resc's reset macro reloads the ELF,
+                        // which is what points the PC back at the entry.
+                        // Debounced: Renode applies the reset at a safe
+                        // point, not instantly like the real register,
+                        // and the firmware keeps calling until it lands
+                        // - our own Reset() re-arms the request.
+                        if(!resetRequested)
+                        {
+                            resetRequested = true;
+                            this.Log(LogLevel.Info, "system reset requested");
+                            machine.RequestReset();
+                        }
                     }
                     return;
                 case Sctlr: sctlr = value; return;
@@ -229,21 +254,63 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
+        // The V4B with nesting enabled (INTSYSCR.INESTEN, which the
+        // startup sets) splits the priority byte: bit 7 is the
+        // preemption level, bits 6:5 only order simultaneous requests.
+        // A source may preempt only a strictly lower class - EXTI/TIM3
+        // at 0x00/0x20 preempt SysTick/DMA handlers at 0xC0/0xE0, never
+        // each other and never the other way around.
+        private int PreemptLevel(int irq)
+        {
+            return priority[irq] >> 7;
+        }
+
+        // preemption level of the innermost active handler, or worse
+        // than any real level when none is active. Must be called with
+        // sync held.
+        private int ActivePreemptLevel()
+        {
+            var level = int.MaxValue;
+            foreach(var f in frames)
+            {
+                var l = PreemptLevel(f.Irq);
+                if(l < level)
+                {
+                    level = l;
+                }
+            }
+            return level;
+        }
+
         // must be called with sync held
         private void Evaluate()
         {
+            var ceiling = ActivePreemptLevel();
             var any = false;
-            for(var w = 0; w < Words; w++)
+            for(var w = 0; w < Words && !any; w++)
             {
-                if(((pendingLevel[w] | pendingSoft[w]) & enable[w] & ~active[w]) != 0)
+                var elig = (pendingLevel[w] | pendingSoft[w]) & enable[w] & ~active[w];
+                while(elig != 0)
                 {
-                    any = true;
-                    break;
+                    var b = TrailingZeros(elig);
+                    elig &= elig - 1;
+                    if(PreemptLevel((w << 5) + b) < ceiling)
+                    {
+                        any = true;
+                        break;
+                    }
                 }
             }
             if(any && !hooksInstalled)
             {
                 InstallHooks();
+            }
+            if(any && hooksInstalled && !meieEnsured)
+            {
+                // re-established after a machine reset cleared mie; the
+                // hooks themselves survive on the CPU
+                cpu.MIE = (ulong)cpu.MIE | (1ul << MachineExternalInterrupt);
+                meieEnsured = true;
             }
             cpu.OnGPIO(MachineExternalInterrupt, any);
         }
@@ -269,13 +336,29 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             // interrupt gating is PFIC enables plus mstatus.MIE - but
             // Renode's CPU requires MEIE for MEIP delivery
             cpu.MIE = (ulong)cpu.MIE | (1ul << MachineExternalInterrupt);
+            meieEnsured = true;
             hooksInstalled = true;
+        }
+
+        // Abandon a trap that found nothing to dispatch: return to the
+        // interrupted code as an mret would, restoring the MIE the trap
+        // entry cleared from MPIE - without that the CPU would run with
+        // interrupts silently off until the next __enable_irq().
+        private void AbandonTrap()
+        {
+            var mstatus = (ulong)cpu.MSTATUS;
+            if((mstatus & Mpie) != 0)
+            {
+                cpu.MSTATUS = mstatus | Mie;
+            }
+            cpu.PC = cpu.MEPC;
         }
 
         private void DispatchInterrupt()
         {
             lock(sync)
             {
+                var ceiling = ActivePreemptLevel();
                 var irq = -1;
                 var best = int.MaxValue;
                 for(var w = 0; w < Words; w++)
@@ -286,6 +369,12 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                         var b = TrailingZeros(elig);
                         elig &= elig - 1;
                         var n = (w << 5) + b;
+                        if(PreemptLevel(n) >= ceiling)
+                        {
+                            continue;
+                        }
+                        // full byte then number: subpriority orders the
+                        // candidates that may all be dispatched
                         var score = (priority[n] << 8) | n;
                         if(score < best)
                         {
@@ -296,9 +385,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 if(irq < 0)
                 {
-                    // raced with the source dropping; resume where the
-                    // trap hit
-                    cpu.PC = cpu.MEPC;
+                    // raced with the source dropping
+                    AbandonTrap();
                     return;
                 }
                 var handler = machine.SystemBus.ReadDoubleWord(vectorBase + 4 * (ulong)irq);
@@ -306,7 +394,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 {
                     this.Log(LogLevel.Error,
                              "interrupt {0} has no vector table entry", irq);
-                    cpu.PC = cpu.MEPC;
+                    AbandonTrap();
                     return;
                 }
                 var frame = new ulong[HpeRegs.Length];
@@ -333,6 +421,14 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 ulong dc;
                 dispatchCounts.TryGetValue(irq, out dc);
                 dispatchCounts[irq] = dc + 1;
+                // real vectored dispatch reports the selected source in
+                // mcause, not the generic MEIP the CPU delivered
+                cpu.MCAUSE = 0x80000000ul | (ulong)irq;
+                // with nesting enabled the V4B keeps mstatus.MIE set on
+                // interrupt entry; a strictly higher preemption class
+                // can cut in immediately, and the Evaluate() gating
+                // above is what keeps equals and lowers out
+                cpu.MSTATUS = (ulong)cpu.MSTATUS | Mie;
                 Evaluate();
                 cpu.PC = handler;
             }
@@ -413,6 +509,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private const long Sctlr = 0xD10;
 
         private const uint Key3 = 0xBEEF0000;
+        private const ulong Mie = 1ul << 3;
+        private const ulong Mpie = 1ul << 7;
         private const int Words = 8;
         private const int MaxIrq = 256;
         private const int MachineExternalInterrupt = 11;
@@ -432,5 +530,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private uint ithresdr, sctlr;
         private ulong vectorBase;
         private bool hooksInstalled;
+        private bool meieEnsured;
+        private bool resetRequested;
     }
 }
