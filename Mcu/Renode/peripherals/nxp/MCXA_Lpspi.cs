@@ -18,15 +18,21 @@
 // zero between frames. Frames not 21 bits long are counted but not
 // GCR-decoded, which tells the two roles apart without configuration.
 //
-// TCF is raised at the end of the TDR write; the 28-56us the frame
-// would occupy on the wire buys nothing here, because the FC generator
-// neither listens to this pin nor drives dshot frames into the gap the
-// reply sits in.
+// TCF is raised after the time the frame really occupies on the wire
+// (FRAMESZ bits at the TCR.PRESCALE-derived baud), and that delay is
+// load bearing: while armed, transfercomplete() defers the frame
+// decode with compute_dshot_flag=1 and the main loop must run
+// processDshot() inside the transmission window - the TCF interrupt's
+// own transfercomplete() overwrites the flag with 2. An immediate TCF
+// tail-chains straight after the DMA interrupt, the received frames
+// are never decoded, signaltimeout climbs and the ESC disarms.
 //
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Time;
 using System.Collections.Generic;
 
 namespace Antmicro.Renode.Peripherals.SPI
@@ -38,10 +44,18 @@ namespace Antmicro.Renode.Peripherals.SPI
         // decodesReplies marks the instance on the dshot wire (LPSPI0);
         // the LED strip's LPSPI1 sets it false so the reply lookup can
         // never bind to it, whatever the enumeration order
-        public MCXA_Lpspi(bool decodesReplies = true)
+        public MCXA_Lpspi(IMachine machine, bool decodesReplies = true)
         {
             DecodesReplies = decodesReplies;
             IRQ = new GPIO();
+            // one shot per TDR word, at the functional clock; the limit
+            // is the frame's length in functional-clock ticks
+            shift = new LimitTimer(machine.ClockSource, FunctionalHz, this,
+                                   "shift", limit: uint.MaxValue,
+                                   direction: Direction.Ascending,
+                                   enabled: false, workMode: WorkMode.OneShot,
+                                   eventEnabled: true, autoUpdate: false);
+            shift.LimitReached += OnTransferDone;
             Reset();
         }
 
@@ -52,6 +66,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             regs.Clear();
             sr = 0;
+            shift.Enabled = false;
             IRQ.Unset();
         }
 
@@ -106,6 +121,18 @@ namespace Antmicro.Renode.Peripherals.SPI
                 LedFrames++;
                 LastLedWord = value;
             }
+            // the flags follow after the frame's wire time: FRAMESZ bits
+            // at functional-clock / 2^(PRESCALE+1) (the doubled divider,
+            // Mcu/a153/Src/peripherals.c) - 28us for a dshot600 reply
+            var prescale = (int)((v >> 27) & 0x7);
+            shift.Enabled = false;
+            shift.Value = 0;
+            shift.Limit = (ulong)framesz << (prescale + 1);
+            shift.Enabled = true;
+        }
+
+        private void OnTransferDone()
+        {
             sr |= Tcf | Fcf | Wcf;
             UpdateIrq();
         }
@@ -204,6 +231,9 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private const int ReplyBits = 21;
 
+        // FRO_12M, both instances (peripherals.c / apa102.c)
+        private const long FunctionalHz = 12000000;
+
         private static readonly uint[] GcrTable = {
             0x19, 0x1B, 0x12, 0x13, 0x1D, 0x15, 0x16, 0x17,
             0x1A, 0x09, 0x0A, 0x0B, 0x1E, 0x0D, 0x0E, 0x0F,
@@ -211,6 +241,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private readonly Dictionary<long, uint> regs = new Dictionary<long, uint>();
         private readonly uint[] replyRing = new uint[64];
+        private readonly LimitTimer shift;
         private uint sr;
     }
 }
