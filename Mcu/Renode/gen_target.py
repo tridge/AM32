@@ -18,9 +18,10 @@ usage:
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py --list                     targets this can emulate
 
-F051, F031, G071, G031, L431, G431, V203 and E230 targets work, _CAN variants included - the
-L431's bxCAN and the G431's FDCAN are both modelled. Anything else
-exits 77, as the test harness does for a skip.
+F051, F031, G071, G031, L431, G431, V203, E230 and F415 targets work,
+_CAN variants included - the L431's and F415's bxCAN and the G431's
+FDCAN are all modelled. Anything else exits 77, as the test harness
+does for a skip.
 '''
 
 import argparse
@@ -39,7 +40,7 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 # applies at the bottom of the file.
 WANTED = [
     'MCU_F051', 'MCU_G071', 'MCU_L431', 'MCU_G431', 'MCU_CH32V203',
-    'MCU_F031', 'MCU_G031', 'MCU_GDE23', 'MCU_A153',
+    'MCU_F031', 'MCU_G031', 'MCU_GDE23', 'MCU_A153', 'MCU_AT415',
     # the NXP LPCMP pair: which unit and which minus input each phase is on
     'PHASE_A_COMP_UNIT', 'PHASE_A_COMP_INP',
     'PHASE_B_COMP_UNIT', 'PHASE_B_COMP_INP',
@@ -116,6 +117,10 @@ INMSEL = {
     # the E230 writes whole CMP_CS words; CMPMSEL[6:4] carries the same
     # encodings as the F051's COMP1 (4=PA4, 5=PA5, 6=PA0)
     'e230': {'0x61': (6, 0), '0x41': (4, 0), '0x51': (5, 0)},
+    # the F415 writes whole CTRLSTS1 words too, with the F051's INMSEL
+    # encodings at [6:4]; the set bit 30 lands in the unused CMP2 half
+    'f415': {'0x400000E5': (6, 0), '0x400000C5': (4, 0),
+             '0x400000D5': (5, 0)},
 }
 
 # the capture timer, as (address, nvic line), per family
@@ -130,6 +135,9 @@ CAPTURE_TIMER = {
     'g031': {'TIM3': (0x40000400, 16)},
     # TIMER2 is ST's TIM3; the throttle rides its channel 0 on PB4
     'e230': {'TIMER2': (0x40000400, 16)},
+    # group AT_D captures on TMR3_CH1 (PB4), group AT_H on TMR2_CH3
+    # (PA2); the nvic lines are the timers' own global vectors
+    'f415': {'TMR3': (0x40000400, 29), 'TMR2': (0x40000000, 28)},
 }
 
 # stock declaration and alternate-function map for whichever timers are
@@ -194,6 +202,14 @@ STOCK_TIMER = {
         'TIMER2': ('timer2', 0x40000400, 16, [
             '    0 -> gpioPortA#06@1 | gpioPortB#04@1 | gpioPortC#06@1',
         ]),
+    },
+    # TMR2 and TMR3 trade the capture role per F415 group; F1-generation
+    # muxing, so as on the V203 there is no AF map to hold and
+    # capture_input_af() finding nothing leaves the capture pin ungated
+    # (the firmware keeps it in INPUT mode while capturing anyway)
+    'f415': {
+        'TMR2': ('timer2', 0x40000000, 28, []),
+        'TMR3': ('timer3', 0x40000400, 29, []),
     },
     # TIM3 captures on every G031 group; TIM16 is the 20kHz loop timer
     'g031': {
@@ -424,6 +440,50 @@ FAMILY = {
         'exti_rtsr': 0x00,
         'exti_ftsr': 0x04,
     },
+    'f415': {
+        'macro': 'MCU_AT415',
+        # 144MHz AHB with both APBs at /2; the F1 timer doubler puts
+        # every timer back at 144MHz
+        'timer_hz': 144000000,
+        # F1-generation addressing throughout, as on the V203
+        'gpio_a': 0x40010800,
+        'syscfg': 0,
+        'throttle': 0x60000000,
+        'bridge': 0x60000400,
+        'guilink': 0x60000800,
+        # the capture arrives on channel 6 via the Artery flexible
+        # request mux (stubbed; routing hardwired) -> DMA1_Channel6_IRQn
+        'dma_irq': 16,
+        # the ADC transfers on channel 1
+        'adc_dma': 0,
+        'adc_base': 0x40012400,
+        'adc_sqr': False,
+        'temp_channel': 16,
+        # ADC_Init() hardwires the sequence instead of taking channels
+        # from targets.h: rank 1 is CH3 (PA3), which ADC_DMA_Callback()
+        # reads as the voltage, rank 2 CH6 (PA6) as the current, rank 3
+        # the internal temperature sensor. The per-target channel macros
+        # are dead code on this family.
+        'fixed_voltage_channel': 3,
+        'fixed_current_channel': 6,
+        # no factory calibration: getConvertedDegrees() applies fixed
+        # constants, seeded as a reference word for the F1-generation
+        # ADC model - with the slope RISING 4.2mV/C, unlike the WCH/GD
+        'temp_slope_tenths': 42,
+        # unused by the bridge's F1 mode, which reads CFG nibbles
+        'timer_af': 0,
+        # DMA1_Channel1 (ADC, ADC_DMA_Callback runs from its ISR) and
+        # DMA1_Channel4 (telemetry TX) both have real handlers in
+        # at32f415_it.c
+        'extra_dma_irqs': [(0, 11), (3, 14)],
+        # F1-style CFGLR/CFGHR GPIO decode in the bridge
+        'f1_gpio': True,
+        # the F1-generation rank-sequenced ADC model
+        'wch_adc': True,
+        'base_repl': 'at32f415_base.repl',
+        # bxCAN, bit-for-bit the STM32's, for the hub wiring
+        'can_name': 'can1',
+    },
     'e230': {
         'macro': 'MCU_GDE23',
         # 72MHz core with all buses at /1, so the timers tick at 72MHz
@@ -532,17 +592,20 @@ def suffix_number(macro, prefix, what):
 
 
 def pin_name(port, pin):
-    '''GPIOA + LL_GPIO_PIN_10 (or the SPL's GPIO_Pin_10) -> "PA10"'''
+    '''GPIOA + LL_GPIO_PIN_10 (or the SPL's GPIO_Pin_10, or the
+       Artery GPIO_PINS_10) -> "PA10"'''
     if port.startswith('GPIO'):
-        for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_', 'GPIO_PIN_'):
+        for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_', 'GPIO_PINS_',
+                       'GPIO_PIN_'):
             if pin.startswith(prefix):
                 return 'P%s%s' % (port[4:], pin[len(prefix):])
     raise Unsupported('cannot read pin %s %s' % (port, pin))
 
 
 def pin_number(pin):
-    '''LL_GPIO_PIN_2 or GPIO_Pin_2 -> 2'''
-    for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_', 'GPIO_PIN_'):
+    '''LL_GPIO_PIN_2, GPIO_Pin_2 or GPIO_PINS_2 -> 2'''
+    for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_', 'GPIO_PINS_',
+                   'GPIO_PIN_'):
         if pin.startswith(prefix):
             try:
                 return int(pin[len(prefix):])
@@ -583,9 +646,9 @@ def config(target, nm='arm-none-eabi-gcc'):
             break
     if family is None:
         raise Unsupported('%s is not an F051, F031, G071, G031, L431, '
-                          'G431, V203 or E230 target; those are the only '
-                          'AM32 MCU families with a Renode platform base '
-                          'so far' % target)
+                          'G431, V203, E230 or F415 target; those are the '
+                          'only AM32 MCU families with a Renode platform '
+                          'base so far' % target)
 
     # DRONECAN_SUPPORT is always defined - 0 on a plain target, 1 on a
     # _CAN one - so the value is the test, not the name or definedness.
@@ -621,6 +684,12 @@ def config(target, nm='arm-none-eabi-gcc'):
             capture_channel = int(icch[len('LL_TIM_CHANNEL_CH'):])
         except ValueError:
             raise Unsupported('cannot read IC_TIMER_CHANNEL from %r' % icch)
+    elif icch.startswith('TMR_SELECT_CHANNEL_'):
+        # the Artery spelling: group AT_H rides TMR2's channel 3
+        try:
+            capture_channel = int(icch[len('TMR_SELECT_CHANNEL_'):])
+        except ValueError:
+            raise Unsupported('cannot read IC_TIMER_CHANNEL from %r' % icch)
     elif icch in ('', '(1-1)', 'TIMER_CH_0'):
         # the non-LL spellings in the tree today all mean channel 1;
         # anything new must be classified rather than guessed at
@@ -631,6 +700,9 @@ def config(target, nm='arm-none-eabi-gcc'):
     chan = m.get('INPUT_DMA_CHANNEL', '')
     if chan.startswith('LL_DMA_CHANNEL_'):
         dma_channel = int(chan[len('LL_DMA_CHANNEL_'):]) - 1
+    elif chan.startswith('DMA1_CHANNEL'):
+        # the Artery spelling
+        dma_channel = int(chan[len('DMA1_CHANNEL'):]) - 1
     elif chan.startswith('DMA1_Channel'):
         # the SPL spelling the WCH targets use
         dma_channel = int(chan[len('DMA1_Channel'):]) - 1
@@ -683,7 +755,7 @@ def config(target, nm='arm-none-eabi-gcc'):
         main = 0
         comp_of = {}
     else:
-        main = 1 if family in ('f051', 'e230') else comp_number(
+        main = 1 if family in ('f051', 'e230', 'f415') else comp_number(
             m.get('MAIN_COMP', 'COMP2'))
         comp_of = {}
         for ph in 'ABC':
@@ -694,6 +766,13 @@ def config(target, nm='arm-none-eabi-gcc'):
         if 'USE_ADC_INPUT' in m:
             raise Unsupported('%s: USE_ADC_INPUT is not modelled on the '
                               'e230' % target)
+    if family == 'f415':
+        # PA6_VOLTAGE would swap the hardwired ADC rank meanings in
+        # Mcu/f415/Src/ADC.c; no current F415 target sets either
+        for macro in ('PA6_VOLTAGE', 'USE_ADC_INPUT'):
+            if macro in m:
+                raise Unsupported('%s: %s is not modelled on the f415'
+                                  % (target, macro))
 
     # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
     # than HIGH and LOW; the bridge takes them in the same two slots
@@ -749,9 +828,11 @@ def config(target, nm='arm-none-eabi-gcc'):
             m.get('CURRENT_ADC_CHANNEL'), m.get('VOLTAGE_ADC_CHANNEL'))
         volt = m.get('VOLTAGE_ADC_CHANNEL')
         cur = m.get('CURRENT_ADC_CHANNEL')
-    if volt is None and 'fixed_voltage_channel' in FAMILY[family]:
-        # the WCH ADC driver hardwires its sequence instead of reading
-        # channel macros from targets.h
+    if 'fixed_voltage_channel' in FAMILY[family]:
+        # the WCH and Artery ADC drivers hardwire their sequence instead
+        # of reading channel macros from targets.h - the F415 targets
+        # define VOLTAGE/CURRENT_ADC_CHANNEL, but Mcu/f415/Src/ADC.c
+        # never looks at them
         voltage_channel = FAMILY[family]['fixed_voltage_channel']
         current_channel = FAMILY[family]['fixed_current_channel']
     else:
@@ -1074,6 +1155,19 @@ def comp_block(cfg):
             '// from changeCompInput(), with its outputs on PA3/PA4 feeding',
             '// EXTI lines 3 and 4 through the GPIO port wiring.',
         ]
+    if cfg['family'] == 'f415':
+        return [
+            '// Artery CMP block on its own page. Nearly the F051 COMP1',
+            '// layout - enable bit 0, INMSEL at [6:4] (4 is PA4, 5 is PA5,',
+            '// 6 is PA0), output at bit 14 - gating EXTI line 19, which has',
+            '// its own vector (CMP1_IRQn 70) rather than sharing an EXINT',
+            '// one. CMP2 in the upper half is unused by every target.',
+            'comp: Miscellaneous.AM32_AT32_Cmp @ sysbus <0x40002400, +0x400>',
+        ] + [
+            '    phase%sInmsel: %d' % (p, cfg['comps'][p][0]) for p in 'ABC'
+        ] + [
+            '    0 -> exti@19',
+        ]
     if cfg['family'] in ('f051', 'e230'):
         return [
             '// SYSCFG and COMP share a register page on the F051. Line 21 is',
@@ -1158,6 +1252,11 @@ def adc_block(cfg, spec):
             '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
             '    currentOffsetMv: %d' % cfg['current_offset'],
             '    temperatureChannel: %d' % spec['temp_channel'],
+        ] + ([
+            # the F415 sensor voltage RISES with temperature, unlike the
+            # WCH/GD default the model inverts
+            '    tempSlopeTenthsMvPerC: %d' % spec['temp_slope_tenths'],
+        ] if 'temp_slope_tenths' in spec else []) + [
             '    0 -> dma@%d' % spec['adc_dma'],
         ]
     cal = [
@@ -1295,8 +1394,10 @@ def platform(cfg):
             '    initialLimit: 0xFFFF',
             '    -> nvic@%d' % oirq,
             '',
-            '%s:' % oname,
-        ] + oaf + ['']
+        ]
+        # the F1-generation families have no per-pin AF map to restate
+        if oaf:
+            L += ['%s:' % oname] + oaf + ['']
 
     L += [
         '// the nvic lines the DMA channels raise: the capture channel',
@@ -1749,7 +1850,7 @@ def all_targets(nm='arm-none-eabi-gcc'):
     cand = [t for t in out.split()
             if 'F051' in t or 'G071' in t or 'L431' in t or 'G431' in t
             or 'V203' in t or 'F031' in t or 'G031' in t or 'E230' in t
-            or 'A153' in t]
+            or 'A153' in t or 'F415' in t]
     found = []
     for t in sorted(set(cand)):
         try:
