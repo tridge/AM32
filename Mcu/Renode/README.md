@@ -14,11 +14,12 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Ten MCU families are supported: F051, F031, G071, G031, L431,
+**Eleven MCU families are supported: F051, F031, G071, G031, L431,
 G431, the RISC-V CH32V203, the GigaDevice GD32E230, the NXP MCXA153
-and the Artery AT32F415**, covering the 52 F051, 3 F031, 54 G071,
-1 G031, 18 L431, 6 G431, 1 V203, 8 E230, 1 A153 and 7 F415 targets
-with no per-target file to write - the platform is generated from
+and the Artery AT32F415 and AT32F421**, covering the 52 F051, 3 F031,
+54 G071, 1 G031, 18 L431, 6 G431, 1 V203, 8 E230, 1 A153, 7 F415 and
+100 F421 targets with no per-target file to write - the platform is
+generated from
 `Inc/targets.h` on demand. What differs between the families is a
 table in `gen_target.py`, not a second code path. The `_CAN` targets
 run their DroneCAN firmware on an emulated CAN peripheral - the
@@ -513,6 +514,84 @@ targets.h), so generation refuses it with a comparator error and it
 never appears in sweeps. `PerformanceInMips` is 96 - 144MHz from
 4-wait-state flash, pinned by the same dshot capture-window alignment
 reasoning as the L431's 48.
+
+### The AT32F421
+
+Artery's 120MHz Cortex-M4 (no FPU) remake of the STM32F0 generation,
+and the biggest family in the tree: 105 buildable targets, of which
+100 generate and pass. Almost everything AM32 touches is
+register-compatible under AT names (TMRn is ST's TIMn at the same
+instance numbers and addresses, WDT is the IWDG, EXINT is the F0
+EXTI), so the machine is mostly reused models: GPIO, the advanced and
+capture timers, the F0 DMA, our IWDG. The ADC is the F1-generation
+register file again (OSQ rank sequencer, ODT at 0x4C, self-clearing
+ADCAL/ADCALINIT), so `AM32_WCH_Adc` serves as on the V203 and E230,
+and USART1 is the F1 register file, so the stock `STM32_UART` stands
+in for the F0 families' `STM32F7_USART`. What was genuinely new:
+
+- **the comparator is Artery's own single-register CMP**
+  (`AM32_AT32_Cmp`): one `ctrlsts` word at offset 0x1C of the SCFG
+  page - the F051's address, but not its layout. The inverting-input
+  select at [6:4] keeps the F051 encodings and adds 7 = PA2 (the
+  `AT_245` polling-mode groups); the output is CMPVALUE at **bit 30**,
+  where the F415 sibling keeps its at bit 14, so the bit position is a
+  constructor parameter. `comStep()` whole-assigns the register with
+  `PHASE_x_COMP` constants that carry bit 30 *set* - writing the
+  read-only output bit, which the model masks as hardware does - and
+  `changeCompInput()` read-modify-writes the speed field at runtime,
+  keyed on `average_interval`, so the model stores everything it does
+  not interpret. EXTI line 21, `ADC1_CMP_IRQn`, as on the F051.
+- **the stock EXTI's software trigger broke arming, invisibly.** The
+  F421 rides `STM32F4_EXTI`'s register layout exactly, but its
+  `EXINT15_4_IRQHandler` guards the flag clear on reading the pending
+  bit back - `if (EXINT->intsts & EXINT_LINE_15)` - where every other
+  family's handler clears unconditionally. Against the stock model a
+  `SWIER` trigger raises the NVIC line but the pending register never
+  reads back set, so the guard never passed, the line was never
+  cleared, and the handler re-entered forever: 6.4 million entries in
+  0.7 simulated seconds, starving the 20kHz loop timer (priority 3
+  behind the deferral's 2) so `armed_timeout_count` never advanced and
+  the ESC sat unarmed with every subsystem apparently healthy.
+  `AM32_STM32F0_EXTI` replaces it on this family with the real
+  semantics - SWIER sets the pending bit, the bit reads back, clearing
+  PR clears SWIER, line output is pending AND unmasked - which also
+  preserves the deliberate non-clearing re-entry the comparator
+  handler uses to wait out the blanking window.
+- **the NTC targets are the first whose firmware actually decodes an
+  external thermistor**: under `USE_NTC` the ARTERY branch of the 1kHz
+  loop calls `getNTCDegrees()` on a fifth ADC rank instead of the
+  internal sensor (the G431 SEQURE also converts an NTC, but its
+  reading is unused). An unmapped channel reads 0, which the board's
+  `NTC_table` decodes as **400C**, and the thermal clamp then holds
+  `duty_cycle_maximum` at 1 - the motor armed and never started, with
+  the "off" temperature limit of 255 sailing straight past 400. The
+  ADC model's `ntcChannel` returns a fixed count that decodes to the
+  38C physics ambient on the table most F421 boards share; the model
+  does not carry the per-board tables, so the NTC reading does not
+  track the physics temperature.
+- **the internal temperature slope runs the other way.** No factory
+  calibration page, as on the GD - but Artery's fixed-constant formula
+  `(12800 - raw*33000/4096)/-42 + 25` has a *positive* 4.2mV/C slope
+  where the WCH/GD sensors fall with temperature. The shared ADC
+  model's fixed negative-slope inversion can only be made exact at the
+  reference point itself, so the .resc seeds 38C at 1337mV - chosen so
+  the firmware's truncating integer math lands exactly 38 - and
+  excursions from there would read mirrored. Exact until the physics
+  models heating.
+- **five targets are refused at generation**: `AIRBEE_F421`,
+  `SP8_AIO_F421`, `NEUTRON_1_2S_AIO_F421`, `TBS_MINI_F421` and
+  `JMITEST_1_2S_F421` define `USE_INVERTED_HIGH` (active-low high-side
+  gates), which the bridge deliberately refuses rather than model
+  untested; the generator now says so before the machine loads.
+
+The rest is family bookkeeping: the AT_B group captures the throttle
+on TMR3_CH1 (PB4, mux 1), the AT_C/E/F groups on TMR15_CH1 (PA2, mux
+0 - `UN_TIM_Init()` sets no mux there because the reset value already
+routes it), both on the shared `DMA1_Channel5_4` line; the CRM is the
+same enable-to-ready Python stub as the GD's RCU with the PLL/MISC
+writes stored; and flash programming is F1-style direct stores that
+land in `MappedMemory` past a register-file FLASH controller whose
+busy flag always reads clear.
 
 ### One target is skipped
 
