@@ -22,4 +22,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // the floating phase
         bool CompOutput { get; set; }
     }
+
+    // Implemented by an EXTI model that can report which line's
+    // rising/falling trigger a write changed. Declared here rather than
+    // with the G0 EXTI so AM32_ExtiBemf can name the type on families
+    // whose scripts never compile that model (the F031's stock F4 EXTI
+    // gives the same information through its register state instead).
+    public interface IAM32TriggerNotifier
+    {
+        event System.Action<int> TriggerChanged;
+    }
 }

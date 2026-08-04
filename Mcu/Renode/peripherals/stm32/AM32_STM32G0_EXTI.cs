@@ -31,7 +31,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class AM32_STM32G0_EXTI : IDoubleWordPeripheral, IKnownSize,
-                                     INumberedGPIOOutput, IGPIOReceiver
+                                     INumberedGPIOOutput, IGPIOReceiver,
+                                     Miscellaneous.IAM32TriggerNotifier
     {
         // lines 0-31 are configurable; 32 and up are the direct lines,
         // which have no edge selection and pass straight through the mask
@@ -126,8 +127,14 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         {
             switch(offset)
             {
-            case Rtsr1: rtsr = value; return;
-            case Ftsr1: ftsr = value; return;
+            case Rtsr1:
+                NotifyTriggerChanges(rtsr ^ value);
+                rtsr = value;
+                return;
+            case Ftsr1:
+                NotifyTriggerChanges(ftsr ^ value);
+                ftsr = value;
+                return;
             case Swier1:
                 // software interrupt: raises the rising pending bit
                 rpr |= value;
@@ -184,6 +191,32 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             for(var i = 0; i < n; i++)
             {
                 Update(i);
+            }
+        }
+
+        // Fired with the line number for every RTSR1/FTSR1 bit a write
+        // changes. The comparator-less G031 gives no other observable
+        // signal of which phase changeCompInput() selected: it only ORs
+        // and clears the current line's trigger bits, so the register
+        // STATE keeps all three phase lines armed while the most recent
+        // CHANGE names the current one (each phase alternates edge
+        // between visits, so its revisit always flips its bits).
+        public event System.Action<int> TriggerChanged;
+
+        private void NotifyTriggerChanges(uint changed)
+        {
+            var handler = TriggerChanged;
+            if(handler == null)
+            {
+                return;
+            }
+            for(var i = 0; changed != 0 && i < 32; i++)
+            {
+                if((changed & (1u << i)) != 0)
+                {
+                    changed &= ~(1u << i);
+                    handler(i);
+                }
             }
         }
 
