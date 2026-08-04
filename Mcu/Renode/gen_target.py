@@ -18,10 +18,10 @@ usage:
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py --list                     targets this can emulate
 
-F051, F031, G071, G031, L431, G431, V203, E230 and F415 targets work,
-_CAN variants included - the L431's and F415's bxCAN and the G431's
-FDCAN are all modelled. Anything else exits 77, as the test harness
-does for a skip.
+F051, F031, G071, G031, L431, G431, V203, E230, A153, F415 and F421
+targets work, _CAN variants included - the L431's and F415's bxCAN and
+the G431's FDCAN are all modelled. Anything else exits 77, as the test
+harness does for a skip.
 '''
 
 import argparse
@@ -41,6 +41,7 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 WANTED = [
     'MCU_F051', 'MCU_G071', 'MCU_L431', 'MCU_G431', 'MCU_CH32V203',
     'MCU_F031', 'MCU_G031', 'MCU_GDE23', 'MCU_A153', 'MCU_AT415',
+    'MCU_AT421',
     # the NXP LPCMP pair: which unit and which minus input each phase is on
     'PHASE_A_COMP_UNIT', 'PHASE_A_COMP_INP',
     'PHASE_B_COMP_UNIT', 'PHASE_B_COMP_INP',
@@ -121,6 +122,10 @@ INMSEL = {
     # encodings at [6:4]; the set bit 30 lands in the unused CMP2 half
     'f415': {'0x400000E5': (6, 0), '0x400000C5': (4, 0),
              '0x400000D5': (5, 0)},
+    # so does the F421; CMPINVSEL[6:4] keeps the F051 encodings and
+    # adds 7=PA2 (the AT_245 polling-mode groups)
+    'f421': {'0x400000E5': (6, 0), '0x400000C5': (4, 0),
+             '0x400000D5': (5, 0), '0x400000F5': (7, 0)},
 }
 
 # the capture timer, as (address, nvic line), per family
@@ -138,6 +143,8 @@ CAPTURE_TIMER = {
     # group AT_D captures on TMR3_CH1 (PB4), group AT_H on TMR2_CH3
     # (PA2); the nvic lines are the timers' own global vectors
     'f415': {'TMR3': (0x40000400, 29), 'TMR2': (0x40000000, 28)},
+    # AT_B captures on TMR3_CH1 (PB4), AT_C/E/F on TMR15_CH1 (PA2)
+    'f421': {'TMR3': (0x40000400, 16), 'TMR15': (0x40014000, 20)},
 }
 
 # stock declaration and alternate-function map for whichever timers are
@@ -210,6 +217,17 @@ STOCK_TIMER = {
     'f415': {
         'TMR2': ('timer2', 0x40000000, 28, []),
         'TMR3': ('timer3', 0x40000400, 29, []),
+    },
+    # TMR3_CH1 on PB4 is AT MUX_1, the F0 TIM3_CH1 routing; TMR15_CH1
+    # on PA2 is MUX_0 - UN_TIM_Init() sets no mux for it, and the reset
+    # AFR value 0 is already TMR15_CH1, so the capture gate is AF 0
+    'f421': {
+        'TMR3': ('timer3', 0x40000400, 16, [
+            '    0 -> gpioPortA#06@1 | gpioPortB#04@1',
+        ]),
+        'TMR15': ('timer15', 0x40014000, 20, [
+            '    0 -> gpioPortA#02@0 | gpioPortB#14@1',
+        ]),
     },
     # TIM3 captures on every G031 group; TIM16 is the 20kHz loop timer
     'g031': {
@@ -525,6 +543,35 @@ FAMILY = {
         'base_repl': 'mcxa153_base.repl',
         'nxp': True,
     },
+    'f421': {
+        'macro': 'MCU_AT421',
+        # 120MHz core with every bus at /1, so the timers tick at 120MHz
+        'timer_hz': 120000000,
+        'gpio_a': 0x48000000,
+        'syscfg': 0,
+        'throttle': 0x50000000,
+        'bridge': 0x50000400,
+        'guilink': 0x50000800,
+        # the classic F0 DMA interrupt map; the capture arrives on
+        # channel 4 (AT_B) or 5 (AT_C/E/F) -> DMA1_Channel5_4_IRQn
+        'dma_irq': 11,
+        'dma_irq_map': {0: 9, 1: 10, 2: 10, 3: 11, 4: 11},
+        # the ADC transfers on channel 1; DMA1_Channel1_IRQHandler
+        # exists (it calls ADC_DMA_Callback) but ADC_Init() leaves its
+        # NVIC enable commented out, so the wire below stays masked
+        'adc_dma': 0,
+        'adc_base': 0x40012400,
+        'adc_sqr': False,
+        'temp_channel': 16,
+        # no factory calibration on this part: getConvertedDegrees()'s
+        # fixed constants are inverted through a seeded reference word
+        # for the F1-generation ADC model, WCH-style (see the .resc)
+        'timer_af': 2,
+        'extra_dma_irqs': [(0, 9)],
+        # the F1-generation (rank-sequenced) ADC model
+        'wch_adc': True,
+        'base_repl': 'at32f421_base.repl',
+    },
 }
 
 
@@ -646,7 +693,8 @@ def config(target, nm='arm-none-eabi-gcc'):
             break
     if family is None:
         raise Unsupported('%s is not an F051, F031, G071, G031, L431, '
-                          'G431, V203, E230 or F415 target; those are the '
+                          'G431, V203, E230, A153, F415 or F421 target; '
+                          'those are the '
                           'only AM32 MCU families with a Renode platform '
                           'base so far' % target)
 
@@ -706,6 +754,9 @@ def config(target, nm='arm-none-eabi-gcc'):
     elif chan.startswith('DMA1_Channel'):
         # the SPL spelling the WCH targets use
         dma_channel = int(chan[len('DMA1_Channel'):]) - 1
+    elif chan.startswith('DMA1_CHANNEL'):
+        # the Artery spelling
+        dma_channel = int(chan[len('DMA1_CHANNEL'):]) - 1
     elif chan.startswith('DMA_CH'):
         # GD numbers its channels from 0, matching the model's index
         dma_channel = int(chan[len('DMA_CH'):])
@@ -755,7 +806,8 @@ def config(target, nm='arm-none-eabi-gcc'):
         main = 0
         comp_of = {}
     else:
-        main = 1 if family in ('f051', 'e230', 'f415') else comp_number(
+        main = 1 if family in ('f051', 'e230', 'f415',
+                               'f421') else comp_number(
             m.get('MAIN_COMP', 'COMP2'))
         comp_of = {}
         for ph in 'ABC':
@@ -773,6 +825,13 @@ def config(target, nm='arm-none-eabi-gcc'):
             if macro in m:
                 raise Unsupported('%s: %s is not modelled on the f415'
                                   % (target, macro))
+
+    if 'USE_INVERTED_HIGH' in m:
+        # active-low high sides (five F421 targets today); the bridge
+        # refuses the flag rather than model it untested, so refuse at
+        # generation with the reason instead of at machine load
+        raise Unsupported('%s: USE_INVERTED_HIGH is not modelled by the '
+                          'bridge' % target)
 
     # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
     # than HIGH and LOW; the bridge takes them in the same two slots
@@ -887,8 +946,7 @@ def config(target, nm='arm-none-eabi-gcc'):
                    if m.get('AF_%s_LOW' % ph) else None
                    for ph in 'ABC'},
         # WS2812.c hardwires the strip to GPIOB; only the pin varies
-        'ws2812_pin': suffix_number(m['WS2812_PIN'], 'LL_GPIO_PIN_',
-                                    'WS2812 pin')
+        'ws2812_pin': pin_number(m['WS2812_PIN'])
                       if 'USE_LED_STRIP' in m and m.get('WS2812_PIN')
                       else None,
     }
@@ -1168,6 +1226,21 @@ def comp_block(cfg):
         ] + [
             '    0 -> exti@19',
         ]
+    if cfg['family'] == 'f421':
+        return [
+            '// SCFG and CMP share the first APB2 page, as on the F051, but',
+            '// the register is Artery\'s own: one ctrlsts word at 0x1C with',
+            '// the inverting select at [6:4] (4=PA4, 5=PA5, 6=PA0, 7=PA2)',
+            '// and the output at bit 30. EXTI line 21, ADC1_CMP_IRQn.',
+            'syscfgcomp: Miscellaneous.AM32_AT32_Cmp @ sysbus <0x40010000, +0x400>',
+        ] + [
+            '    phase%sInmsel: %d' % (p, cfg['comps'][p][0]) for p in 'ABC'
+        ] + [
+            '    ctrlstsOffset: 0x1C',
+            '    outputBit: 30',
+            '    polarityBit: 15',
+            '    0 -> exti@21',
+        ]
     if cfg['family'] in ('f051', 'e230'):
         return [
             '// SYSCFG and COMP share a register page on the F051. Line 21 is',
@@ -1256,7 +1329,12 @@ def adc_block(cfg, spec):
             # the F415 sensor voltage RISES with temperature, unlike the
             # WCH/GD default the model inverts
             '    tempSlopeTenthsMvPerC: %d' % spec['temp_slope_tenths'],
-        ] if 'temp_slope_tenths' in spec else []) + [
+        ] if 'temp_slope_tenths' in spec else []) + ([
+            # the F421 USE_NTC targets read their temperature from an
+            # external NTC; unmapped it reads 0, which decodes to 400C
+            # and the thermal clamp cuts the duty before the motor starts
+            '    ntcChannel: %d' % cfg['ntc_channel'],
+        ] if cfg['ntc_channel'] >= 0 else []) + [
             '    0 -> dma@%d' % spec['adc_dma'],
         ]
     cal = [
@@ -1850,7 +1928,7 @@ def all_targets(nm='arm-none-eabi-gcc'):
     cand = [t for t in out.split()
             if 'F051' in t or 'G071' in t or 'L431' in t or 'G431' in t
             or 'V203' in t or 'F031' in t or 'G031' in t or 'E230' in t
-            or 'A153' in t or 'F415' in t]
+            or 'A153' in t or 'F415' in t or 'F421' in t]
     found = []
     for t in sorted(set(cand)):
         try:
