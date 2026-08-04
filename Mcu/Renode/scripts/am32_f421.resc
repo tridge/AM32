@@ -1,0 +1,69 @@
+:name: AM32 F421
+:description: boots an AM32 AT32F421 firmware ELF
+
+# Common to every F421 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the Artery specifics
+# are noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_EXTI.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/artery/AM32_AT32_Cmp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values; the
+# Artery ADC is the F1-generation register file the WCH model implements
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Adc.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+$eeprom_addr?=0x08007C00
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# The Artery temperature sensor has no factory calibration page: the
+# firmware applies fixed constants, getConvertedDegrees() being
+# (12800 - raw*33000/4096)/-42 + 25 - a POSITIVE 4.2mV/C slope where the
+# WCH/GD sensors fall with temperature. The ADC model inverts its fixed
+# -4.3mV/C formula around a reference word (degrees high half,
+# millivolts low half), so only the reference point itself can be made
+# exact: 38C (the physics default) at 1337mV lands the firmware's
+# truncating integer math on 38 exactly, and excursions from there read
+# mirrored at ~-1C/C. Exact until the physics models heating.
+sysbus WriteDoubleWord 0x1FFFF720 0x00260539
+
+# The M4 has a VTOR and SystemInit() points it at 0x08001000 itself;
+# the reset vector still needs the flash table before that runs.
+cpu VectorTableOffset 0x08001000
+
+macro reset
+"""
+    cpu VectorTableOffset 0x08001000
+"""
+
+
+# 120MHz Cortex-M4 from zero-wait-state-equivalent flash, one
+# instruction per cycle
+cpu PerformanceInMips 120
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true

@@ -1,0 +1,187 @@
+// AT32F421 common to every AM32 F421 target. Not loadable on its own:
+// the capture timer, the ADC, the comparator, the bridge and the
+// throttle wiring come from a generated target overlay.
+//
+// Artery's 120MHz Cortex-M4 (no FPU) remake of the STM32F0 generation,
+// and register-compatible almost everywhere AM32 touches it: GPIO
+// (numberOfAFs 8), the timer block including BRK=BDTR, EXINT (the
+// F0/F4 EXTI layout, 4 NVIC priority bits), the five-channel DMA and
+// the WDT watchdog all run against the STM32 models unchanged, under
+// AT names (TMRn is ST's TIMn, same instance numbers and addresses).
+// The divergences: the ADC is the F1-generation register file (OSQ
+// rank sequencer, ODT at 0x4C, ADCAL/ADCALINIT self-clearing
+// calibration - the CH32V203/GD32E230 layout, so the WCH model
+// serves), USART1 is the F1 register file (stock STM32_UART, not the
+// F0/F7 one), and the comparator is Artery's own single-register CMP
+// sharing the SCFG page - AM32_AT32_Cmp, declared by the overlay.
+// HICK/2 x PLL30 gives 120MHz with every bus at /1, so all timers
+// tick at 120MHz.
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 120000000
+    IRQ -> cpu@0
+
+// ours, not the stock STM32F4_EXTI: the F421's EXINT15_4 handler
+// guards its flag clear on reading the pending bit back, which the
+// stock model's software trigger never sets (see AM32_STM32F0_EXTI.cs)
+exti: IRQControllers.AM32_STM32F0_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 32
+    [0, 1] -> nvicInput5@[0, 1]
+    [2, 3] -> nvicInput6@[0, 1]
+    [4-15] -> nvicInput7@[0-11]
+    [21] -> nvic@[12]
+
+nvicInput5: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@5
+
+nvicInput6: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@6
+
+// EXINT15_4: the BEMF lines never land here, but line 15 does - the
+// DMA ISR software-pends it through SWTRG to tail-chain processDshot()
+// at low priority, with no GPIO or trigger behind it at all
+nvicInput7: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 12
+    -> nvic@7
+
+// line 21 -> nvic@12 is ADC1_CMP_IRQn, raised by the comparator
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+// the F1-generation register file, so the stock F1-style model rather
+// than the STM32F7_USART the F0 families use
+usart1: UART.STM32_UART @ sysbus <0x40013800, +0x400>
+    -> nvic@27
+
+gpioPortA: GPIOPort.STM32_GPIOPort @ sysbus <0x48000000, +0x400>
+    modeResetValue: 0x28000000
+    pullUpPullDownResetValue: 0x24000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32_GPIOPort @ sysbus <0x48000400, +0x400>
+    modeResetValue: 0x00000000
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortC: GPIOPort.STM32_GPIOPort @ sysbus <0x48000800, +0x400>
+    modeResetValue: 0x00000000
+    pullUpPullDownResetValue: 0x00000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+gpioPortF: GPIOPort.STM32_GPIOPort @ sysbus <0x48001400, +0x400>
+    modeResetValue: 0x28000000
+    pullUpPullDownResetValue: 0x24000000
+    numberOfAFs: 8
+    [0-15] -> exti@[0-15]
+
+// TMR1: the advanced PWM timer, same model as everywhere
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 120000000
+    0 -> nvic@13
+    1 -> nvic@14
+
+// timer3 (AT_B capture) and timer15 (AT_C/E/F capture) are declared by
+// the target overlay: whichever is not capturing is declared stock.
+
+// TMR6: the free-running 2MHz interval timer (DIV 59)
+timer6: Timers.STM32_Timer @ sysbus 0x40001000
+    frequency: 120000000
+    initialLimit: 0xFFFF
+    -> nvic@17
+
+// TMR14: the 20kHz loop timer (DIV 119, 1MHz tick)
+timer14: Timers.STM32_Timer @ sysbus 0x40002000
+    frequency: 120000000
+    initialLimit: 0xFFFF
+    -> nvic@19
+
+// TMR16: the commutation timer
+timer16: Timers.STM32_Timer @ sysbus 0x40014400
+    frequency: 120000000
+    initialLimit: 0xFFFF
+    -> nvic@21
+
+// TMR17: the microsecond counter delayMicros() spins on
+timer17: Timers.STM32_Timer @ sysbus 0x40014800
+    frequency: 120000000
+    initialLimit: 0xFFFF
+    -> nvic@22
+
+// CRM: enable-to-ready flip-flops at the F0-style offsets. CTRL's
+// HICK/HEXT/PLL stable bits mirror their enables and CFG's SCLKSTS
+// mirrors SCLKSEL, which is everything system_clock_config() and
+// crm_reset() poll. PLL(0x2C), MISC1(0x30) and MISC2(0x54) writes -
+// crm_reset() and the auto-step enable land there - are stored.
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    data = {}
+
+if request.IsWrite:
+    data[request.Offset] = request.Value
+elif request.IsRead:
+    v = data.get(request.Offset, 0)
+    if request.Offset == 0x0:
+        # HICKSTBL(1) <- HICKEN(0), HEXTSTBL(17) <- HEXTEN(16),
+        # PLLSTBL(25) <- PLLEN(24)
+        request.Value = v | ((v & 1) << 1) | (((v >> 16) & 1) << 17) | (((v >> 24) & 1) << 25)
+    elif request.Offset == 0x4:
+        # SCLKSTS[3:2] mirrors SCLKSEL[1:0]
+        request.Value = (v & ~0xC) | ((v & 3) << 2)
+    else:
+        request.Value = v
+'''
+
+// FLASH: flash_operation_wait_for() polls an OBF that always reads
+// clear; the programming stores go straight to the flash addresses,
+// which MappedMemory accepts, and sector erase is a no-op
+// save_flash_nolib() tolerates by rewriting the whole page
+fmc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+
+// WDT: same register file as the STM32 IWDG; ours rather than a real
+// watchdog, as everywhere
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+// 64K flash with the app at 0x08001000 above an empty 4K bootloader
+// region. 16K of SRAM; the linker script places the stack top at
+// 0x20003C00, inside it.
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x10000
+
+flashAlias: Memory.MappedMemory @ sysbus 0x0
+    size: 0x10000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x4000
+
+// no factory calibration words on this part - the temperature formula
+// is fixed constants - but the WCH ADC model reads its reference point
+// from a seeded word here (the .resc writes matching values)
+systemMemory: Memory.MappedMemory @ sysbus 0x1FFFF000
+    size: 0x1000
+
+// five channels; the capture arrives on channel 4 (AT_B, TMR3_CH1) or
+// channel 5 (AT_C/E/F, TMR15_CH1) and the ADC on channel 1
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 5
+
+sysbus:
+    init:
+        Tag <0x40002C00, 0x40002FFF> "WWDT"
+        Tag <0x40004400, 0x400047FF> "USART2"
+        Tag <0x40005400, 0x400057FF> "I2C1"
+        Tag <0x40007000, 0x400073FF> "PWR"
+        Tag <0x40013000, 0x400133FF> "SPI1"
+        Tag <0x40003800, 0x40003BFF> "SPI2"
+        Tag <0x40015800, 0x40015BFF> "DEBUG"
+        Tag <0x40023000, 0x400233FF> "CRC"
