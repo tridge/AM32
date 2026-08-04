@@ -1,0 +1,172 @@
+// WCH CH32V203 common to every AM32 V203 target. Not loadable on its
+// own: the capture timer, the ADC, the bridge and the throttle wiring
+// come from a generated target overlay, as on the STM32 families.
+//
+// First RISC-V family in the harness. The QingKe V4B core boots on
+// Renode's generic RiscV32 with three pieces of help, all set up by
+// scripts/am32_v203.resc and peripherals/wch/AM32_WCH_Pfic.cs:
+// stubs for WCH's custom CSRs (0xbc0 corecfgr, 0x804 intsyscr, and
+// 0x800, an mstatus alias used by __enable_irq/__disable_irq), and
+// the PFIC model's trap dispatch, which turns Renode's mode-1 mtvec
+// landing back into WCH's vector-table dispatch with the hardware
+// prologue/epilogue emulated around it.
+//
+// The peripheral generation is STM32F1: CFGLR/CFGHR GPIO nibbles,
+// fixed DMA channel routing, rank-sequenced ADC, F1 register layouts
+// for TIM/DMA/EXTI/IWDG - which is why the F0 DMA model, the F4 EXTI
+// model and the shared timer models serve unchanged.
+
+cpu: CPU.RiscV32 @ sysbus
+    cpuType: "rv32imac_zicsr"
+    timeProvider: empty
+
+// one backing store visible at both 0 (where the code runs; the ELF
+// links at 0x1000-based addresses) and 0x08000000 (where the firmware
+// addresses its settings page at 0x0800F800): save_flash_nolib()'s
+// read-merge-erase-program cycle and the harness eeprom seeding must
+// see the same bytes through both windows
+flash: Memory.MappedMemory @ {
+        sysbus 0x0;
+        sysbus 0x08000000
+    }
+    size: 0x10000
+
+ram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x5000
+
+// factory data page: TempSensor_Volt_To_Temper() reads its calibration
+// point from 0x1FFFF720, which the family .resc seeds
+factory: Memory.MappedMemory @ sysbus 0x1FFFF000
+    size: 0x1000
+
+// named nvic, as WCH's own core_riscv.h does (#define NVIC PFIC),
+// so the generator's shared "-> nvic@N" emissions serve unchanged
+nvic: IRQControllers.AM32_WCH_Pfic @ sysbus 0xE000E000
+    cpu: cpu
+
+systick: Timers.AM32_WCH_SysTick @ sysbus 0xE000F000
+    frequency: 96000000
+    IRQ -> nvic@12
+
+// same single-bank layout as the F1 it descends from (INTENR at 0x00,
+// RTENR/FTENR/SWIEVR/INTFR following), which is the layout the stock
+// F4 model implements. Not clearing a pending line on its own is load
+// bearing here too: EXTI3/4_IRQHandler leave INTFR set inside the
+// blanking window and rely on immediate re-entry.
+exti: IRQControllers.STM32F4_EXTI @ sysbus 0x40010400
+    numberOfOutputLines: 20
+    [0-4] -> nvic@[22-26]
+    [5-9] -> nvicInput39@[0-4]
+    [10-15] -> nvicInput40@[0-5]
+
+nvicInput39: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 5
+    -> nvic@39
+
+nvicInput40: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 6
+    -> nvic@40
+
+gpioPortA: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010800, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010C00, +0x400>
+    [0-15] -> exti@[0-15]
+
+// no target pin lands here, but the bridge polls all three ports
+gpioPortC: GPIOPort.STM32F1GPIOPort @ sysbus <0x40011000, +0x400>
+    [0-15] -> exti@[0-15]
+
+// AFIO: EXTICR selections and the TIM1 partial remap land here. Stored
+// and read back, not interpreted: PA3/PA4 are wired to EXTI 3/4 above,
+// and the bridge's F1 mode trusts the remap the firmware always sets.
+afio: Miscellaneous.AM32_RegisterFile @ sysbus <0x40010000, +0x400>
+
+// motor PWM. The CH32 keeps the F1 advanced-timer register layout,
+// which matches the F0/G0 layout this model was written against.
+// IRQ 41 is TIM1_UP, 43 is TIM1_CC; the firmware enables neither.
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 48000000
+    0 -> nvic@41
+    1 -> nvic@43
+
+// timer2 is declared by the target overlay: it is the input-capture
+// timer on this family, and belongs with the DMA and pin wiring.
+
+timer3: Timers.STM32_Timer @ sysbus 0x40000400
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@45
+
+timer4: Timers.STM32_Timer @ sysbus 0x40000800
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@46
+
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 7
+
+usart2: UART.STM32_UART @ sysbus <0x40004400, +0x400>
+    -> nvic@53
+
+// the OPA block doubles as the BEMF comparator on this part; it also
+// owns EXTEN_CTR at offset 0 of its page. Outputs land on real pins:
+// OPA1 on PA3, OPA2 on PA4, which EXTI edge-detects via the port
+// wiring above and getCompOutputLevel() reads back through INDR.
+opa: Miscellaneous.AM32_WCH_Opa @ sysbus <0x40023800, +0x100>
+    0 -> gpioPortA@3
+    1 -> gpioPortA@4
+
+// Enable-to-ready flip-flops at the F1-style offsets. CFGR0 keeps the
+// PLL fields SystemCoreClockUpdate() recomputes the clock from, and
+// RSTSCKR always reports LSIRDY: the LSI auto-starts with the IWDG and
+// IWDG_Enable() polls for it without ever writing LSION.
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    data = {'ctlr': 0, 'cfgr0': 0, 'rstsckr': 0}
+
+if request.IsWrite:
+    if request.Offset == 0x0:
+        data['ctlr'] = request.Value
+    elif request.Offset == 0x4:
+        data['cfgr0'] = request.Value
+    elif request.Offset == 0x24:
+        data['rstsckr'] = request.Value
+elif request.IsRead:
+    if request.Offset == 0x0:
+        # HSIRDY(1) <- HSION(0), HSERDY(17) <- HSEON(16),
+        # PLLRDY(25) <- PLLON(24)
+        v = data['ctlr']
+        request.Value = v | ((v & 1) << 1) | (((v >> 16) & 1) << 17) | (((v >> 24) & 1) << 25)
+    elif request.Offset == 0x4:
+        # SWS[3:2] mirrors SW[1:0], everything else reads back
+        v = data['cfgr0']
+        request.Value = (v & ~0xC) | ((v & 3) << 2)
+    elif request.Offset == 0x24:
+        # LSI auto-starts with the IWDG; always report LSIRDY(1)
+        request.Value = data.get('rstsckr', 0) | 0x2
+    else:
+        request.Value = 0
+'''
+
+// FLASH controller: the fast-program path strobes CTLR and polls a
+// STATR that always reads not-busy; the data words go straight to the
+// flash addresses, which MappedMemory accepts as plain RAM. Page erase
+// is a no-op, which save_flash_nolib() tolerates by programming the
+// whole read-merged page.
+flash_ctrl: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+
+// ours rather than Renode's watchdog, as on the other families: the
+// register layout matches the STM32's (CTLR/PSCR/RLDR = KR/PR/RLR)
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+sysbus:
+    init:
+        Tag <0x40002800, 0x40002BFF> "BKP"
+        Tag <0x40002C00, 0x40002FFF> "WWDG"
+        Tag <0x40004800, 0x40004BFF> "USART3"
+        Tag <0x40005400, 0x400057FF> "I2C1"
+        Tag <0x40013800, 0x40013BFF> "USART1"

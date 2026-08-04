@@ -65,12 +65,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 string topology = "highlow", uint timerAf = 2,
                                 uint lowAfA = 0, uint lowAfB = 0, uint lowAfC = 0,
                                 ulong gpioFBase = 0,
-                                ulong syscfgBase = 0)
+                                ulong syscfgBase = 0,
+                                bool f1Gpio = false)
         {
             this.machine = machine;
             this.batchUs = batchUs == 0 ? 1u : batchUs;
             this.timerAf = timerAf;
             this.syscfgBase = syscfgBase;
+            // F1-generation GPIO (the WCH CH32 keeps it): CFGLR/CFGHR
+            // nibbles instead of MODER+AFR, ODR at 0x0C
+            this.f1Gpio = f1Gpio;
             // index 3 is GPIOF, for the G431 groups whose phase A low
             // side is PF0; base 0 means the platform declares no port F
             gpioBase = new[] { gpioABase, gpioBBase, gpioCBase, gpioFBase };
@@ -365,10 +369,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     continue;
                 }
-                moder[i] = gpio[i].ReadDoubleWord(0);
-                odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
-                afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
-                afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
+                if(f1Gpio)
+                {
+                    cfgl[i] = gpio[i].ReadDoubleWord(0);
+                    cfgh[i] = gpio[i].ReadDoubleWord(CfghOffset);
+                    odr[i] = gpio[i].ReadDoubleWord(OdrOffsetF1);
+                }
+                else
+                {
+                    moder[i] = gpio[i].ReadDoubleWord(0);
+                    odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
+                    afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
+                    afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
+                }
             }
 
             // CEN gates everything: a counter that never advances never
@@ -538,6 +551,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // and that is a live porting bug on a new target.
         private bool TimerDrives(int port, int pin, uint expectedAf)
         {
+            if(f1Gpio)
+            {
+                // one CFG nibble per pin: MODE[1:0] nonzero (output)
+                // with CNF[1] set means alternate function output. There
+                // is no per-pin AF number to check on this generation -
+                // routing is AFIO remap, which the firmware programs
+                // before enabling the outputs and is not modelled.
+                var cfg = pin < 8 ? cfgl[port] : cfgh[port];
+                var nib = (cfg >> (4 * (pin & 7))) & 0xF;
+                return (nib & 3) != 0 && (nib & 8) != 0;
+            }
             if(((moder[port] >> (2 * pin)) & 3) != ModeAlternate)
             {
                 return false;
@@ -566,6 +590,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const long OdrOffset = 0x14;
         private const long AfrlOffset = 0x20;
         private const long AfrhOffset = 0x24;
+        private const long CfghOffset = 0x04;
+        private const long OdrOffsetF1 = 0x0C;
 
         private const int RtldNow = 2;
         private const int RtldGlobal = 0x100;
@@ -609,6 +635,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] odr = new uint[4];
         private readonly uint[] afrl = new uint[4];
         private readonly uint[] afrh = new uint[4];
+        private readonly uint[] cfgl = new uint[4];
+        private readonly uint[] cfgh = new uint[4];
+        private readonly bool f1Gpio;
         private readonly int[] lastMode = new int[3];
         private readonly bool invertedLow;
         // AF number that routes TIM1 to a pin; 2 on F0 and G0, 1 on the
