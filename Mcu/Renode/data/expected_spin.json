@@ -63,6 +63,10 @@
   "rpm": 3090,
   "zero_crosses": 3034
  },
+ "AT32DEV_F415": {
+  "rpm": 2985,
+  "zero_crosses": 2917
+ },
  "BLPWR_F051": {
   "rpm": 3110,
   "zero_crosses": 3033
@@ -279,6 +283,10 @@
   "rpm": 2990,
   "zero_crosses": 2884
  },
+ "ORCA_12S_F415": {
+  "rpm": 2985,
+  "zero_crosses": 2917
+ },
  "ORQA_F051": {
   "rpm": 2587,
   "zero_crosses": 2498
@@ -314,6 +322,10 @@
  "REF_F031": {
   "rpm": 2799,
   "zero_crosses": 2738
+ },
+ "REF_F415_CAN": {
+  "rpm": 2985,
+  "zero_crosses": 2919
  },
  "REF_G431": {
   "rpm": 3090,
@@ -447,6 +459,14 @@
   "rpm": 2990,
   "zero_crosses": 2884
  },
+ "TBS_12S_F415": {
+  "rpm": 2985,
+  "zero_crosses": 2917
+ },
+ "TBS_12S_F415_CAN": {
+  "rpm": 2985,
+  "zero_crosses": 2919
+ },
  "TBS_12S_G071": {
   "rpm": 2863,
   "zero_crosses": 2757
@@ -470,6 +490,14 @@
  "TBS_4IN1_G071": {
   "rpm": 2989,
   "zero_crosses": 2884
+ },
+ "TBS_F415_CAN": {
+  "rpm": 2985,
+  "zero_crosses": 2919
+ },
+ "TEKKO32_F415": {
+  "rpm": 2985,
+  "zero_crosses": 2917
  },
  "TMOTOR45_F051": {
   "rpm": 2985,

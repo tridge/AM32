@@ -111,6 +111,15 @@ BDSHOT_NOARM = {
 }
 
 
+# Families whose bidirectional-dshot eRPM reply is off by a fixed
+# factor ON REAL HARDWARE, so the reply check must expect it rather
+# than fail. The F415 sums commutation intervals assuming 0.5us ticks
+# ("COMMUTATION INTERVAL IS 0.5US INCREMENTS", Src/main.c), but its
+# INTERVAL_TIMER runs at 144MHz/75 = 1.92MHz, 0.5208us a tick - so the
+# reported period is 24/25 of the true one and the eRPM reads 25/24
+# high. A firmware trait, not an emulation artefact.
+REPLY_RPM_SCALE = {'f415': 25.0 / 24.0}
+
 # what AM32 makes of a 1300us servo pulse, the same internal throttle the
 # scripted tests use, so a link run is comparable with them
 LINK_DSHOT_VALUE = 632
@@ -786,7 +795,8 @@ def link_sample(ds, sim):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--target', default='FD6288_F051',
-                    help='any F051, G071, L431 or G431 target in Inc/targets.h')
+                    help='any target in Inc/targets.h whose MCU family has '
+                         'a platform base (gen_target.py --list shows them)')
     # defaults to whatever obj/ holds for the target, so the firmware
     # version does not have to be tracked here
     ap.add_argument('--elf', default=None)
@@ -895,8 +905,8 @@ def main():
             target_resc, _ = gen_target.generate(args.target, scratch, args.gcc)
             throttle_addr = gen_target.throttle_address(args.target, args.gcc)
             timer_name = gen_target.capture_timer_name(args.target, args.gcc)
-            if args.can and not gen_target.config(args.target,
-                                                  args.gcc)['dronecan']:
+            target_cfg = gen_target.config(args.target, args.gcc)
+            if args.can and not target_cfg['dronecan']:
                 skip('%s has no CAN peripheral' % args.target)
         except gen_target.Unsupported as e:
             skip(str(e))
@@ -1038,12 +1048,18 @@ def main():
         period = (payload & 0x1FF) << (payload >> 9)
         poles = int(motor.get('poles', 14))
         erpm = 60e6 / period if period else 0
-        want = s.get('rpm', 0)
+        # some families misreport by a fixed factor on real hardware
+        # too; hold the reply to what the real ESC would say
+        scale = REPLY_RPM_SCALE.get(target_cfg['family'], 1.0)
+        want = s.get('rpm', 0) * scale
         got = erpm / (poles / 2)
         check('reply reports the measured rpm',
               want and abs(got - want) < 0.02 * want,
-              'frame=0x%04X period=%dus -> %drpm, physics %drpm'
-              % (frame, period, got, want))
+              'frame=0x%04X period=%dus -> %drpm, physics %drpm%s'
+              % (frame, period, got, s.get('rpm', 0),
+                 '' if scale == 1.0 else
+                 ' (x%.4f firmware scale -> %drpm expected)'
+                 % (scale, want)))
     if r and args.edt and not noarm:
         # each telemetry kind carries a different top nibble, so one run
         # shows whether all three went out. The divisors are 40 frames

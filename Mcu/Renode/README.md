@@ -14,17 +14,17 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Nine MCU families are supported: F051, F031, G071, G031, L431,
-G431, the RISC-V CH32V203, the GigaDevice GD32E230 and the NXP
-MCXA153**, covering the
-52 F051, 3 F031, 54 G071, 1 G031, 18 L431, 6 G431, 1 V203, 8 E230 and
-1 A153 targets with no per-target file to write - the platform is
-generated from
+**Ten MCU families are supported: F051, F031, G071, G031, L431,
+G431, the RISC-V CH32V203, the GigaDevice GD32E230, the NXP MCXA153
+and the Artery AT32F415**, covering the 52 F051, 3 F031, 54 G071,
+1 G031, 18 L431, 6 G431, 1 V203, 8 E230, 1 A153 and 7 F415 targets
+with no per-target file to write - the platform is generated from
 `Inc/targets.h` on demand. What differs between the families is a
 table in `gen_target.py`, not a second code path. The `_CAN` targets
 run their DroneCAN firmware on an emulated CAN peripheral - the
-L431's bxCAN, the G431's FDCAN (see below); they are recognised by the
-value the preprocessor gives `DRONECAN_SUPPORT`, not by their names.
+L431's and F415's bxCAN, the G431's FDCAN (see below); they are
+recognised by the value the preprocessor gives `DRONECAN_SUPPORT`,
+not by their names.
 The SEQURE_G431 pair currently fails its spin assertions to a known
 low-speed startup fidelity gap described below.
 
@@ -439,6 +439,80 @@ impossible because `ic_timer_prescaler` was left at 0 where
 `run_renode_tests.py` documents it; the bdshot run still asserts the
 reply plumbing, and the `--link` run drives plain dshot instead so the
 spin assertion stays.
+
+### The AT32F415
+
+Artery's 144MHz Cortex-M4 (no FPU), and after the CH32V203 the second
+F1-generation reunion: CFGLR/CFGHR GPIO at the F1 addresses, F1
+layouts for the timers, DMA, EXINT, WDT and bxCAN, and the
+rank-sequenced F1 ADC. Most of the machine is therefore the V203's
+model set - the F0 DMA, `STM32F1GPIOPort`, `AM32_WCH_Adc`, the
+bridge's `f1Gpio` mode, the shared timer models and our IWDG - with
+both APB buses at /2 and the F1 timer doubler putting every timer at
+the full 144MHz. The capture timer differs per hardware group: AT_D
+boards ride TMR3_CH1 on PB4, AT_H boards TMR2_**CH3** on PA2 - the
+second user of the capture model's channel parameter after the F031.
+The Artery-isms:
+
+- **the comparator is a block of its own** at 0x40002400, not a SYSCFG
+  tenant: nearly the F051's COMP1 half-register (enable bit 0, INMSEL
+  at [6:4], output at bit 14), whole-assigned with `PHASE_x_COMP`
+  constants whose stray bit 30 lands in the unused CMP2 half. It gates
+  EXTI line 19, which has its **own NVIC vector** (`CMP1_IRQn` 70)
+  rather than sharing an EXINT one. `AM32_AT32_Cmp` models it, with
+  the output bit position a constructor parameter because the F421's
+  otherwise-similar block reads back at bit 30 - the model is shared
+  with that port.
+- **the stock EXTI model broke the deferred-dshot path**, the first
+  family to notice: Renode's `STM32F4_EXTI` sets the output line on a
+  SWIER write but never latches the pending bit. The L431 gets away
+  with it because its handler clears line 15 unconditionally; the
+  F415's `EXINT15_10_IRQHandler` *reads* `intsts` to decide what to
+  service, saw nothing, cleared nothing, and the level-held NVIC line
+  re-entered it forever - the 20kHz loop (a lower priority) starved
+  and the ESC never armed. `AM32_STM32_Exti` is the stock model with
+  the software interrupt latching PR, as hardware does.
+- **DMA request routing is a flexible mux**, not fixed F1 wiring:
+  `SRC_SEL0/1` at 0xA0/0xA4 assign 8-bit request IDs per channel
+  (ADC1 to channel 1, UART1 TX to 4, the capture timer to 6). The
+  offsets fall past the model's seven-channel register block and are
+  ignored; the platform hardwires the routing, the same deliberate
+  deviation as the G0's DMAMUX and the L4's CSELR.
+- **the temperature sensor slope runs the other way.** No factory
+  calibration page; `getConvertedDegrees()` applies fixed constants
+  amounting to 1344mV at 25C **rising** 4.2mV/C, where the WCH and GD
+  sensors fall 4.3mV/C - so `AM32_WCH_Adc` grew a slope parameter,
+  and the family .resc seeds the reference word 1mV high to cancel
+  the firmware's fixed-point truncation. The .resc also seeds the
+  flash-size halfword at 0x1FFFF7E0 (128), which `sector_size()` in
+  `Mcu/f415/Src/eeprom.c` reads to pick 1K over 2K sectors.
+- **the ADC channel macros are dead code**: `Mcu/f415/Src/ADC.c`
+  hardwires rank 1 = CH3 read back as voltage and rank 2 = CH6 as
+  current, whatever `VOLTAGE_ADC_CHANNEL` says, so the generator uses
+  the fixed channels as it does on the V203.
+- **the eRPM reply is 25/24 high on real hardware too**: the firmware
+  sums commutation intervals assuming 0.5us ticks, but its interval
+  timer runs at 144MHz/75 = 1.92MHz. The bidirectional-reply check
+  in `run_renode_tests.py` expects the scale (`REPLY_RPM_SCALE`)
+  instead of failing the honest emulation of it.
+- **CRM wants real readback**: `system_core_clock_update()`,
+  `usart_init()` and `sys_can_init()` all recompute clocks from the
+  stored CFG multiplier and PLL register, so the stub keeps what was
+  written and mirrors the enable-to-ready and SCLKSEL-to-SCLKSTS
+  bits, like the other families' RCC stubs.
+- **the `_CAN` targets are bxCAN**, bit-for-bit the STM32's at the
+  STM32 address with the same four vectors, so the stock `STMCAN` and
+  the existing mcast bridge serve exactly as on the L431. The 16K CAN
+  bootloader puts the app base at 0x08004000, and DroneCAN's
+  bootloader flag lives in ERTC backup registers, a write-readback
+  stub. `TBS_12S_F415` (no CAN) shares the 128K parts' relocated
+  eeprom at 0x0801F800.
+
+`DAKEFPV_35A_F415` is build-disabled upstream (no comparator group in
+targets.h), so generation refuses it with a comparator error and it
+never appears in sweeps. `PerformanceInMips` is 96 - 144MHz from
+4-wait-state flash, pinned by the same dshot capture-window alignment
+reasoning as the L431's 48.
 
 ### One target is skipped
 
