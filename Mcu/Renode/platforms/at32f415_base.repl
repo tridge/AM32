@@ -1,0 +1,229 @@
+// Artery AT32F415 common to every AM32 F415 target. Not loadable on its
+// own: the capture timer, the comparator, the ADC, the bridge and the
+// throttle wiring come from a generated target overlay, as on the other
+// families.
+//
+// First Artery family here. A 144MHz Cortex-M4 (no FPU) wrapped around
+// F1-generation peripherals: CFGLR/CFGHR GPIO nibbles at the F1
+// addresses, F1 register layouts for TIM/DMA/EXINT/WDT/bxCAN, and a
+// rank-sequenced F1 ADC - which is why the CH32V203's models (the F0
+// DMA, the F4 EXTI, the WCH ADC, the F1 GPIO port and the shared timer
+// models) serve unchanged. The Artery-specific pieces are the CMP block
+// at 0x40002400 (peripherals/artery/AM32_AT32_Cmp.cs, declared by the
+// overlay) and the CRM clock controller stubbed below.
+//
+// AHB runs at 144MHz with both APB buses at /2, and the F1 timer
+// doubler puts every timer back at 144MHz - all the firmware's
+// prescaler arithmetic assumes it (CPU_FREQUENCY_MHZ 144).
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 144000000
+    IRQ -> cpu@0
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m4"
+    nvic: nvic
+
+// F1 single-bank layout (INTEN at 0x00, POLCFG1/POLCFG2/SWTRG/INTSTS
+// following), the layout the stock F4 model implements - but NOT the
+// stock model: EXINT15_10_IRQHandler reads INTSTS before clearing, and
+// the stock SWIER never latches the pending bit, so the deferred-dshot
+// software trigger left the NVIC line stuck and the handler re-entering
+// forever (see AM32_STM32_Exti.cs). Not clearing a pending line on its
+// own is load bearing as everywhere: CMP1_IRQHandler leaves INTSTS set
+// inside the commutation blanking window and relies on immediate
+// re-entry. Line 19 is the comparator, with its OWN vector (CMP1_IRQn
+// 70) rather than an EXINT one; line 15 is pulsed through SWTRG to
+// defer dshot decoding out of the DMA interrupt (EXINT15_10, vector
+// 40).
+exti: IRQControllers.AM32_STM32_Exti @ sysbus 0x40010400
+    numberOfOutputLines: 20
+    [0-4] -> nvic@[6-10]
+    [5-9] -> nvicInput23@[0-4]
+    [10-15] -> nvicInput40@[0-5]
+    19 -> nvic@70
+
+nvicInput23: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 5
+    -> nvic@23
+
+nvicInput40: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 6
+    -> nvic@40
+
+// TMR1_OVF_TMR10_IRQn: TMR1's update interrupt shares line 25 with
+// TMR10. The firmware enables neither, but the sharing is real
+// hardware wiring. TMR9 and TMR11 share lines 24 and 26 with TMR1's
+// brake and trigger interrupts the same way; those are wired straight
+// to the timer that actually uses them.
+nvicInput25: Miscellaneous.CombinedInput @ none
+    numberOfInputs: 2
+    -> nvic@25
+
+gpioPortA: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010800, +0x400>
+    [0-15] -> exti@[0-15]
+
+gpioPortB: GPIOPort.STM32F1GPIOPort @ sysbus <0x40010C00, +0x400>
+    [0-15] -> exti@[0-15]
+
+// no target pin lands here, but the bridge polls all three ports
+gpioPortC: GPIOPort.STM32F1GPIOPort @ sysbus <0x40011000, +0x400>
+    [0-15] -> exti@[0-15]
+
+// IOMUX: Artery's AFIO. The remap registers (the legacy word at 0x04
+// and the per-peripheral GMUX words at 0x20-0x34) are stored and read
+// back, not interpreted: the TMR1 GMUX_0001 remap that puts CH1N/2N/3N
+// on PA7/PB0/PB1, the TMR3/TMR2 input remaps and the SWJTAG release of
+// PB4 are all trusted, as the bridge's F1 mode and the ungated capture
+// pin trust the AFIO on the CH32V203. EXINTC (EXTICR) is never written.
+iomux: Miscellaneous.AM32_RegisterFile @ sysbus <0x40010000, +0x400>
+
+// motor PWM. The F415 keeps the F1 advanced-timer register layout,
+// which matches the F0/G0 layout this model was written against.
+// Update shares line 25 with TMR10, channel is line 27; the firmware
+// enables neither.
+timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
+    frequency: 144000000
+    0 -> nvicInput25@0
+    1 -> nvic@27
+
+// TMR2 and TMR3 trade the capture role per hardware group (TMR3_CH1 on
+// PB4 for group AT_D, TMR2_CH3 on PA2 for AT_H); whichever captures is
+// declared by the target overlay, the other comes from the generator's
+// stock-timer table.
+
+// INTERVAL_TIMER, counting commutation intervals
+timer4: Timers.STM32_Timer @ sysbus 0x40000800
+    frequency: 144000000
+    initialLimit: 0xFFFF
+    -> nvic@30
+
+// TEN_KHZ_TIMER: the 20kHz loop interrupt (TMR1_BRK_TMR9_IRQn)
+timer9: Timers.STM32_Timer @ sysbus 0x40014C00
+    frequency: 144000000
+    initialLimit: 0xFFFF
+    -> nvic@24
+
+// UTILITY_TIMER, the 1MHz microsecond clock delayMicros() spins on
+timer10: Timers.STM32_Timer @ sysbus 0x40015000
+    frequency: 144000000
+    initialLimit: 0xFFFF
+    -> nvicInput25@1
+
+// COM_TIMER (TMR1_TRG_HALL_TMR11_IRQn)
+timer11: Timers.STM32_Timer @ sysbus 0x40015400
+    frequency: 144000000
+    initialLimit: 0xFFFF
+    -> nvic@26
+
+// DMA1, request driven as on the other families. The Artery flexible
+// request mux (SRC_SEL0/SRC_SEL1 at 0xA0/0xA4, routing ADC1 to channel
+// 1, UART1 TX to channel 4 and the capture timer to channel 6) falls
+// past the model's seven-channel block and is ignored, so the routing
+// is hardwired by the platform and the mux itself is not checked - the
+// same deliberate deviation as the G0's DMAMUX and the L4's CSELR.
+// Which channel raises which NVIC line is set by the overlay.
+dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
+    numberOfChannels: 7
+
+// serial telemetry, half-duplex on PB6. The DMA path is not modelled
+// (no UART1-to-channel-4 request line), the same standing gap as the
+// other families' interval telemetry.
+usart1: UART.STM32_UART @ sysbus <0x40013800, +0x400>
+    -> nvic@37
+
+// CRM: enable-to-ready flip-flops in the same spirit as the other
+// families' RCC stubs. SystemInit and system_clock_config() poll
+// HICKSTBL, PLLSTBL and the SCLKSTS mirror of SCLKSEL repeatedly, and
+// system_core_clock_update() recomputes the 144MHz core clock from the
+// stored CFG multiplier and the PLL register (whose reset value keeps
+// PLLCFGEN clear, selecting the legacy CFG path) - a zero readback
+// there would also break the baudrate arithmetic in usart_init() and
+// sys_can_init(), which derive PCLK the same way.
+crm: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.IsInit:
+    data = {}
+
+if request.IsWrite:
+    data[request.Offset] = request.Value
+elif request.IsRead:
+    v = data.get(request.Offset, 0)
+    if request.Offset == 0x0:
+        # HICKSTBL(1) <- HICKEN(0), HEXTSTBL(17) <- HEXTEN(16),
+        # PLLSTBL(25) <- PLLEN(24)
+        request.Value = v | ((v & 1) << 1) | (((v >> 16) & 1) << 17) | (((v >> 24) & 1) << 25)
+    elif request.Offset == 0x4:
+        # SCLKSTS[3:2] mirrors SCLKSEL[1:0]; the PLL multiplier and
+        # divider fields read back as written
+        request.Value = (v & ~0xC) | ((v & 3) << 2)
+    else:
+        request.Value = v
+'''
+
+// Write-readback stubs. FLASH: the program path strobes CTRL and polls
+// an STS that always reads not-busy; the data words go straight to the
+// flash addresses, which MappedMemory accepts as plain RAM - sector
+// erase is a no-op, which save_flash_nolib() tolerates by programming
+// whole sectors. PWC: SystemInit does a byte RMW at 0x40007050, which
+// the register file's byte translation accepts. ERTC: DroneCAN's
+// bootloader flag lives in the BPR data registers at 0x2850+, plain
+// stored words behind a write-protect dance that never polls.
+flash_ctrl: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+
+pwc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40007000, +0x400>
+
+ertc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40002800, +0x400>
+
+// ours rather than Renode's watchdog, as on the other families: the WDT
+// register layout matches the STM32 IWDG's (CMD/DIV/RLD = KR/PR/RLR)
+iwdg: Miscellaneous.AM32_STM32_IWDG @ sysbus <0x40003000, +0x400>
+
+// bxCAN, bit-for-bit the STM32's at the STM32 address with the same
+// four vectors. libcanard's driver needs the MSR.INAK handshake and the
+// TSR/RFxR mailbox semantics; the frames themselves go to a CANHub
+// created by the .resc on CAN targets, where an AM32_CanMcast bridge
+// puts them on the SITL's multicast bus for dronecan_gui_tool.
+can1: CAN.STMCAN @ sysbus <0x40006400, +0x400>
+    [0-3] -> nvic@[19-22]
+
+// 128K, the largest ESC part: the 64K targets keep their settings at
+// 0x08007C00 and the TBS 12S boards (CAN and not) at 0x0801F800, both
+// inside this.
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x20000
+
+// NOT an alias: a second, independent backing store at 0. Reads see
+// zeros, not flash, so checkDeviceInfo() finds no devinfo magic at
+// 0x00000FE0 and keeps the compile-time eeprom address - correct while
+// no bootloader is loaded, same as on the other families.
+flashAlias: Memory.MappedMemory @ sysbus 0x0
+    size: 0x1000
+
+// 32K, the CAN parts' size; the plain targets link their stack at 16K
+// and never see the rest
+ram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x8000
+
+// factory data page: the temperature reference word the WCH-style ADC
+// model inverts at 0x1FFFF720, the flash-size halfword sector_size()
+// reads at 0x1FFFF7E0 (both seeded by the family .resc) and the 96-bit
+// UID at 0x1FFFF7E8 sys_can_getUniqueID() copies, which reads zeros
+factory: Memory.MappedMemory @ sysbus 0x1FFFF000
+    size: 0x1000
+
+// The bridge, the throttle generator, the guilink, the capture timer,
+// the comparator and the ADC are declared by the target overlay: their
+// pin maps, channels and scaling differ per target. The made-up
+// peripherals sit at 0x60000000 as on the G0.
+
+sysbus:
+    init:
+        Tag <0x40002C00, 0x40002FFF> "WWDT"
+        Tag <0x40004400, 0x400047FF> "USART2"
+        Tag <0x40004800, 0x40004BFF> "USART3"
+        Tag <0x40005400, 0x400057FF> "I2C1"
+        Tag <0x40020400, 0x400207FF> "DMA2"
