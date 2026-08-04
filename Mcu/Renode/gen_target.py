@@ -18,7 +18,7 @@ usage:
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py --list                     targets this can emulate
 
-F051, G071, L431 and G431 targets work, _CAN variants included - the
+F051, G071, L431, G431 and V203 targets work, _CAN variants included - the
 L431's bxCAN and the G431's FDCAN are both modelled. Anything else
 exits 77, as the test harness does for a skip.
 '''
@@ -38,7 +38,7 @@ REPO = os.path.abspath(os.path.join(HERE, '..', '..'))
 # rather than assumed, including the PHASE_*_COMP fallbacks targets.h
 # applies at the bottom of the file.
 WANTED = [
-    'MCU_F051', 'MCU_G071', 'MCU_L431', 'MCU_G431',
+    'MCU_F051', 'MCU_G071', 'MCU_L431', 'MCU_G431', 'MCU_CH32V203',
     # the G431 SEQURE splits conversion across both ADC instances, and
     # its NTC rides in ADC1's sequence
     'USE_ADC_1_2', 'NTC_ADC_CHANNEL',
@@ -106,6 +106,7 @@ CAPTURE_TIMER = {
     'g071': {'TIM3': (0x40000400, 16), 'TIM16': (0x40014400, 21)},
     'l431': {'TIM15': (0x40014000, 24)},
     'g431': {'TIM15': (0x40014000, 24)},
+    'v203': {'TIM2': (0x40000000, 44)},
 }
 
 # stock declaration and alternate-function map for whichever timers are
@@ -148,6 +149,10 @@ STOCK_TIMER = {
             '    0 -> gpioPortA#02@9 | gpioPortB#14@1',
         ]),
     },
+    # F1-generation pin muxing has no per-pin AF numbers, so there is
+    # no AF map to hold: TIM3 and TIM4 are declared by the base repl and
+    # capture_input_af() finding nothing leaves the capture pin ungated
+    'v203': {},
 }
 
 # Everything that differs between the MCU families, in one place, so
@@ -268,6 +273,44 @@ FAMILY = {
         # the platform's CAN peripheral, for the hub wiring
         'can_name': 'can1',
     },
+    'v203': {
+        'macro': 'MCU_CH32V203',
+        # APB timers tick at 48MHz under the 96MHz core clock; all the
+        # firmware's prescaler arithmetic assumes 48
+        'timer_hz': 48000000,
+        # F1-generation addressing throughout
+        'gpio_a': 0x40010800,
+        'syscfg': 0,
+        'throttle': 0x60000000,
+        'bridge': 0x60000400,
+        'guilink': 0x60000800,
+        # DMA1_Channel5_IRQn as a PFIC interrupt number: the capture is
+        # on channel 5 (TIM2_CH1's fixed F1 routing)
+        'dma_irq': 31,
+        # the ADC transfers on DMA1 channel 1
+        'adc_dma': 0,
+        'adc_base': 0x40012400,
+        'adc_sqr': False,
+        'temp_channel': 16,
+        # ADCInit() hardwires the sequence instead of taking channels
+        # from targets.h: rank 1 is CH1 (PA1, voltage), rank 2 is CH6
+        # (PA6, current), rank 3 the internal temperature sensor
+        'fixed_voltage_channel': 1,
+        'fixed_current_channel': 6,
+        # unused by the bridge's F1 mode, which reads CFG nibbles
+        'timer_af': 0,
+        # DMA1_Channel1 (ADC) and DMA1_Channel7 (telemetry TX) both have
+        # real handlers in ch32v20x_it.c
+        'extra_dma_irqs': [(0, 27), (6, 33)],
+        # comparator duty is done by the OPA block, fixed per family and
+        # declared in the base platform; there are no PHASE_x_COMP macros
+        'opa_comp': True,
+        # F1-style CFGLR/CFGHR GPIO decode in the bridge
+        'f1_gpio': True,
+        # the F1-generation rank-sequenced ADC model
+        'wch_adc': True,
+        'base_repl': 'ch32v203_base.repl',
+    },
 }
 
 
@@ -327,10 +370,23 @@ def suffix_number(macro, prefix, what):
 
 
 def pin_name(port, pin):
-    '''GPIOA + LL_GPIO_PIN_10 -> "PA10"'''
-    if not port.startswith('GPIO') or not pin.startswith('LL_GPIO_PIN_'):
-        raise Unsupported('cannot read pin %s %s' % (port, pin))
-    return 'P%s%s' % (port[4:], pin[len('LL_GPIO_PIN_'):])
+    '''GPIOA + LL_GPIO_PIN_10 (or the SPL's GPIO_Pin_10) -> "PA10"'''
+    if port.startswith('GPIO'):
+        for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_'):
+            if pin.startswith(prefix):
+                return 'P%s%s' % (port[4:], pin[len(prefix):])
+    raise Unsupported('cannot read pin %s %s' % (port, pin))
+
+
+def pin_number(pin):
+    '''LL_GPIO_PIN_2 or GPIO_Pin_2 -> 2'''
+    for prefix in ('LL_GPIO_PIN_', 'GPIO_Pin_'):
+        if pin.startswith(prefix):
+            try:
+                return int(pin[len(prefix):])
+            except ValueError:
+                break
+    raise Unsupported('cannot read a pin number from %s' % pin)
 
 
 def capture_input_af(family, timer, port, pin):
@@ -364,9 +420,9 @@ def config(target, nm='arm-none-eabi-gcc'):
             family = fam
             break
     if family is None:
-        raise Unsupported('%s is not an F051, G071, L431 or G431 target; '
-                          'those are the only AM32 MCU families with a '
-                          'Renode platform base so far' % target)
+        raise Unsupported('%s is not an F051, G071, L431, G431 or V203 '
+                          'target; those are the only AM32 MCU families '
+                          'with a Renode platform base so far' % target)
 
     # DRONECAN_SUPPORT is always defined - 0 on a plain target, 1 on a
     # _CAN one - so the value is the test, not the name or definedness.
@@ -381,28 +437,44 @@ def config(target, nm='arm-none-eabi-gcc'):
         raise Unsupported('capture timer %s is not modelled on the %s'
                           % (timer, family))
     chan = m.get('INPUT_DMA_CHANNEL', '')
-    if not chan.startswith('LL_DMA_CHANNEL_'):
+    if chan.startswith('LL_DMA_CHANNEL_'):
+        dma_channel = int(chan[len('LL_DMA_CHANNEL_'):]) - 1
+    elif chan.startswith('DMA1_Channel'):
+        # the SPL spelling the WCH targets use
+        dma_channel = int(chan[len('DMA1_Channel'):]) - 1
+    else:
         raise Unsupported('cannot read DMA channel %s' % chan)
 
-    inmsel = INMSEL[family]
-    comps = {}
-    for ph in 'ABC':
-        c = m.get('PHASE_%s_COMP' % ph)
-        if c not in inmsel:
-            raise Unsupported('comparator input %s for phase %s is not one '
-                              'of %s' % (c, ph, '/'.join(sorted(inmsel))))
-        comps[ph] = inmsel[c]
+    if FAMILY[family].get('opa_comp'):
+        # no comparator peripheral: the OPA block routes the phases, its
+        # mapping is fixed per family and lives in the base platform
+        comps = {}
+    else:
+        inmsel = INMSEL[family]
+        comps = {}
+        for ph in 'ABC':
+            c = m.get('PHASE_%s_COMP' % ph)
+            if c not in inmsel:
+                raise Unsupported('comparator input %s for phase %s is not '
+                                  'one of %s' % (c, ph,
+                                                 '/'.join(sorted(inmsel))))
+            comps[ph] = inmsel[c]
 
     # Which comparator senses each phase. The G0 N_VARIANT targets and
     # every G431 group split the phases across COMP1 and COMP2, saying
     # so with PHASE_x_COMP_NUMBER; everything else keeps all three on
     # MAIN_COMP, and the F051 has only COMP1. Keying on the macro rather
     # than on N_VARIANT is what lets the G431 groups through.
-    main = 1 if family == 'f051' else comp_number(m.get('MAIN_COMP', 'COMP2'))
-    comp_of = {}
-    for ph in 'ABC':
-        num = m.get('PHASE_%s_COMP_NUMBER' % ph)
-        comp_of[ph] = comp_number(num) if num else main
+    if FAMILY[family].get('opa_comp'):
+        main = 0
+        comp_of = {}
+    else:
+        main = 1 if family == 'f051' else comp_number(m.get('MAIN_COMP',
+                                                            'COMP2'))
+        comp_of = {}
+        for ph in 'ABC':
+            num = m.get('PHASE_%s_COMP_NUMBER' % ph)
+            comp_of[ph] = comp_number(num) if num else main
 
     # a PWM_ENABLE_BRIDGE target names its pins PWM and ENABLE rather
     # than HIGH and LOW; the bridge takes them in the same two slots
@@ -436,14 +508,23 @@ def config(target, nm='arm-none-eabi-gcc'):
     # channel ever matches in the ADC model and the reading stays 0
     cur = m.get('CURRENT_ADC_CHANNEL')
     ntc = m.get('NTC_ADC_CHANNEL')
+    volt = m.get('VOLTAGE_ADC_CHANNEL')
+    if volt is None and 'fixed_voltage_channel' in FAMILY[family]:
+        # the WCH ADC driver hardwires its sequence instead of reading
+        # channel macros from targets.h
+        voltage_channel = FAMILY[family]['fixed_voltage_channel']
+        current_channel = FAMILY[family]['fixed_current_channel']
+    else:
+        voltage_channel = suffix_number(volt, 'LL_ADC_CHANNEL_',
+                                        'voltage channel')
+        current_channel = suffix_number(cur, 'LL_ADC_CHANNEL_',
+                                        'current channel') if cur else -1
     return {
         'target': target,
         'family': family,
         'name': m.get('FILE_NAME', target).strip('"').strip(),
-        'voltage_channel': suffix_number(m.get('VOLTAGE_ADC_CHANNEL'),
-                                         'LL_ADC_CHANNEL_', 'voltage channel'),
-        'current_channel': suffix_number(cur, 'LL_ADC_CHANNEL_',
-                                         'current channel') if cur else -1,
+        'voltage_channel': voltage_channel,
+        'current_channel': current_channel,
         'ntc_channel': suffix_number(ntc, 'LL_ADC_CHANNEL_',
                                      'ntc channel') if ntc else -1,
         'adc12': 'USE_ADC_1_2' in m,
@@ -454,14 +535,14 @@ def config(target, nm='arm-none-eabi-gcc'):
         'timer_addr': CAPTURE_TIMER[family][timer][0],
         'timer_irq': CAPTURE_TIMER[family][timer][1],
         # reference manual counts channels from 1, Renode from 0
-        'dma_channel': int(chan[len('LL_DMA_CHANNEL_'):]) - 1,
+        'dma_channel': dma_channel,
         'throttle_pin': pin_name(m['INPUT_PIN_PORT'], m['INPUT_PIN']),
         'input_base': FAMILY[family]['gpio_a']
                       + 0x400 * (ord(m['INPUT_PIN_PORT'][4:]) - ord('A')),
-        'input_pin': int(m['INPUT_PIN'][len('LL_GPIO_PIN_'):]),
+        'input_pin': pin_number(m['INPUT_PIN']),
         'input_af': capture_input_af(
             family, timer, m['INPUT_PIN_PORT'][4:],
-            int(m['INPUT_PIN'][len('LL_GPIO_PIN_'):])),
+            pin_number(m['INPUT_PIN'])),
         'dead_time': m.get('DEAD_TIME', '?'),
         'loop_hz': number('LOOP_FREQUENCY_HZ', 20000),
         'eeprom_addr': eeprom_addr,
@@ -502,6 +583,13 @@ def comp_number(macro):
 
 def comp_block(cfg):
     '''the comparator declaration, which is the biggest family split'''
+    if FAMILY[cfg['family']].get('opa_comp'):
+        return [
+            '// no comparator peripheral on this family: the OPA block in the',
+            '// base platform routes the phases, selected by OPA->CR writes',
+            '// from changeCompInput(), with its outputs on PA3/PA4 feeding',
+            '// EXTI lines 3 and 4 through the GPIO port wiring.',
+        ]
     if cfg['family'] == 'f051':
         return [
             '// SYSCFG and COMP share a register page on the F051. Line 21 is',
@@ -577,6 +665,17 @@ def adc_block(cfg, spec):
         '// conversions in software from the 1kHz loop, and modelling a',
         '// hardware trigger as well made sequences overlap forever.',
     ]
+    if spec.get('wch_adc'):
+        return head + [
+            'adc: Analog.AM32_WCH_Adc @ sysbus 0x%08X' % spec['adc_base'],
+            '    voltageChannel: %d' % cfg['voltage_channel'],
+            '    currentChannel: %d' % cfg['current_channel'],
+            '    voltageDivider: %d' % cfg['voltage_divider'],
+            '    millivoltPerAmp: %d' % cfg['millivolt_per_amp'],
+            '    currentOffsetMv: %d' % cfg['current_offset'],
+            '    temperatureChannel: %d' % spec['temp_channel'],
+            '    0 -> dma@%d' % spec['adc_dma'],
+        ]
     cal = [
         '    temperatureChannel: %d' % spec['temp_channel'],
         '    tsCal1: 0x%08X' % spec['ts_cal'][0],
@@ -650,9 +749,10 @@ def platform(cfg):
                                              cfg['dead_time']),
         '// throttle in on %s, captured by %s_CH1 into DMA1 channel %d'
         % (tp, cfg['timer'], cfg['dma_channel'] + 1),
-        '// comparator: A=%s B=%s C=%s (INMSEL[.INMESEL]), on COMP%s/%s/%s'
-        % (tuple(inmsel_name(cfg['comps'][p]) for p in 'ABC')
-           + tuple(cfg['comp_of'][p] for p in 'ABC')),
+        ('// comparator: A=%s B=%s C=%s (INMSEL[.INMESEL]), on COMP%s/%s/%s'
+         % (tuple(inmsel_name(cfg['comps'][p]) for p in 'ABC')
+            + tuple(cfg['comp_of'][p] for p in 'ABC'))) if cfg['comps']
+        else '// comparator: OPA-routed, fixed per family',
         '// bridge: %s' % ('gate driver PWM + enable per phase'
                            if cfg['enable_bridge'] else
                            ('high and low side, low side inverted'
@@ -660,7 +760,9 @@ def platform(cfg):
         '',
         # absolute: these are generated into a scratch or obj directory,
         # so a path relative to the platforms tree would not resolve
-        'using "%s"' % os.path.join(HERE, 'platforms', 'stm32%s_base.repl' % fam),
+        'using "%s"' % os.path.join(HERE, 'platforms',
+                                    spec.get('base_repl',
+                                             'stm32%s_base.repl' % fam)),
         '',
         '// Throttle capture. The stock timer model has no input capture, so',
         '// this is ours; it raises a DMA request rather than an interrupt',
@@ -733,6 +835,8 @@ def platform(cfg):
         '    phase%s%s: "%s"' % (p, side.capitalize(), cfg['pins'][p + side])
         for p in 'ABC' for side in ('HIGH', 'LOW')
     ] + ([
+        '    f1Gpio: true',
+    ] if spec.get('f1_gpio') else []) + ([
         '    topology: "enable"',
     ] if cfg['enable_bridge'] else []) + ([
         '    invertedLow: true',
@@ -1138,7 +1242,8 @@ def all_targets(nm='arm-none-eabi-gcc'):
     # Cheap substring prefilter, then ask the preprocessor what the
     # target really is.
     cand = [t for t in out.split()
-            if 'F051' in t or 'G071' in t or 'L431' in t or 'G431' in t]
+            if 'F051' in t or 'G071' in t or 'L431' in t or 'G431' in t
+            or 'V203' in t]
     found = []
     for t in sorted(set(cand)):
         try:
