@@ -41,7 +41,8 @@ namespace Antmicro.Renode.Peripherals.Analog
                             int millivoltPerAmp, int currentOffsetMv,
                             int temperatureChannel = 16,
                             ulong tempCalWord = 0x1FFFF720,
-                            int tempSlopeTenthsMvPerC = -43)
+                            int tempSlopeTenthsMvPerC = -43,
+                            int ntcChannel = -1, uint ntcCounts = 3104)
         {
             this.tempSlopeTenthsMvPerC = tempSlopeTenthsMvPerC;
             this.machine = machine;
@@ -52,6 +53,8 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.currentOffsetMv = currentOffsetMv;
             this.temperatureChannel = temperatureChannel;
             this.tempCalWord = tempCalWord;
+            this.ntcChannel = ntcChannel;
+            this.ntcCounts = ntcCounts;
             if(voltageDivider <= 0)
             {
                 throw new RecoverableException("voltageDivider must be positive");
@@ -189,6 +192,18 @@ namespace Antmicro.Renode.Peripherals.Analog
             {
                 return TemperatureCounts(degrees);
             }
+            else if(channel == ntcChannel)
+            {
+                // An external NTC divider, decoded by the firmware
+                // through its per-board NTC_table (Inc/ntc_tables.h),
+                // which this model does not carry - so a fixed count is
+                // returned rather than the physics temperature. Left at
+                // 0 the table's first entry reads as 400C and the
+                // thermal clamp cuts the duty to nothing before the
+                // motor can start. The default 3104 decodes to the 38C
+                // physics ambient on the table most F421 boards share.
+                return ntcCounts;
+            }
             else
             {
                 return 0;
@@ -259,6 +274,8 @@ namespace Antmicro.Renode.Peripherals.Analog
         private readonly int temperatureChannel;
         private readonly ulong tempCalWord;
         private readonly int tempSlopeTenthsMvPerC;
+        private readonly int ntcChannel;
+        private readonly uint ntcCounts;
 
         private AM32_F051_Bridge bridge;
         private uint statr, ctlr1, ctlr2, samptr1, samptr2, rdatar;
