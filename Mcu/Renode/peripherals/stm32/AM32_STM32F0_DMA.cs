@@ -105,9 +105,13 @@ namespace Antmicro.Renode.Peripherals.DMA
                     isr &= ~(nib << (4 * i));
                     // the line stays asserted while an event flag is
                     // still set, so a flag cleared separately is still
-                    // serviced by a re-dispatch
+                    // serviced by a re-dispatch; once the last event
+                    // flag goes, GIF goes with it (RM0008: an
+                    // individual clear also clears GIF when no other
+                    // flag remains)
                     if((isr & ((TCIF | HTIF | TEIF) << (4 * i))) == 0)
                     {
+                        isr &= ~(GIF << (4 * i));
                         Connections[i].Unset();
                     }
                 }
