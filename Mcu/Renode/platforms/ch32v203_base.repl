@@ -106,8 +106,11 @@ timer4: Timers.STM32_Timer @ sysbus 0x40000800
 dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000
     numberOfChannels: 7
 
+// IRQ 54: USART1 is 53 on this part. TX-DMA telemetry is not modelled
+// (no USART2-to-DMA7 request line), the same standing gap as the other
+// families' interval telemetry; no current V203 target enables it.
 usart2: UART.STM32_UART @ sysbus <0x40004400, +0x400>
-    -> nvic@53
+    -> nvic@54
 
 // the OPA block doubles as the BEMF comparator on this part; it also
 // owns EXTEN_CTR at offset 0 of its page. Outputs land on real pins:

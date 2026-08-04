@@ -50,6 +50,10 @@ WANTED = [
     # always defined by targets.h - 0 for a plain target, 1 for a _CAN
     # one - so it is the value that says whether CAN support is built in
     'DRONECAN_SUPPORT',
+    # V203 configuration variants the models do not cover: PA2 as the
+    # comparator instead of the OPA outputs, swapped fixed ADC channels,
+    # and ADC throttle input
+    'USE_PA2_AS_COMP', 'PA6_VOLTAGE', 'USE_ADC_INPUT',
     'IC_TIMER_REGISTER', 'INPUT_DMA_CHANNEL', 'INPUT_PIN', 'INPUT_PIN_PORT',
     'DEAD_TIME', 'FILE_NAME', 'EEPROM_START_ADD',
     # tenKhzRoutine()'s rate: armed_timeout_count counts to it, so it is
@@ -428,6 +432,15 @@ def config(target, nm='arm-none-eabi-gcc'):
     # _CAN one - so the value is the test, not the name or definedness.
     # The L431's bxCAN and the G431's FDCAN are modelled.
     dronecan = m.get('DRONECAN_SUPPORT', '0').strip() not in ('', '0')
+
+    if FAMILY[family].get('opa_comp'):
+        # the OPA phase mapping and the fixed ADC channel order are
+        # hardwired in the models; a target selecting one of these
+        # variants would launch and silently misbehave
+        for macro in ('USE_PA2_AS_COMP', 'PA6_VOLTAGE', 'USE_ADC_INPUT'):
+            if macro in m:
+                raise Unsupported('%s: %s is not modelled on the %s'
+                                  % (target, macro, family))
     if dronecan and 'can_name' not in FAMILY[family]:
         raise Unsupported('%s: CAN is not modelled on the %s'
                           % (target, family))
