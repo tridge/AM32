@@ -14,9 +14,10 @@ the real comparator. The firmware's own measured `commutation_interval`
 agrees with the rpm the physics reports, so the timing it derives and
 the motor it derives it from check out independently.
 
-**Four MCU families are supported: F051, G071, L431 and G431**,
-covering the 52 F051, 54 G071, 18 L431 and 6 G431 targets with no
-per-target file to write - the platform is generated from
+**Five MCU families are supported: F051, G071, L431, G431 and the
+RISC-V CH32V203**, covering the 52 F051, 54 G071, 18 L431, 6 G431 and
+1 V203 targets with no per-target file to write - the platform is
+generated from
 `Inc/targets.h` on demand. What differs between the families is a
 table in `gen_target.py`, not a second code path. The `_CAN` targets
 run their DroneCAN firmware on an emulated CAN peripheral - the
@@ -206,6 +207,83 @@ telemetry is not modelled (the stock USART raises no TX DMA request;
 nothing in the tests enables interval telemetry), and the `APB2RSTR`
 reset pulse `receiveDshotDma()` sends TIM15 every direction change is
 ignored by the RCC stub, as it is on the other families.
+
+### The CH32V203
+
+The fifth family is not an STM32 and not an ARM: WCH's CH32V203, a
+96MHz QingKe V4B RISC-V core. The peripheral generation is a faithful
+STM32F1, which is why most of the machine is reused models - the F0
+DMA (F1 layout is identical), the F4 EXTI (same single-bank layout,
+same load-bearing non-clearing re-entry), the shared advanced and
+capture timer models, our IWDG, and Renode's stock `STM32F1GPIOPort`.
+The interrupt controller is another matter. Renode's generic `RiscV32`
+boots the ELF once three WCH-isms are stubbed (`am32_v203.resc`:
+custom CSRs 0xbc0 and 0x804, and 0x800, an mstatus alias that
+`__enable_irq()` writes), but WCH's PFIC and "fast interrupt"
+machinery had to be emulated in `AM32_WCH_Pfic`:
+
+- **WCH vectoring is a table of handler addresses** (mtvec mode 3),
+  which Renode coerces to its CLINT-vectored mode 1 - so every
+  interrupt lands on a *data word inside the vector table*. All
+  sources funnel through the machine-external interrupt, so the model
+  hooks that one landing address, picks the winning PFIC source
+  (lowest priority byte, then lowest number), and redirects PC to the
+  handler read from the real table. Exceptions land at the table base
+  and are redirected to `HardFault_Handler` after logging.
+- **every AM32 handler is `WCH-Interrupt-fast`**: the compiler saves
+  no registers and relies on the hardware prologue/epilogue, which
+  also shadows mepc/mstatus per nesting level. The model saves the 16
+  caller-saved registers plus the trap CSRs at dispatch and restores
+  them from a pre-opcode hook on `mret` (0x30200073). An opcode hook
+  rather than an address hook is deliberate: Renode address hooks miss
+  translation blocks entered through the indirect-jump fast path - a
+  `ret` landing on the mret is exactly that - while opcode hooks are
+  embedded at translation time and always fire. Skipping the CSR
+  shadowing was good for the subtlest bug of the port: with one
+  architectural mepc, the EXTI trap taken inside the 20kHz handler
+  overwrote the outer return address, and the outer `mret` jumped into
+  a data variable with another context's registers.
+- **there is no comparator - two op-amps do BEMF duty.**
+  `changeCompInput()` routes one phase per step through `OPA->CR`, the
+  outputs land on real pins (PA3/PA4) read back through `GPIOA->INDR`
+  and edge-detected by EXTI lines 3 and 4. `AM32_WCH_Opa` maps the
+  three CR values to phases and drives the actual GPIO pins, so both
+  the INDR reads and the EXTI path are the firmware's own.
+- **the core SysTick is WCH's own** (64-bit CNT/CMP at 0xE000F000,
+  SR cleared by writing zero), the 20kHz loop timer here -
+  `AM32_WCH_SysTick`.
+- **the ADC is F1-generation**: RSQR1..3 rank sequencer, RDATAR, and
+  self-clearing CAL/RSTCAL bits the init spins on (`AM32_WCH_Adc`).
+  Temperature has no TS_CAL page; the factory point at 0x1FFFF720
+  with a fixed -4.3mV/C slope is seeded and inverted instead.
+- **dshot capture reaches both edges differently**: IC1 mapped to TRC
+  (CC1S=11) with the TI1 edge detector as trigger (SMCR TS=100)
+  instead of the STM32's CCER both-edge polarity - a mode the capture
+  timer model now recognises. Miss it and servo works while every
+  dshot flavour arms deaf.
+- the bridge grew an **`f1Gpio` mode**: phase drive decoded from
+  CFGLR/CFGHR nibbles (output mode with the CNF alternate bit) and
+  ODR at 0x0C, with no per-pin AF number to check - F1 routing is the
+  AFIO remap, which the firmware always programs and the model
+  deliberately trusts.
+- being the first family to enable the DMA **half-transfer interrupt**
+  (the capture handler needs HT for its servo polarity flip), it
+  exposed a live bug in the shared DMA model: IFCR cleared the whole
+  channel nibble on any bit write where real hardware clears per bit.
+  The arming tune runs with interrupts masked, HT and TC accumulated
+  across it, and the handler's HT-only clear wiped the pending TC -
+  after which the transfer-complete path never re-armed the DMA and
+  dshot input went permanently deaf the moment the ESC armed. One
+  model fix cured three symptoms: dshot300 arm-then-timeout, a
+  bidirectional reply frozen at a spinup-era period, and a degraded
+  bdshot spin speed.
+
+Two Renode-level gaps are papered over in the PFIC model rather than
+the platform: the CPU requires `mie.MEIE` for external-interrupt
+delivery, which the firmware (correctly, for WCH) never sets, so the
+model sets it when it installs its hooks; and `NVIC_SystemReset` via
+the PFIC CFGR key write is logged and ignored, so the signal-loss
+reboot path halts the machine instead of restarting the firmware.
 
 ### One target is skipped
 

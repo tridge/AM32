@@ -23,6 +23,10 @@
   "rpm": 2990,
   "zero_crosses": 2884
  },
+ "AIRBOT_V203": {
+  "rpm": 2730,
+  "zero_crosses": 2613
+ },
  "AM32REF_F051": {
   "rpm": 2985,
   "zero_crosses": 2904
