@@ -1,0 +1,63 @@
+:name: AM32 E230
+:description: boots an AM32 GD32E230 firmware ELF
+
+# Common to every E230 target. Do not include this directly - include a
+# generated per-target .resc, which sets $platform and then comes here.
+# See am32_f051.resc for what the variables mean; the GD specifics are
+# noted below.
+
+$repo?=@.
+$elf?=@none
+$eeprom?=@none
+$platform?=@none
+
+# first, because each .cs is compiled on its own against the ones
+# included before it: the comparator interface has to exist before
+# anything implements it or looks one up
+include $repo/Mcu/Renode/peripherals/common/IAM32Comparator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_SysCfgComp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
+include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+# after the bridge, which it samples for the physics sensor values; the
+# GD ADC is the F1-generation register file the WCH model implements
+include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Adc.cs
+# the LED strip decoder, whose type the guilink names
+include $repo/Mcu/Renode/peripherals/common/AM32_Ws2812.cs
+# after the bridge and the generator, whose types it names
+include $repo/Mcu/Renode/peripherals/common/AM32_GuiLink.cs
+
+mach create "am32"
+machine LoadPlatformDescription $platform
+
+sysbus LoadELF $elf
+
+$eeprom_addr?=0x08007C00
+sysbus LoadBinary $eeprom $eeprom_addr
+
+# The GD temperature sensor has no factory calibration page: the
+# firmware applies fixed datasheet constants (1.43V at 25C, -4.3mV/C).
+# The ADC model inverts a linear formula around a reference word -
+# degrees in the high half, millivolts in the low half - so seed it
+# with exactly those constants.
+sysbus WriteDoubleWord 0x1FFFF720 0x00190596
+
+# The M23 has a VTOR and SystemInit() points it at 0x08001000 itself;
+# the reset vector still needs the flash table before that runs.
+cpu VectorTableOffset 0x08001000
+
+macro reset
+"""
+    cpu VectorTableOffset 0x08001000
+"""
+
+
+# 72MHz Cortex-M23, one instruction per cycle
+cpu PerformanceInMips 72
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
