@@ -15,7 +15,10 @@
 // millivolts, high half reference degrees) and applies a fixed
 // -4.3 mV/C slope, so this model inverts exactly that against the same
 // word, which the family .resc seeds. getConvertedDegrees() divides by
-// 4096, not 4095, hence the scaling below.
+// 4096, not 4095, hence the scaling below. The slope is a parameter in
+// tenths of a millivolt per degree because the Artery sensor runs the
+// other way: the F415's fixed formula is 1344mV at 25C RISING 4.2mV/C,
+// where the WCH and GD parts fall 4.3mV/C.
 //
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
@@ -37,8 +40,10 @@ namespace Antmicro.Renode.Peripherals.Analog
                             int currentChannel, int voltageDivider,
                             int millivoltPerAmp, int currentOffsetMv,
                             int temperatureChannel = 16,
-                            ulong tempCalWord = 0x1FFFF720)
+                            ulong tempCalWord = 0x1FFFF720,
+                            int tempSlopeTenthsMvPerC = -43)
         {
+            this.tempSlopeTenthsMvPerC = tempSlopeTenthsMvPerC;
             this.machine = machine;
             this.voltageChannel = voltageChannel;
             this.currentChannel = currentChannel;
@@ -197,12 +202,14 @@ namespace Antmicro.Renode.Peripherals.Analog
 
         private uint TemperatureCounts(double degrees)
         {
-            // TempSensor_Volt_To_Temper: T = refT - (mv - refMv)*10/43,
-            // fed raw*3300/4096 by getConvertedDegrees()
+            // the linear sensor around the seeded reference point:
+            // TempSensor_Volt_To_Temper's T = refT - (mv - refMv)*10/43
+            // inverted at the default -4.3mV/C, the F415's rising
+            // formula at +4.2, each fed raw*3300/4096 by the firmware
             var word = machine.SystemBus.ReadDoubleWord(tempCalWord);
             var refMv = (int)(word & 0xFFFF);
             var refT = (int)((word >> 16) & 0xFFFF);
-            var mv = refMv + (refT - degrees) * 43.0 / 10.0;
+            var mv = refMv + (degrees - refT) * tempSlopeTenthsMvPerC / 10.0;
             return Clamp(mv * 4096.0 / 3300.0);
         }
 
@@ -251,6 +258,7 @@ namespace Antmicro.Renode.Peripherals.Analog
         private readonly int currentOffsetMv;
         private readonly int temperatureChannel;
         private readonly ulong tempCalWord;
+        private readonly int tempSlopeTenthsMvPerC;
 
         private AM32_F051_Bridge bridge;
         private uint statr, ctlr1, ctlr2, samptr1, samptr2, rdatar;
