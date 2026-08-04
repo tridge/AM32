@@ -409,7 +409,10 @@ FAMILY = {
         'temp_channel': 12,
         'ts_cal': (0x1FFF75A8, 0x1FFF75CA, 130, 3000),
         'timer_af': 2,
-        'extra_dma_irqs': [(1, 10)],
+        # ADC on channel 2 and telemetry TX on channel 3, sharing the
+        # DMA1_Channel2_3 line (the USART model raises no TX requests
+        # today, but the wiring is the honest one)
+        'extra_dma_irqs': [(1, 10), (2, 10)],
         # no comparator on the die (G0 EXTI layout: RTSR1/FTSR1 at 0/4)
         'exti_bemf': True,
         'exti_base': 0x40021800,
@@ -591,8 +594,13 @@ def config(target, nm='arm-none-eabi-gcc'):
             capture_channel = int(icch[len('LL_TIM_CHANNEL_CH'):])
         except ValueError:
             raise Unsupported('cannot read IC_TIMER_CHANNEL from %r' % icch)
-    else:
+    elif icch in ('', '(1-1)', 'TIMER_CH_0'):
+        # the non-LL spellings in the tree today all mean channel 1;
+        # anything new must be classified rather than guessed at
         capture_channel = 1
+    else:
+        raise Unsupported('capture channel spelling %r is not recognised'
+                          % icch)
     chan = m.get('INPUT_DMA_CHANNEL', '')
     if chan.startswith('LL_DMA_CHANNEL_'):
         dma_channel = int(chan[len('LL_DMA_CHANNEL_'):]) - 1
@@ -817,23 +825,30 @@ def bemf_block(cfg, spec):
                                      cfg['bemf'][ph][0][2:])
         for i, ph in enumerate('ABC')
     ]
+    # Disconnect every OTHER port's pin from each BEMF line: EXTICR is
+    # stored but not honoured, so PF6 toggling as a gate-driver pin or
+    # PB6 as telemetry TX would otherwise alias the PA6 BEMF line. The
+    # BEMF port keeps its pin; every other declared port loses that pin
+    # number. (An LED-strip overlay would restate a port again and undo
+    # this; no current comparator-less target has one.)
     bemf_pins = {(cfg['bemf'][ph][0][1], int(cfg['bemf'][ph][0][2:]))
                  for ph in 'ABC'}
+    ports = ['A', 'B', 'C', 'F']
     drop = {}
     for ph in 'ABC':
-        for side in ('HIGH', 'LOW'):
-            pname = cfg['pins'][ph + side]
-            port, num = pname[1], int(pname[2:])
-            if num in lines.values() and (port, num) not in bemf_pins:
-                drop.setdefault(port, set()).add(num)
+        line = cfg['bemf'][ph][1]
+        for port in ports:
+            if (port, line) not in bemf_pins:
+                drop.setdefault(port, set()).add(line)
     for port in sorted(drop):
         L += [
             '',
-            '// pin%s %s would reach the same EXTI line%s as a BEMF input on'
+            '// line%s %s belong%s to a BEMF input on another port; EXTICR is'
             % ('s' if len(drop[port]) > 1 else '',
-               ', '.join('P%s%d' % (port, n) for n in sorted(drop[port])),
-               's' if len(drop[port]) > 1 else ''),
-            '// another port; EXTICR is not honoured, so disconnect here',
+               ', '.join(str(n) for n in sorted(drop[port])),
+               '' if len(drop[port]) > 1 else 's'),
+            '// not honoured, so this port\'s pin%s disconnect%s from the EXTI'
+            % (('s', '') if len(drop[port]) > 1 else ('', 's')),
             'gpioPort%s:' % port,
         ] + [
             '    %d -> exti@%d' % (n, n) for n in range(16)
@@ -1010,8 +1025,9 @@ def platform(cfg):
         '//',
         '// target %s (%s), DEAD_TIME %s' % (cfg['target'], cfg['name'],
                                              cfg['dead_time']),
-        '// throttle in on %s, captured by %s_CH1 into DMA1 channel %d'
-        % (tp, cfg['timer'], cfg['dma_channel'] + 1),
+        '// throttle in on %s, captured by %s_CH%d into DMA1 channel %d'
+        % (tp, cfg['timer'], cfg.get('capture_channel', 1),
+           cfg['dma_channel'] + 1),
         ('// comparator: A=%s B=%s C=%s (INMSEL[.INMESEL]), on COMP%s/%s/%s'
          % (tuple(inmsel_name(cfg['comps'][p]) for p in 'ABC')
             + tuple(cfg['comp_of'][p] for p in 'ABC'))) if cfg['comps']

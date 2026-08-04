@@ -42,9 +42,11 @@ sysbus LoadBinary $eeprom $eeprom_addr
 # The GD temperature sensor has no factory calibration page: the
 # firmware applies fixed datasheet constants (1.43V at 25C, -4.3mV/C).
 # The ADC model inverts a linear formula around a reference word -
-# degrees in the high half, millivolts in the low half - so seed it
-# with exactly those constants.
-sysbus WriteDoubleWord 0x1FFFF720 0x00190596
+# degrees in the high half, millivolts in the low half. The reference
+# is seeded 2mV low (1428 rather than 1430): the firmware's fixed-point
+# conversion truncates, and the exact constants land integer
+# temperatures half a count high, reading one degree cold.
+sysbus WriteDoubleWord 0x1FFFF720 0x00190594
 
 # The M23 has a VTOR and SystemInit() points it at 0x08001000 itself;
 # the reset vector still needs the flash table before that runs.
