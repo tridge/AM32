@@ -1,28 +1,38 @@
 //
-// Artery AT32 comparator (CMP). First Artery family in the harness; the
+// Artery AT32 comparator (CMP), shared by the F415 and F421 ports. The
 // block is nearly the F051's COMP1 half-register - enable at bit 0,
-// inverting-input select at [6:4], polarity at bit 11 - but it lives on
-// a page of its own (0x40002400 on the F415, not the SYSCFG page) and
-// the F415 firmware whole-assigns CTRLSTS1 with the PHASE_x_COMP
-// constants from Inc/targets.h: 0xC5 selects PA4, 0xD5 PA5, 0xE5 PA0.
-// Those constants also set bit 30, which lands in the unused CMP2
-// half of the register and is ignored here, as CMP2 itself is: no AM32
-// target touches it.
+// inverting-input select CMPINVSEL at [6:4] - but the two families
+// place it differently, so the placement is constructor parameters
+// rather than two models:
 //
-// The output level bit is a constructor parameter because the two
-// Artery families place it differently: the F415 reads CMP1VALUE at
-// bit 14 of this register (getCompOutputLevel() in
-// Mcu/f415/Src/comparator.c), while the F421's comparator lives in the
-// SCFG page with its output at bit 30. Shared with the F421 port -
-// keep the name and parameters in sync when merging.
+// - the F415 gives it a page of its own at 0x40002400, output CMP1VALUE
+//   at bit 14, polarity at bit 11 (Mcu/f415/Src/comparator.c);
+// - the F421 keeps it an SCFG-page tenant, F051 style: ctrlsts at page
+//   offset 0x1C, output CMPVALUE at bit 30, polarity CMPP at bit 15
+//   (Mcu/f421/Src/comparator.c), with the rest of the page being plain
+//   SCFG storage.
+//
+// Both firmwares whole-assign the register with the PHASE_x_COMP
+// constants from Inc/targets.h to select which phase the inverting
+// input watches; the codes are 4=PA4, 5=PA5, 6=PA0, 7=PA2 (F421 only).
+// Which code is phase A, B or C differs per hardware group, so the map
+// is constructor parameters with no default - a wrong map is silent,
+// the firmware would commutate against the wrong phase and simply
+// never run well. Stray bits the constants set above the modelled ones
+// (the F415's bit 30 lands in its unused CMP2 half) are stored and
+// ignored. Neither firmware ever sets the polarity bit; it is honoured
+// anyway so a target that did would not silently invert BEMF sensing.
 //
 // The non-inverting input is the resistor-star virtual neutral, so the
 // output is high when neutral is above the floating phase - the same
 // sense as Mcu/SITL/sim/motor.c and every other family's comparator
 // model, which is what lets one physics model drive them all.
 //
-// Connections: [0] is the EXTI line the comparator gates (line 19 on
-// the F415, wired by the target overlay).
+// Connections: [0] is the EXTI line the comparator gates (19 on the
+// F415, 21 on the F421), wired by the target overlay. The EXTI model
+// decides whether the edge direction is armed, so the rising/falling
+// selection stays in the real EXINT registers where the firmware put
+// it.
 //
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
@@ -38,19 +48,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AM32_AT32_Cmp : IDoubleWordPeripheral, IKnownSize,
                                  INumberedGPIOOutput, IAM32Comparator
     {
-        // phaseXInmsel is the CTRLSTS1[6:4] code the target's
-        // PHASE_X_COMP constant selects: 4 is PA4, 5 is PA5, 6 is PA0.
-        // outputBit is where the output level reads back: 14 on the
-        // F415, 30 on the F421's SCFG-page block.
         public AM32_AT32_Cmp(IMachine machine, int phaseAInmsel,
                              int phaseBInmsel, int phaseCInmsel,
-                             int outputBit = 14)
+                             int outputBit = 14, int polarityBit = 11,
+                             long ctrlstsOffset = 0)
         {
             if(outputBit < 0 || outputBit > 31)
             {
                 throw new RecoverableException("outputBit must be 0..31");
             }
+            if(polarityBit < 0 || polarityBit > 31)
+            {
+                throw new RecoverableException("polarityBit must be 0..31");
+            }
+            if(ctrlstsOffset < 0 || ctrlstsOffset >= 0x400 || (ctrlstsOffset & 3) != 0)
+            {
+                throw new RecoverableException(
+                    "ctrlstsOffset must be a word offset inside the page");
+            }
             this.outputBit = 1u << outputBit;
+            this.polarityBit = 1u << polarityBit;
+            ctrlsts = ctrlstsOffset;
             inmselToPhase = new int[8];
             for(var i = 0; i < inmselToPhase.Length; i++)
             {
@@ -81,14 +99,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // which phase the inverting input is watching, 0=A 1=B 2=C, or
         // -1 when the selection is not one of the three phase pins
-        public int SensedPhase => inmselToPhase[(regs[Ctrlsts1 / 4] >> 4) & 7];
+        public int SensedPhase => inmselToPhase[(regs[ctrlsts / 4] >> 4) & 7];
 
-        public bool Enabled => (regs[Ctrlsts1 / 4] & EnBit) != 0;
+        public bool Enabled => (regs[ctrlsts / 4] & EnBit) != 0;
 
-        // Driven by the motor model. A change moves the EXTI line; the
-        // EXTI model itself decides whether this edge direction is
-        // armed, so the rising/falling selection stays in the real
-        // EXINT registers where the firmware put it.
+        // driven by the motor model
         public bool CompOutput
         {
             get { return output; }
@@ -103,7 +118,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private bool PolarityInverted => (regs[Ctrlsts1 / 4] & PolBit) != 0;
+        private bool PolarityInverted => (regs[ctrlsts / 4] & polarityBit) != 0;
 
         private bool Level => PolarityInverted ? !output : output;
 
@@ -114,7 +129,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return 0;
             }
-            if(offset == Ctrlsts1)
+            if(offset == ctrlsts)
             {
                 var v = regs[idx] & ~outputBit;
                 return Level ? (v | outputBit) : v;
@@ -129,7 +144,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            if(offset == Ctrlsts1)
+            if(offset == ctrlsts)
             {
                 // the output level is read-only
                 regs[idx] = value & ~outputBit;
@@ -156,17 +171,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             inmselToPhase[inmsel] = phase;
         }
 
-        private const long Ctrlsts1 = 0x00;
-
         private const uint EnBit = 1u << 0;
-        private const uint PolBit = 1u << 11;
 
         private const int ExtiLine = 0;
 
-        // CTRLSTS1 and CTRLSTS2; the rest of the page reads back writes
+        // one 0x400 page: the comparator register plus, on the F421,
+        // the SCFG registers it shares the page with (write-readback)
         private readonly uint[] regs = new uint[0x100];
         private readonly int[] inmselToPhase;
         private readonly uint outputBit;
+        private readonly uint polarityBit;
+        private readonly long ctrlsts;
         private bool output;
     }
 }
