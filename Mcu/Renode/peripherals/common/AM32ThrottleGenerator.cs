@@ -193,12 +193,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void Reset()
         {
-            frameTimer.Enabled = false;
-            Connections[0].Unset();
+            // The generator is the bench-side transmitter: an ESC
+            // reboot (NVIC_SystemReset -> machine reset) does not
+            // silence the radio or flight controller on the other end
+            // of the wire, so the frame train restarts with its current
+            // settings instead of going quiet - without this the
+            // firmware's signal-loss reboot came back deaf and
+            // re-reset every two seconds forever.
             high = false;
-            enabled = false;
             bitIndex = 0;
             transmitting = false;
+            frameTimer.Enabled = false;
+            Connections[0].Unset();
+            if(enabled)
+            {
+                StartHigh();
+            }
         }
 
         private void StartHigh()
