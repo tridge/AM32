@@ -37,7 +37,8 @@ namespace Antmicro.Renode.Peripherals.Timers
     // with zeros and detectInput() never locks.
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class AM32_STM32_CaptureTimer : IDoubleWordPeripheral, IKnownSize,
-                                           INumberedGPIOOutput, IGPIOReceiver
+                                           INumberedGPIOOutput, IGPIOReceiver,
+                                           Miscellaneous.IAM32ReplySource
     {
         // inputBase/inputPin/inputAf describe the pin the throttle
         // arrives on. Without them a capture happens whatever the pin is

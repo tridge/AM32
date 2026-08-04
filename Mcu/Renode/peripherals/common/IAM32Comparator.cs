@@ -23,6 +23,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         bool CompOutput { get; set; }
     }
 
+    // Implemented by a PWM peripheral that knows each phase's bridge
+    // state directly - the NXP FlexPWM, whose commutation is pure
+    // MASK/DTSRCSEL register state with no GPIO mode changes for the
+    // bridge to decode. When one of these is present the bridge takes
+    // everything from it instead of the GPIO+timer decode.
+    public interface IAM32PwmSource : IPeripheral
+    {
+        // SITL_PHASE_*: 0 float, 1 low, 2 pwm, 3 pwm without
+        // complementary, 4 proportional brake
+        int PhaseState(int phase);
+
+        // the active (post-LDOK) compare value for the phase
+        uint PhaseDuty(int phase);
+
+        uint Arr { get; }
+        uint DeadTimeNs { get; }
+        uint TickPs { get; }
+        bool Running { get; }
+    }
+
+    // Implemented by whatever peripheral decodes the ESC's bidirectional
+    // dshot replies - the capture timer on the STM32 families, the LPSPI
+    // on the NXP - so the guilink can stream them without knowing which.
+    public interface IAM32ReplySource : IPeripheral
+    {
+        uint ReplyCount { get; }
+        bool TryGetReply(uint index, out uint frame);
+    }
+
     // Implemented by an EXTI model that can report which line's
     // rising/falling trigger a write changed. Declared here rather than
     // with the G0 EXTI so AM32_ExtiBemf can name the type on families

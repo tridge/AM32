@@ -789,7 +789,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     .FirstOrDefault();
                 bridge = machine.GetPeripheralsOfType<AM32_F051_Bridge>()
                     .FirstOrDefault();
-                capture = machine.GetPeripheralsOfType<AM32_STM32_CaptureTimer>()
+                capture = machine.GetPeripheralsOfType<IAM32ReplySource>()
                     .FirstOrDefault();
                 if(generator == null)
                 {
@@ -935,7 +935,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private Socket stateSocket;
         private AM32ThrottleGenerator generator;
         private AM32_F051_Bridge bridge;
-        private AM32_STM32_CaptureTimer capture;
+        private IAM32ReplySource capture;
         private AM32_Ws2812 ws2812;
 
         // guarded by sync: the newest setpoint, and where its sender is

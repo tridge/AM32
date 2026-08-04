@@ -296,6 +296,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             timer = null;
             comp = null;
             syscfg = null;
+            pwmSource = null;
+            probed = false;
             Array.Clear(gpio, 0, gpio.Length);
             Array.Clear(lastMode, 0, lastMode.Length);
             LastSensedPhase = 2;
@@ -315,11 +317,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            if(timer == null)
+            if(!probed)
             {
+                probed = true;
+                // a PWM peripheral that knows the phase states directly
+                // (the NXP FlexPWM) replaces the GPIO+timer decode
+                pwmSource = machine.GetPeripheralsOfType<IAM32PwmSource>().FirstOrDefault();
                 timer = machine.GetPeripheralsOfType<AM32_STM32_AdvancedTimer>().FirstOrDefault();
                 comp = machine.GetPeripheralsOfType<IAM32Comparator>().FirstOrDefault();
-                if(timer == null || comp == null)
+                if((timer == null && pwmSource == null) || comp == null)
                 {
                     this.Log(LogLevel.Error, "no TIM1 or COMP in the platform; bridge disabled");
                     batch.Enabled = false;
@@ -331,7 +337,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // every access, and at 100k ticks a simulated second the
                 // twelve GPIO reads alone were over half of all bus
                 // traffic in the emulation.
-                for(var i = 0; i < gpioBase.Length; i++)
+                for(var i = 0; pwmSource == null && i < gpioBase.Length; i++)
                 {
                     if(gpioBase[i] == 0)
                     {
@@ -363,56 +369,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
 
-            for(var i = 0; i < gpio.Length; i++)
+            if(pwmSource != null)
             {
-                if(gpio[i] == null)
-                {
-                    continue;
-                }
-                if(f1Gpio)
-                {
-                    cfgl[i] = gpio[i].ReadDoubleWord(0);
-                    cfgh[i] = gpio[i].ReadDoubleWord(CfghOffset);
-                    odr[i] = gpio[i].ReadDoubleWord(OdrOffsetF1);
-                }
-                else
-                {
-                    moder[i] = gpio[i].ReadDoubleWord(0);
-                    odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
-                    afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
-                    afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
-                }
+                TickFromPwmSource();
+            }
+            else
+            {
+                TickFromPins();
             }
 
-            // CEN gates everything: a counter that never advances never
-            // matches a compare, whatever the pins say
-            var moe = timer.MainOutputEnabled && timer.CounterEnabled;
             var mode = tickMode;
-            var ccr = tickCcr;
-            for(var p = 0; p < 3; p++)
-            {
-                var ph = phases[p];
-                // a pin only carries the timer output when it is in
-                // alternate mode AND selects the timer's AF AND the
-                // channel is connected to it
-                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin, timerAf)
-                    && timer.ChannelEnabled(ph.CcrChannel)
-                    && RemapOk(ph.RemapBit);
-                var loTimer = TimerDrives(ph.LowPort, ph.LowPin, ph.LowAf)
-                    && timer.ComplementaryEnabled(ph.CcrChannel);
-                mode[p] = PhaseMode(moe, hiTimer, odr[ph.HighPort], ph.HighPin,
-                                    loTimer, odr[ph.LowPort], ph.LowPin);
-                // the shadow, not the register: see ActiveCcr
-                ccr[p] = timer.ActiveCcr(ph.CcrChannel);
-            }
-            am32sim_set_bridge(mode[0], mode[1], mode[2]);
-            mode.CopyTo(lastMode, 0);
-
-            var arr = timer.ActiveArr;
-            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2],
-                             (timer.Prescaler + 1) * tickPs,
-                             timer.DeadTimeNs);
-
             var sensed = comp.SensedPhase;
             if(sensed >= 0)
             {
@@ -441,6 +407,78 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 comp.CompOutput = before ^ ((t & 1) != 0);
             }
             comp.CompOutput = LastCompOut;
+        }
+
+        // phase states straight from a PWM block that knows them (the
+        // NXP FlexPWM): no pin modes to decode
+        private void TickFromPwmSource()
+        {
+            var mode = tickMode;
+            var ccr = tickCcr;
+            for(var p = 0; p < 3; p++)
+            {
+                mode[p] = pwmSource.PhaseState(p);
+                ccr[p] = pwmSource.PhaseDuty(p);
+            }
+            am32sim_set_bridge(mode[0], mode[1], mode[2]);
+            mode.CopyTo(lastMode, 0);
+            am32sim_set_tim1(pwmSource.Arr, ccr[0], ccr[1], ccr[2],
+                             pwmSource.TickPs, pwmSource.DeadTimeNs);
+        }
+
+        // the STM32-style decode: what each half-bridge pin carries is
+        // GPIO mode + AF + timer channel state
+        private void TickFromPins()
+        {
+            var mode = tickMode;
+            var ccr = tickCcr;
+            for(var i = 0; i < gpio.Length; i++)
+            {
+                if(gpio[i] == null)
+                {
+                    continue;
+                }
+                if(f1Gpio)
+                {
+                    cfgl[i] = gpio[i].ReadDoubleWord(0);
+                    cfgh[i] = gpio[i].ReadDoubleWord(CfghOffset);
+                    odr[i] = gpio[i].ReadDoubleWord(OdrOffsetF1);
+                }
+                else
+                {
+                    moder[i] = gpio[i].ReadDoubleWord(0);
+                    odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
+                    afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
+                    afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
+                }
+            }
+
+            // CEN gates everything: a counter that never advances never
+            // matches a compare, whatever the pins say
+            var moe = timer.MainOutputEnabled && timer.CounterEnabled;
+            for(var p = 0; p < 3; p++)
+            {
+                var ph = phases[p];
+                // a pin only carries the timer output when it is in
+                // alternate mode AND selects the timer's AF AND the
+                // channel is connected to it
+                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin, timerAf)
+                    && timer.ChannelEnabled(ph.CcrChannel)
+                    && RemapOk(ph.RemapBit);
+                var loTimer = TimerDrives(ph.LowPort, ph.LowPin, ph.LowAf)
+                    && timer.ComplementaryEnabled(ph.CcrChannel);
+                mode[p] = PhaseMode(moe, hiTimer, odr[ph.HighPort], ph.HighPin,
+                                    loTimer, odr[ph.LowPort], ph.LowPin);
+                // the shadow, not the register: see ActiveCcr
+                ccr[p] = timer.ActiveCcr(ph.CcrChannel);
+            }
+            am32sim_set_bridge(mode[0], mode[1], mode[2]);
+            mode.CopyTo(lastMode, 0);
+
+            var arr = timer.ActiveArr;
+            am32sim_set_tim1(arr, ccr[0], ccr[1], ccr[2],
+                             (timer.Prescaler + 1) * tickPs,
+                             timer.DeadTimeNs);
         }
 
         // one phase's high and low side pins, e.g. "PA10" and "PB1"
@@ -657,6 +695,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private IDoubleWordPeripheral syscfg;
         private AM32_STM32_AdvancedTimer timer;
         private IAM32Comparator comp;
+        private IAM32PwmSource pwmSource;
+        private bool probed;
         private string configPath;
         private double initialTheta;
         private bool loaded;
