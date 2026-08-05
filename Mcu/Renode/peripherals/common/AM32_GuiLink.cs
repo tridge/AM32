@@ -144,6 +144,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // from the motor turning
         public ulong ArmedAddress { get; set; }
 
+        // the firmware's in-RAM eepromBuffer. Settings writes land in
+        // the flash page AND here, which is what changing a setting at
+        // runtime over DroneCAN does - the firmware acts on the RAM
+        // copy, so the change is live without a reboot
+        public ulong EepromBufferAddress { get; set; }
+
         // where the application starts; below it is the bootloader region,
         // so the PC says which of the two is executing
         public ulong AppBase { get; set; }
@@ -188,6 +194,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // the pace setting survives a firmware reboot, like the
             // SITL's does; only the anchor is dropped
             paceValid = false;
+            // the watch subscription survives too (the addresses are
+            // still valid, it is the same firmware), but the change
+            // detection restarts so the rebooted values re-emit
+            for(var i = 0; i < watchCount; i++)
+            {
+                watches[i].HaveLast = false;
+            }
+            watchBatchCount = 0;
             tick.Limit = IdleTickUs;
             tick.Enabled = inputSocket != null || stateSocket != null;
         }
@@ -494,10 +508,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                               + "fast as it can below real time");
                     }
                     break;
-                case 9: // what firmware is running, and where it is
-                    DeviceInfo(c.From);
+                case 8: // variable watch subscribe. Same command number,
+                    // reply and data format as the SITL's state port, but
+                    // the entries carry (u8 size, u32 address) instead of
+                    // (u8 size, name\0): there is no symbol table in here,
+                    // the client resolves names against the ELF and sends
+                    // addresses
+                    WatchSubscribe(c.Data, c.From);
                     break;
-                case 8: // restart the ESC
+                case 9: // restart the ESC
                     // AM32 latches the input protocol it detected and only
                     // ever re-checks that one, so a client that changes
                     // protocol - or writes the eeprom - needs a reboot,
@@ -507,6 +526,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     this.Log(LogLevel.Info, "restarting the ESC");
                     Reply(c.From, true, "restarting the ESC");
                     machine.RequestReset();
+                    break;
+                case 10: // what firmware is running, and where it is
+                    DeviceInfo(c.From);
                     break;
                 case 5:
                     EepromFetch(c.From);
@@ -623,6 +645,126 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 samplesOut += (uint)batchCount;
                 batchCount = 0;
                 lastFlushNs = nowNs;
+            }
+        }
+
+        // ---- variable watch (state cmd 8) ----
+        //
+        // The client subscribes with a list of (size, address) entries;
+        // every tick each watched location is read from the system bus
+        // and a change - honouring the per-variable min period - becomes
+        // an event (t_ns, index, raw) in a batch packet, exactly the
+        // packets the SITL's watch emits, so the same client reads both.
+
+        private void WatchSubscribe(byte[] d, EndPoint from)
+        {
+            if(d.Length < 8)
+            {
+                return;
+            }
+            // an unchanged re-send is a keepalive: extend the expiry
+            // without disturbing the change detection state
+            if(watchCount > 0 && watchReq != null
+               && d.Length == watchReq.Length && from.Equals(watchTo)
+               && d.SequenceEqual(watchReq))
+            {
+                watchSubscribeMs = Environment.TickCount;
+                return;
+            }
+            var count = Math.Min((int)d[3], WatchMax);
+            watchMinPeriodNs = BitConverter.ToUInt32(d, 4);
+            watchCount = 0;
+            var reply = new byte[4 + count];
+            Array.Copy(BitConverter.GetBytes(StateMagicWatchReply), 0, reply, 0, 2);
+            reply[2] = 1; // version
+            var off = 8;
+            for(var k = 0; k < count && off + 5 <= d.Length; k++)
+            {
+                var size = d[off];
+                var addr = BitConverter.ToUInt32(d, off + 1);
+                off += 5;
+                var ok = size == 1 || size == 2 || size == 4 || size == 8;
+                if(ok)
+                {
+                    watches[watchCount].Address = addr;
+                    watches[watchCount].Size = size;
+                    watches[watchCount].HaveLast = false;
+                    watches[watchCount].NextNs = 0;
+                    watchCount++;
+                }
+                reply[3]++;
+                reply[4 + k] = (byte)(ok ? 1 : 0);
+            }
+            watchTo = from;
+            watchSubscribeMs = Environment.TickCount;
+            watchBatchCount = 0;
+            watchReq = (byte[])d.Clone();
+            this.Log(LogLevel.Info, "watching {0} variables", watchCount);
+            Send(stateSocket, reply, 4 + reply[3], from);
+        }
+
+        private ulong WatchRead(int i)
+        {
+            var addr = watches[i].Address;
+            switch(watches[i].Size)
+            {
+            case 1: return machine.SystemBus.ReadByte(addr);
+            case 2: return machine.SystemBus.ReadWord(addr);
+            case 8: return machine.SystemBus.ReadQuadWord(addr);
+            default: return machine.SystemBus.ReadDoubleWord(addr);
+            }
+        }
+
+        private void WatchStep()
+        {
+            if(watchCount == 0)
+            {
+                return;
+            }
+            if(Environment.TickCount - watchSubscribeMs > SubscriberTimeoutMs)
+            {
+                watchCount = 0;
+                watchReq = null;
+                return;
+            }
+            var nowNs = (ulong)machine.ElapsedVirtualTime.TimeElapsed
+                .TotalMicroseconds * 1000;
+            for(var i = 0; i < watchCount; i++)
+            {
+                if(nowNs < watches[i].NextNs)
+                {
+                    continue;
+                }
+                var v = WatchRead(i);
+                if(watches[i].HaveLast && v == watches[i].Last)
+                {
+                    continue;
+                }
+                watches[i].Last = v;
+                watches[i].HaveLast = true;
+                watches[i].NextNs = nowNs + watchMinPeriodNs;
+                var o = 4 + watchBatchCount * WatchEventSize;
+                Array.Copy(BitConverter.GetBytes(nowNs), 0, watchBatch, o, 8);
+                Array.Copy(BitConverter.GetBytes((uint)i), 0, watchBatch, o + 8, 4);
+                Array.Copy(BitConverter.GetBytes(v), 0, watchBatch, o + 12, 8);
+                watchBatchCount++;
+                if(watchBatchCount >= WatchBatchMax)
+                {
+                    break; // the rest go next tick; ordering stays intact
+                }
+            }
+            if(watchBatchCount > 0
+               && (watchBatchCount >= WatchBatchMax
+                   || nowNs - watchLastFlushNs > 5000000UL))
+            {
+                watchBatch[0] = (byte)(StateMagicWatchData & 0xFF);
+                watchBatch[1] = (byte)(StateMagicWatchData >> 8);
+                watchBatch[2] = 1; // version
+                watchBatch[3] = (byte)watchBatchCount;
+                Send(stateSocket, watchBatch, 4 + watchBatchCount * WatchEventSize,
+                     watchTo);
+                watchBatchCount = 0;
+                watchLastFlushNs = nowNs;
             }
         }
 
@@ -760,12 +902,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var bytes = new byte[len];
                 Array.Copy(data, dataOffset, bytes, 0, len);
                 machine.SystemBus.WriteBytes(bytes, eepromAddress + off);
+                // the RAM copy too, as a runtime DroneCAN parameter
+                // write would: the firmware acts on eepromBuffer, so
+                // the change is live. Derived values that only
+                // loadEEpromSettings() computes still need a reset,
+                // exactly as they would on the bench.
+                if(EepromBufferAddress != 0)
+                {
+                    machine.SystemBus.WriteBytes(bytes, EepromBufferAddress + off);
+                }
                 this.Log(LogLevel.Info, "eeprom wrote {0} bytes at {1}", len, off);
-                // no equivalent of the SITL calling loadEEpromSettings():
-                // the firmware is running inside the emulator and reads
-                // its settings at boot, so this lands on the next reset
                 Reply(to, true, string.Format(
-                    "wrote {0} bytes at {1}; reset the ESC to read them", len, off));
+                    EepromBufferAddress != 0
+                    ? "wrote {0} bytes at {1} (live)"
+                    : "wrote {0} bytes at {1}; reset the ESC to read them",
+                    len, off));
             }
         }
 
@@ -808,6 +959,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ApplySetpoint();
             PumpReplies();
             SampleState();
+            WatchStep();
             Pace();
         }
 
@@ -889,6 +1041,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const ushort StateMagicReply = 0x5355;
         private const ushort StateMagicEeprom = 0x5358;
         private const ushort StateMagicInfo = 0x5359;
+        // shared with the info reply magic, as the SITL does: a watch
+        // reply has version 1 in byte 2 where the info packet has 9
+        private const ushort StateMagicWatchReply = 0x5359;
+        private const ushort StateMagicWatchData = 0x535a;
+        private const int WatchMax = 16;
+        private const int WatchBatchMax = 32;
+        private const int WatchEventSize = 20; // u64 t_ns, u32 index, u64 raw
         // const char filename[30] in Src/main.c
         private const int FirmwareNameMax = 30;
 
@@ -954,6 +1113,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint repliesOut;
         private uint samplesOut;
         private uint repliesLost;
+
+        private struct WatchEntry
+        {
+            public ulong Address;
+            public byte Size;
+            public ulong Last;
+            public bool HaveLast;
+            public ulong NextNs;
+        }
+
+        private readonly WatchEntry[] watches = new WatchEntry[WatchMax];
+        private readonly byte[] watchBatch =
+            new byte[4 + WatchBatchMax * WatchEventSize];
+        private int watchCount;
+        private uint watchMinPeriodNs;
+        private EndPoint watchTo;
+        private int watchSubscribeMs;
+        private int watchBatchCount;
+        private ulong watchLastFlushNs;
+        private byte[] watchReq;
 
         private EndPoint sampleTo;
         private bool subscribed;

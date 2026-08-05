@@ -711,7 +711,8 @@ def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
     # what a client needs to say which firmware is running and how far
     # through arming it is; absent symbols simply lose that readout
     addrs = gen_target.symbol_addresses(
-        elf, ('filename', 'armed_timeout_count', 'armed'), nm)
+        elf, ('filename', 'armed_timeout_count', 'armed', 'eepromBuffer'),
+        nm)
     app_base = gen_target.APP_BASE
     try:
         cfg = gen_target.config(os.path.basename(target_resc)
@@ -725,7 +726,8 @@ def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
         info.append('guilink LoopHz %d' % cfg['loop_hz'])
     for prop, sym in (('FirmwareNameAddress', 'filename'),
                       ('ArmedCountAddress', 'armed_timeout_count'),
-                      ('ArmedAddress', 'armed')):
+                      ('ArmedAddress', 'armed'),
+                      ('EepromBufferAddress', 'eepromBuffer')):
         if sym in addrs:
             info.append('guilink %s 0x%08X' % (prop, addrs[sym]))
     resc = os.path.join(scratch, 'link.resc')

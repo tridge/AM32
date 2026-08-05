@@ -2155,10 +2155,11 @@ def main():
         # so a client can say what firmware is running and how far
         # through arming it is, neither of which is on the wire
         addrs = symbol_addresses(elf, ('filename', 'armed_timeout_count',
-                                       'armed'), args.nm_bin)
+                                       'armed', 'eepromBuffer'), args.nm_bin)
         for prop, sym in (('FirmwareNameAddress', 'filename'),
                           ('ArmedCountAddress', 'armed_timeout_count'),
-                          ('ArmedAddress', 'armed')):
+                          ('ArmedAddress', 'armed'),
+                          ('EepromBufferAddress', 'eepromBuffer')):
             if sym in addrs:
                 setup += '; guilink %s 0x%08X' % (prop, addrs[sym])
         setup += '; guilink InputPort %d; guilink StatePort %d' % (

@@ -630,18 +630,19 @@ class SimStream(object):
         '''ask what firmware is running, where the core is and how far
         through arming it is - none of which is visible on the wire.
         Answered by the Renode backend only; the reply lands in .info'''
-        pkt = struct.pack('<HBB', self.MAGIC_CMD, 9, 0)
+        pkt = struct.pack('<HBB', self.MAGIC_CMD, 10, 0)
         try:
             self.sock.sendto(pkt, self.addr)
         except OSError:
             pass
 
     def reset_esc(self):
-        '''restart the emulated ESC (Renode backend only). AM32 latches
-        the input protocol it detected and only re-checks that one, so
-        changing protocol - or writing the eeprom - needs a reboot, as it
-        would on the bench. The SITL has its process panel for this.'''
-        pkt = struct.pack('<HBB', self.MAGIC_CMD, 8, 0)
+        '''restart the ESC: a machine reset under Renode, a re-exec
+        under the SITL - the same command number reaches both. AM32
+        latches the input protocol it detected and only re-checks that
+        one, so changing protocol - or writing the eeprom - needs a
+        reboot, as it would on the bench.'''
+        pkt = struct.pack('<HBB', self.MAGIC_CMD, 9, 0)
         try:
             self.sock.sendto(pkt, self.addr)
         except OSError:
