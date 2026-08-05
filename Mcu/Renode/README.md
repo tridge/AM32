@@ -983,6 +983,41 @@ of `obj/`:
 Paths must be absolute if you drive Renode directly: the harness runs
 from a scratch directory, as the SITL suite does.
 
+## Running the SITL test scripts on real firmware
+
+The scripted tests in `Mcu/SITL/tests/*.scr` (see the language reference
+in `Mcu/SITL/run_test.py`) run against an emulated target's real
+firmware with:
+
+    python3 Mcu/Renode/run_test.py VIMDRONES_L431 Mcu/SITL/tests/test_spin_stop.scr
+
+Same script language, same reports (timeline, variable change log, CSV,
+PNG, interactive HTML) - the SITL runner's machinery wrapped around an
+emulated MCU, so one script exercises both the portable C and each
+family's register-level code. The firmware ELF is found in `obj/` (or
+built) and rebuilt firmware matters: the eeprom layout and the tested
+behaviour come from the code, so run `make <TARGET>` after pulling
+firmware changes.
+
+The wire protocols are AM32_GuiLink's, shared with `sitl_gui.py`; the
+firmware variable watch uses the SITL's state-port packets (cmd 8) with
+ELF-resolved addresses in the entries, since the emulator has no symbol
+table. What necessarily differs from the SITL, and can need script
+care:
+
+- an `eepromBuffer.` write lands in the settings flash AND the
+  firmware's in-RAM eepromBuffer, which is what a runtime DroneCAN
+  parameter write does - the change is live, no reboot. Derived
+  values that only `loadEEpromSettings()` computes at boot still
+  need a scripted `reset`, exactly as on the bench
+- `reset` is a machine reset and the virtual clock keeps running: the
+  report time axis is continuous with no epoch stitching
+- SITL-only exports (`sitl_tone_active`) read as constant 0, so the
+  idiomatic "wait out the beeps" line passes immediately; the beeps
+  cost virtual time here and are covered by `wait armed == 1`
+- `speedup` below 1 paces the emulation; 0 or above 1 free-runs (an
+  emulated MCU does not exceed real time)
+
 ## What is here
 
     gen_target.py                   builds a platform for any F051, G071,
