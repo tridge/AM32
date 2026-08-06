@@ -1,0 +1,21 @@
+# basic spin up / spin down on DShot600, graphing the firmware's rpm
+# estimate against the physics rpm, with the input on the 2nd Y axis
+
+throttle type DSHOT600
+
+graph e_rpm rpm newinput:2
+watch armed running
+
+throttle 0.0
+wait armed == 1 timeout=3
+# the arming beeps play inside an interrupt handler and input is deaf
+# until they finish; sitl_tone_active == 0 marks throttle-ready
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.4 ramp=0.3
+wait e_rpm >= 150 timeout=4
+delay 2
+
+note cutting throttle
+throttle 0.0
+wait e_rpm < 10 timeout=10

@@ -32,3 +32,4 @@ report/
 # packaged capture GUI
 /dist/
 /build/
+test_outputs/
