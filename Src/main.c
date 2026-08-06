@@ -1534,6 +1534,9 @@ void tenKhzRoutine()
               if((brake_countdown == 0) && (zero_throttle_brake_active == 1)){
                 zero_crosses = 0;                          // after countdown forces the brake on stop behavior 
                 running = 0;                               // stops tracking rpm
+                temp_comp_pwm = eepromBuffer.comp_pwm;     // hand back to the brake on stop behavior
+              } else {
+                temp_comp_pwm = 0;                         // coast until the countdown expires
               }
               zero_throttle_brake_active = 1;
               }
