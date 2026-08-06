@@ -1,0 +1,138 @@
+# Test PR 361 brake on zero throttle
+# sweep brake_on_zero_throttle 0-4, each mode in the comp_pwm setting
+# where its behaviour is distinguishable, with per-mode assertions.
+# Stop detection uses the physics rpm: the firmware's e_rpm collapses
+# to 0 at a forced stop while the rotor is still turning.
+
+# use PWM throttle
+throttle type PWM
+
+# e_rpm capped for display: its first spin-up sample is a firmware
+# uint16 truncation glitch (600000/2 wrapped = 37856)
+graph MIN(e_rpm,1000) rpm:2 newinput:3
+
+# log the brake state machine in the variable change log
+watch zero_throttle_brake_active temp_comp_pwm brake_countdown
+
+############
+
+# mode 0 baseline, comp on: stock behaviour, quick regenerative stop
+eepromBuffer.comp_pwm = 1
+eepromBuffer.brake_on_zero_throttle = 0
+graphtag brake_on_zero_throttle=0 comp_pwm=1
+
+throttle 0.0
+wait armed == 1 timeout=3
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.5 ramp=0.5
+wait rpm >= 2500 timeout=4
+delay 2
+
+throttle 0.0
+wait rpm < 100 timeout=1.5
+
+note reset ESC
+delay 2
+reset
+
+############
+
+# mode 1 coast, comp on: must free-wheel although comp pwm would brake
+eepromBuffer.comp_pwm = 1
+eepromBuffer.brake_on_zero_throttle = 1
+graphtag brake_on_zero_throttle=1 comp_pwm=1
+
+throttle 0.0
+wait armed == 1 timeout=3
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.5 ramp=0.5
+wait rpm >= 2500 timeout=4
+delay 2
+
+throttle 0.0
+delay 1
+# still coasting a second after the cut
+wait rpm > 500 timeout=0.1
+wait rpm < 100 timeout=10
+
+note reset ESC
+delay 2
+reset
+
+############
+
+# mode 2 brake, comp off: must stop fast although stock would coast ~2s
+eepromBuffer.comp_pwm = 0
+eepromBuffer.brake_on_zero_throttle = 2
+graphtag brake_on_zero_throttle=2 comp_pwm=0
+
+throttle 0.0
+wait armed == 1 timeout=3
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.5 ramp=0.5
+wait rpm >= 2500 timeout=4
+delay 2
+
+throttle 0.0
+wait rpm < 100 timeout=1
+
+note reset ESC
+delay 2
+reset
+
+############
+
+# mode 3, comp on: coast for 1s after the cut, then stop
+eepromBuffer.comp_pwm = 1
+eepromBuffer.brake_on_zero_throttle = 3
+graphtag brake_on_zero_throttle=3 comp_pwm=1
+
+throttle 0.0
+wait armed == 1 timeout=3
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.5 ramp=0.5
+wait rpm >= 2500 timeout=4
+delay 2
+
+throttle 0.0
+delay 0.5
+# mid-delay: must still be coasting, not braking at the cut
+wait rpm > 1000 timeout=0.1
+# and the delayed stop must actually happen around the 1s mark
+wait running == 0 timeout=1.6
+wait rpm < 100 timeout=10
+
+note reset ESC
+delay 2
+reset
+
+############
+
+# mode 4, comp on: coast for 2s after the cut, then stop
+eepromBuffer.comp_pwm = 1
+eepromBuffer.brake_on_zero_throttle = 4
+graphtag brake_on_zero_throttle=4 comp_pwm=1
+
+throttle 0.0
+wait armed == 1 timeout=3
+wait sitl_tone_active == 0 timeout=2
+
+throttle 0.5 ramp=0.5
+wait rpm >= 2500 timeout=4
+delay 2
+
+throttle 0.0
+delay 1.5
+# mid-delay: must still be coasting, not braking at the cut
+wait rpm > 200 timeout=0.1
+# and the delayed stop must actually happen around the 2s mark
+wait running == 0 timeout=1.1
+wait rpm < 100 timeout=10
+
+note reset ESC
+delay 2
+reset
