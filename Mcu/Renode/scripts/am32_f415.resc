@@ -24,6 +24,7 @@ include $repo/Mcu/Renode/peripherals/artery/AM32_AT32_Cmp.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_Sigrok.cs
 # after the bridge, which it samples for the physics sensor values; the
 # Artery ADC is the F1-generation register file the WCH model implements
 include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Adc.cs

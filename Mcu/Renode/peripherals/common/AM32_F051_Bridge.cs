@@ -297,6 +297,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             comp = null;
             syscfg = null;
             pwmSource = null;
+            logicAnalyzer = null;
             probed = false;
             Array.Clear(gpio, 0, gpio.Length);
             Array.Clear(lastMode, 0, lastMode.Length);
@@ -325,6 +326,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 pwmSource = machine.GetPeripheralsOfType<IAM32PwmSource>().FirstOrDefault();
                 timer = machine.GetPeripheralsOfType<AM32_STM32_AdvancedTimer>().FirstOrDefault();
                 comp = machine.GetPeripheralsOfType<IAM32Comparator>().FirstOrDefault();
+                logicAnalyzer = machine.GetPeripheralsOfType<IAM32LogicAnalyzer>()
+                    .FirstOrDefault();
                 if((timer == null && pwmSource == null) || comp == null)
                 {
                     this.Log(LogLevel.Error, "no TIM1 or COMP in the platform; bridge disabled");
@@ -407,6 +410,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 comp.CompOutput = before ^ ((t & 1) != 0);
             }
             comp.CompOutput = LastCompOut;
+            if(logicAnalyzer != null)
+            {
+                logicAnalyzer.ObserveBridge(lastMode[0], lastMode[1], lastMode[2],
+                                            LastSensedPhase, LastCompOut);
+            }
         }
 
         // phase states straight from a PWM block that knows them (the
@@ -696,6 +704,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private AM32_STM32_AdvancedTimer timer;
         private IAM32Comparator comp;
         private IAM32PwmSource pwmSource;
+        private IAM32LogicAnalyzer logicAnalyzer;
         private bool probed;
         private string configPath;
         private double initialTheta;

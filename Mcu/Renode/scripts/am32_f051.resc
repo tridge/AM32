@@ -33,6 +33,7 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_SysCfgComp.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_Sigrok.cs
 # after the bridge: each .cs is compiled on its own, so a file may only
 # reference types from one included before it. The ADC samples the
 # bridge for the physics sensor values.

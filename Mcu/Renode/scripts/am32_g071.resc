@@ -24,6 +24,7 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32G0_Comp.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_Sigrok.cs
 # after the bridge, which it samples for the physics sensor values
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_ADC.cs
 # the LED strip decoder, whose type the guilink names

@@ -57,6 +57,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         bool TryGetReply(uint index, out uint frame);
     }
 
+    // Optional edge recorder fed by the motor bridge at its existing
+    // physics batch boundary. This exposes state changes without adding a
+    // sampling timer to the emulation.
+    public interface IAM32LogicAnalyzer : IPeripheral
+    {
+        void ObserveBridge(int phaseA, int phaseB, int phaseC,
+                           int sensedPhase, bool comparator);
+    }
+
     // Implemented by an EXTI model that can report which line's
     // rising/falling trigger a write changed. Declared here rather than
     // with the G0 EXTI so AM32_ExtiBemf can name the type on families

@@ -23,6 +23,7 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32G0_EXTI.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs
+include $repo/Mcu/Renode/peripherals/common/AM32_Sigrok.cs
 # the die has no comparators: external comparator chips drive GPIO
 # pins, modelled by the EXTI-watching BEMF block (after the bridge's
 # interface, which it implements)
