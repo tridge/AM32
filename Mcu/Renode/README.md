@@ -783,6 +783,56 @@ reads a little below the instantaneous value because the firmware runs
 it through a moving average (`Src/main.c:816`); voltage and temperature,
 being steady, match exactly.
 
+### Live logic analyser
+
+`--sigrok` starts a TCP server for libsigrok's `ipdbg-la` driver and
+starts the emulation:
+
+    python3 Mcu/Renode/gen_target.py VIMDRONES_L431 --sigrok
+
+Connect PulseView to it and set its sample rate to the same 10 MHz the
+launcher prints:
+
+    pulseview -d ipdbg-la:conn=tcp-raw/127.0.0.1/4242
+
+The protocol cannot report its sampling clock, so selecting 10 MHz in
+PulseView is required for the time axis to be meaningful. `--sigrok-port`
+and `--sigrok-sample-rate` change the defaults. A headless capture uses
+the same connection:
+
+    sigrok-cli -d ipdbg-la:conn=tcp-raw/127.0.0.1/4242 \
+        -c samplerate=10M --samples 20000 -O bits
+
+Use an `ipdbg-la` build with the datafeed-header and configurable
+samplerate fixes; stock libsigrok releases without those fixes discard the
+capture in frontends.
+
+The driver names the channels `CH0` onward. Their AM32 meanings are:
+
+| channel | signal | source and resolution |
+|---|---|---|
+| CH0 | input wire | exact servo, DShot and bidirectional-reply edges |
+| CH1 | WS2812 data | exact GPIO edges on targets with a strip; low otherwise |
+| CH2..4 | phase A mode, bit 0..2 | bridge state at the physics batch boundary |
+| CH5..7 | phase B mode, bit 0..2 | bridge state at the physics batch boundary |
+| CH8..10 | phase C mode, bit 0..2 | bridge state at the physics batch boundary |
+| CH11 | comparator output | physics result at the batch boundary |
+| CH12..13 | sensed phase, bit 0..1 | 0=A, 1=B, 2=C |
+
+The three-bit phase value is the motor model's existing state: 0 float,
+1 low, 2 complementary PWM, 3 PWM without complementary drive and 4
+proportional brake. It is deliberately not a synthetic PWM carrier.
+Comparator transitions are delivered by the bridge at its 20us batch
+boundary; multiple physics transitions inside one batch share that
+timestamp and cannot appear as nanosecond-separated edges.
+
+There is no sample-rate timer in the emulator. The analyser records only
+timestamped changes into a ring and expands them into 65,536 fixed-rate
+samples when a capture completes, so selecting 10 MHz does not add ten
+million emulation events per simulated second. PulseView's trigger and
+pre-trigger controls are carried by the ipdbg protocol and apply to the
+recorded AM32 signals.
+
 ### Driving it from the SITL GUI
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --gui
