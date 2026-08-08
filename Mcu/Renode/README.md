@@ -796,9 +796,9 @@ launcher prints:
     pulseview -d ipdbg-la:conn=tcp-raw/127.0.0.1/4242
 
 The protocol cannot report its sampling clock, so selecting 10 MHz in
-PulseView is required for the time axis to be meaningful. `--sigrok-port`
-and `--sigrok-sample-rate` change the defaults. A headless capture uses
-the same connection:
+PulseView is required for the time axis to be meaningful. `--sigrok-port`,
+`--sigrok-sample-rate` and `--sigrok-samples` change the defaults. A
+headless capture uses the same connection:
 
     sigrok-cli -d ipdbg-la:conn=tcp-raw/127.0.0.1/4242 \
         -c samplerate=10M --samples 20000 -O bits
@@ -827,11 +827,24 @@ boundary; multiple physics transitions inside one batch share that
 timestamp and cannot appear as nanosecond-separated edges.
 
 There is no sample-rate timer in the emulator. The analyser records only
-timestamped changes into a ring and expands them into 65,536 fixed-rate
-samples when a capture completes, so selecting 10 MHz does not add ten
-million emulation events per simulated second. PulseView's trigger and
+timestamped changes into a ring and expands them into fixed-rate samples
+when a capture completes, so selecting 10 MHz does not add ten million
+emulation events per simulated second. PulseView's trigger and
 pre-trigger controls are carried by the ipdbg protocol and apply to the
 recorded AM32 signals.
+
+`--sigrok-samples` is the buffer depth, 1048576 by default, which at
+10 MHz is a 105ms window. It also sets the largest sample count
+PulseView will offer: the frontend lists 1-2-5 steps up to the depth,
+so a shallow buffer silently caps the selector (65536 stops it at
+50k). The whole buffer is transferred on every capture whatever count
+is selected, so depth costs readout time.
+
+The capture is one-shot, as the ipdbg protocol has no streaming mode:
+arm, wait for the trigger, fill the buffer, transfer. There is no
+continuous rolling capture - use the trigger with a pre-trigger
+percentage to place the window around the event of interest, and a
+lower sample rate for a longer window.
 
 ### Driving it from the SITL GUI
 

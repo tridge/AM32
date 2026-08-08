@@ -84,6 +84,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        // Capture depth as log2 of the sample count, which is what the
+        // protocol carries. It bounds the window a capture can cover
+        // (2^n / SampleRate) and PulseView's largest offered sample
+        // count, but the whole buffer is transferred on every capture,
+        // so deeper is not free.
+        public uint AddressWidth
+        {
+            get { return addressWidth; }
+            set
+            {
+                if(value < MinAddressWidth || value > MaxAddressWidth)
+                {
+                    throw new RecoverableException(string.Format(
+                        "sigrok address width must be {0}..{1}",
+                        MinAddressWidth, MaxAddressWidth));
+                }
+                addressWidth = value;
+            }
+        }
+
         // Debug window: port, nominal sample rate, edges retained, captures.
         public uint ReadDoubleWord(long offset)
         {
@@ -514,7 +534,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(state == State.LogicAnalyzer)
                 {
                     BeginPayload(value == 0x1F ? Target.Delay : Target.None,
-                                 AddressBytes);
+                                 owner.AddressBytes);
                     return;
                 }
 
@@ -611,7 +631,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 var data = new byte[8];
                 WriteLittleEndian(data, 0, DataWidth);
-                WriteLittleEndian(data, 4, AddressWidth);
+                WriteLittleEndian(data, 4, owner.addressWidth);
                 Send(data);
             }
 
@@ -701,15 +721,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private const int DataWidth = 14;
-        private const uint AddressWidth = 16;
         private const int DataBytes = (DataWidth + 7) / 8;
-        private const int AddressBytes = (int)((AddressWidth + 7) / 8);
-        private const uint SampleCount = 1u << (int)AddressWidth;
+        private const uint DefaultAddressWidth = 20;
+        private const uint MinAddressWidth = 8;
+        private const uint MaxAddressWidth = 26;
         private const uint ValidMask = (1u << DataWidth) - 1;
         private const uint BridgeMask = ValidMask & ~3u;
         private const uint DefaultSampleRate = 10000000;
         private const byte Escape = 0x55;
         private const byte ResetCommand = 0xEE;
+
+        private uint addressWidth = DefaultAddressWidth;
+        private int AddressBytes => (int)((addressWidth + 7) / 8);
+        private uint SampleCount => 1u << (int)addressWidth;
 
         private readonly IMachine machine;
         private readonly object lifecycle = new object();

@@ -2006,6 +2006,12 @@ def main():
     ap.add_argument('--sigrok-sample-rate', type=int, default=10000000,
                     help='nominal capture sample rate in Hz; set the same '
                          'rate in PulseView (default 10000000)')
+    ap.add_argument('--sigrok-samples', type=int, default=1 << 20,
+                    help='capture buffer depth in samples, rounded up to a '
+                         'power of two. It sets the window a capture covers '
+                         '(samples/rate) and the largest count PulseView '
+                         'offers, and the whole buffer is transferred every '
+                         'capture (default 1048576)')
     ap.add_argument('--gui-port', type=int, default=57733,
                     help='udp port carrying throttle in and telemetry out')
     ap.add_argument('--gui-state-port', type=int, default=57734,
@@ -2098,6 +2104,8 @@ def main():
             ap.error('--sigrok-port must be 1..65535')
         if not 1 <= args.sigrok_sample_rate <= 1000000000:
             ap.error('--sigrok-sample-rate must be 1..1000000000 Hz')
+        if not 256 <= args.sigrok_samples <= (1 << 26):
+            ap.error('--sigrok-samples must be 256..67108864')
 
     # an eeprom is required, not optional; without one Renode fails with
     # "Parameters did not match the signature" from LoadBinary, which
@@ -2203,8 +2211,10 @@ def main():
                               can_bus=args.can_bus if cfg['dronecan'] else -1)
 
     if args.sigrok:
-        setup += '; sigrok SampleRate %d; sigrok Port %d' % (
-            args.sigrok_sample_rate, args.sigrok_port)
+        width = max(8, (args.sigrok_samples - 1).bit_length())
+        setup += '; sigrok SampleRate %d; sigrok AddressWidth %d' % (
+            args.sigrok_sample_rate, width)
+        setup += '; sigrok Port %d' % args.sigrok_port
         if not args.gdb and not (args.gui or args.link):
             setup += '; start'
         print('connect with:')
@@ -2212,6 +2222,8 @@ def main():
               % args.sigrok_port)
         print('set the PulseView sample rate to %d Hz' %
               args.sigrok_sample_rate)
+        print('buffer %d samples = %.3g s per capture'
+              % (1 << width, float(1 << width) / args.sigrok_sample_rate))
         print('channels: CH0=input wire, CH1=WS2812 data, '
               'CH2..4=A mode, CH5..7=B mode, CH8..10=C mode, '
               'CH11=comparator, CH12..13=sensed phase')
