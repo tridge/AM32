@@ -1,21 +1,29 @@
-// Event-driven logic analyser served through the ipdbg-la TCP protocol.
-// GPIO and bridge state changes are timestamped as they happen; the fixed-rate
-// sample array is only produced when a client requests a capture.
+// Event-driven logic analyser served through the renode-la TCP protocol
+// (src/hardware/renode-la/PROTOCOL.md in libsigrok). GPIO and bridge state
+// changes are timestamped as they happen and expanded into the fixed-rate
+// stream the client asked for, so the sample rate costs nothing to raise:
+// there is no per-sample emulation event, only a flush tick.
 //
-// Channels:
-//   0 input wire, 1 WS2812 data, 2..4/5..7/8..10 phase A/B/C mode,
-//   11 comparator output, 12..13 sensed phase.
-// Phase mode is SITL_PHASE_*: 0 float, 1 low, 2 PWM, 3 PWM without
-// complementary drive, 4 proportional brake.
+// Capture is continuous. Once the client sends START the stream follows
+// simulated time until STOP, which is what makes it behave like a bench
+// analyser rather than a one-shot buffer.
+//
+// Channels are named on the wire (see ChannelNames). Phase mode is
+// SITL_PHASE_*: 0 float, 1 low, 2 PWM, 3 PWM without complementary drive,
+// 4 proportional brake.
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Time;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
@@ -28,12 +36,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             this.machine = machine;
             sampleRate = DefaultSampleRate;
+            // Advancing the stream needs a tick of its own: an idle wire
+            // still has to produce samples or the client's time stands
+            // still. One per millisecond of simulated time is negligible
+            // beside the physics batch, and each one emits however many
+            // samples the selected rate calls for.
+            flush = new LimitTimer(machine.ClockSource, 1000000, this, "sigrok",
+                                   FlushPeriodUs, direction: Direction.Ascending,
+                                   enabled: false, autoUpdate: true,
+                                   eventEnabled: true);
+            flush.LimitReached += OnFlush;
         }
 
         public long Size => 0x100;
 
         // The analyser is bench equipment, so a firmware reset does not close
-        // its socket or discard the waveform already on the wire.
+        // its socket or interrupt the stream already running.
         public void Reset()
         {
         }
@@ -70,6 +88,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        // The rate advertised in the greeting. The client may pick another
+        // one when it starts, and that is the rate the stream then uses.
         public uint SampleRate
         {
             get { return sampleRate; }
@@ -84,35 +104,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        // Capture depth as log2 of the sample count, which is what the
-        // protocol carries. It bounds the window a capture can cover
-        // (2^n / SampleRate) and PulseView's largest offered sample
-        // count, but the whole buffer is transferred on every capture,
-        // so deeper is not free.
-        public uint AddressWidth
+        // Shown as the device name in the frontend's device list.
+        public string DeviceName
         {
-            get { return addressWidth; }
-            set
-            {
-                if(value < MinAddressWidth || value > MaxAddressWidth)
-                {
-                    throw new RecoverableException(string.Format(
-                        "sigrok address width must be {0}..{1}",
-                        MinAddressWidth, MaxAddressWidth));
-                }
-                addressWidth = value;
-            }
+            get { return deviceName; }
+            set { deviceName = string.IsNullOrEmpty(value) ? DefaultName : value; }
         }
 
-        // Debug window: port, nominal sample rate, edges retained, captures.
+        // Debug window: port, advertised rate, streamed samples, clients.
         public uint ReadDoubleWord(long offset)
         {
             switch(offset)
             {
             case 0x00: return (uint)port;
             case 0x04: return sampleRate;
-            case 0x08: return (uint)edgeCount;
-            case 0x0C: return captures;
+            case 0x08: return (uint)streamedSamples;
+            case 0x0C: return clients;
             default: return 0;
             }
         }
@@ -136,17 +143,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
-            var now = NowNs;
-            ActivateRequest(now);
-            UpdateState(1u << number, value ? 1u << number : 0, now);
-            CompleteIfReady(now);
+            UpdateState(1u << number, value ? 1u << number : 0);
         }
 
         public void ObserveBridge(int phaseA, int phaseB, int phaseC,
                                   int sensedPhase, bool comparator)
         {
-            var now = NowNs;
-            ActivateRequest(now);
             uint value = ((uint)phaseA & 7u) << 2;
             value |= ((uint)phaseB & 7u) << 5;
             value |= ((uint)phaseC & 7u) << 8;
@@ -155,601 +157,520 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 value |= 1u << 11;
             }
             value |= ((uint)Math.Max(0, sensedPhase) & 3u) << 12;
-            UpdateState(BridgeMask, value, now);
-            CompleteIfReady(now);
+            UpdateState(BridgeMask, value);
         }
+
+        // ---- capture, on the emulation thread ----
 
         private long NowNs => (long)(machine.ElapsedVirtualTime.TimeElapsed
             .TotalMicroseconds * 1000.0);
 
-        private void UpdateState(uint mask, uint value, long now)
+        private void UpdateState(uint mask, uint value)
         {
-            var before = currentState;
-            var after = (before & ~mask) | (value & mask);
-            var changed = before ^ after;
-            if(changed != 0)
-            {
-                for(var channel = 0; channel < DataWidth; channel++)
-                {
-                    var bit = 1u << channel;
-                    if((changed & bit) != 0)
-                    {
-                        AddEdge(new Edge(now, channel, (after & bit) != 0));
-                    }
-                }
-                currentState = after;
-            }
-            EvaluateTrigger(before, after, changed, now);
-        }
-
-        private void AddEdge(Edge edge)
-        {
-            if(edgeCount == edges.Length)
-            {
-                baseState = edges[edgeHead].Apply(baseState);
-                edgeHead = (edgeHead + 1) % edges.Length;
-                edgeCount--;
-            }
-            edges[(edgeHead + edgeCount) % edges.Length] = edge;
-            edgeCount++;
-        }
-
-        private void ActivateRequest(long now)
-        {
-            if(active != null)
+            var after = (currentState & ~mask) | (value & mask);
+            if(after == currentState)
             {
                 return;
             }
-            do
+            // Emit everything up to this instant at the old level first, so
+            // the change lands in the right sample rather than being
+            // back-dated to the last flush.
+            var stream = active;
+            if(stream != null)
             {
-                if(!requests.TryDequeue(out active))
-                {
-                    return;
-                }
-                if(active.Cancelled)
-                {
-                    active.Ready.Set();
-                    active = null;
-                }
+                Emit(stream, NowNs);
             }
-            while(active == null);
-            active.SampleRate = sampleRate;
-            active.Delay = Math.Min(active.Delay, SampleCount - 1);
-            EvaluateTrigger(currentState, currentState, 0, now);
+            currentState = after;
         }
 
-        private void EvaluateTrigger(uint before, uint after, uint changed,
-                                     long now)
+        private void OnFlush()
         {
-            if(active == null || active.Triggered)
+            ServicePending();
+            var stream = active;
+            if(stream == null)
             {
                 return;
             }
-            var any = active.MaskCurrent | active.MaskLast | active.MaskEdge;
-            var currentMatch = (after & active.MaskCurrent)
-                == (active.ValueCurrent & active.MaskCurrent);
-            var lastMatch = (before & active.MaskLast)
-                == (active.ValueLast & active.MaskLast);
-            var edgeMatch = active.MaskEdge == 0
-                || (changed & active.MaskEdge) == active.MaskEdge;
-            if(any == 0 || (currentMatch && lastMatch && edgeMatch))
-            {
-                active.Triggered = true;
-                active.TriggerNs = now;
-            }
+            Emit(stream, NowNs);
+            stream.Push();
         }
 
-        private void CompleteIfReady(long now)
+        // Expand the interval [emitted, until) into fixed-rate samples of the
+        // level held over it. Cost is the sample count, not the edge count,
+        // and nothing here runs per emulated sample.
+        private void Emit(Stream stream, long until)
         {
-            if(active == null)
+            if(until <= stream.EmittedNs)
             {
                 return;
             }
-            if(active.Cancelled)
+            var wanted = (long)((decimal)(until - stream.StartNs)
+                                * stream.Rate / 1000000000m);
+            var count = wanted - stream.EmittedSamples;
+            if(count <= 0)
             {
-                active.Ready.Set();
-                active = null;
+                stream.EmittedNs = until;
                 return;
             }
-            if(!active.Triggered)
+            if(count > MaxSamplesPerEmit)
             {
-                return;
+                // A long pause (the emulation was stopped, or the client
+                // stalled) would otherwise allocate without bound.
+                count = MaxSamplesPerEmit;
             }
-            var post = SampleCount - 1 - active.Delay;
-            var end = active.TriggerNs + SamplesToNs(post, active.SampleRate);
-            if(now < end)
-            {
-                return;
-            }
-            active.Data = Rasterize(active);
-            captures++;
-            active.Ready.Set();
-            active = null;
+            stream.Append(currentState, (int)count);
+            stream.EmittedSamples += count;
+            stream.EmittedNs = until;
+            streamedSamples += count;
         }
 
-        private byte[] Rasterize(CaptureRequest request)
-        {
-            var data = new byte[SampleCount * DataBytes];
-            var start = request.TriggerNs
-                - SamplesToNs(request.Delay, request.SampleRate);
-            var state = baseState;
-            var edgeIndex = 0;
-            while(edgeIndex < edgeCount)
-            {
-                var edge = edges[(edgeHead + edgeIndex) % edges.Length];
-                if(edge.TimeNs > start)
-                {
-                    break;
-                }
-                state = edge.Apply(state);
-                edgeIndex++;
-            }
-            for(var sample = 0; sample < SampleCount; sample++)
-            {
-                var when = start + SamplesToNs((uint)sample, request.SampleRate);
-                while(edgeIndex < edgeCount)
-                {
-                    var edge = edges[(edgeHead + edgeIndex) % edges.Length];
-                    if(edge.TimeNs > when)
-                    {
-                        break;
-                    }
-                    state = edge.Apply(state);
-                    edgeIndex++;
-                }
-                var offset = sample * DataBytes;
-                data[offset] = (byte)state;
-                data[offset + 1] = (byte)(state >> 8);
-            }
-            return data;
-        }
-
-        private static long SamplesToNs(uint samples, uint rate)
-        {
-            return (long)((ulong)samples * 1000000000ul / rate);
-        }
+        // ---- the socket side ----
 
         private void Open(int value)
         {
-            var listener = new Socket(AddressFamily.InterNetwork,
-                                      SocketType.Stream, ProtocolType.Tcp);
+            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream,
+                                    ProtocolType.Tcp);
             try
             {
-                listener.SetSocketOption(SocketOptionLevel.Socket,
-                                         SocketOptionName.ReuseAddress, true);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, value));
-                listener.Listen(1);
+                socket.Bind(new IPEndPoint(IPAddress.Loopback, value));
+                socket.Listen(1);
             }
             catch(SocketException e)
             {
-                listener.Close();
+                socket.Close();
                 throw new RecoverableException(string.Format(
-                    "could not bind the sigrok port {0}: {1}", value, e.Message));
+                    "could not listen on sigrok port {0}: {1}", value, e.Message));
             }
-            listenerSocket = listener;
             port = value;
-            listenerThread = new Thread(() => AcceptLoop(listener))
+            listenerSocket = socket;
+            flush.Enabled = true;
+            listenerThread = new Thread(() => ListenLoop(socket))
             {
                 IsBackground = true,
-                Name = "am32 sigrok " + value,
+                Name = "am32 sigrok listener",
             };
             listenerThread.Start();
-            this.Log(LogLevel.Info, "ipdbg-la listening on tcp 127.0.0.1:{0}",
+            this.Log(LogLevel.Info, "renode-la listening on tcp 127.0.0.1:{0}",
                      value);
         }
 
         private void Close()
         {
-            port = 0;
-            var listener = listenerSocket;
-            var client = clientSocket;
-            var thread = listenerThread;
+            StopStream();
+            flush.Enabled = false;
+            var socket = listenerSocket;
             listenerSocket = null;
+            if(socket != null)
+            {
+                socket.Close();
+            }
+            var client = clientSocket;
             clientSocket = null;
-            listenerThread = null;
             if(client != null)
             {
                 client.Close();
             }
-            if(listener != null)
-            {
-                listener.Close();
-            }
-            if(thread != null && !thread.Join(2000))
-            {
-                this.Log(LogLevel.Warning,
-                         "sigrok listener thread did not stop in time");
-            }
+            port = 0;
         }
 
-        private void AcceptLoop(Socket listener)
+        private void ListenLoop(Socket socket)
         {
-            try
+            while(true)
             {
-                while(listenerSocket == listener)
+                Socket client;
+                try
                 {
-                    Socket client;
-                    try
-                    {
-                        client = listener.Accept();
-                    }
-                    catch(SocketException)
-                    {
-                        if(listenerSocket != listener)
-                        {
-                            return;
-                        }
-                        continue;
-                    }
+                    client = socket.Accept();
+                }
+                catch(Exception)
+                {
+                    return;
+                }
+                try
+                {
                     client.NoDelay = true;
+                    clients++;
                     clientSocket = client;
+                    Serve(client);
+                }
+                catch(Exception e)
+                {
+                    this.Log(LogLevel.Warning, "sigrok client dropped: {0}",
+                             e.Message);
+                }
+                finally
+                {
+                    StopStream();
+                    clientSocket = null;
                     try
                     {
-                        new ProtocolSession(this, client).Run();
-                    }
-                    catch(SocketException)
-                    {
-                        // Client disconnect is the normal scan/open sequence.
-                    }
-                    catch(ObjectDisposedException)
-                    {
-                    }
-                    catch(Exception e)
-                    {
-                        this.Log(LogLevel.Error, "sigrok client stopped: {0}", e);
-                    }
-                    finally
-                    {
-                        if(clientSocket == client)
-                        {
-                            clientSocket = null;
-                        }
                         client.Close();
+                    }
+                    catch(Exception)
+                    {
                     }
                 }
             }
-            catch(ObjectDisposedException)
+        }
+
+        // One connection: greeting, then commands until the peer goes away.
+        // A scan connects, reads the greeting and disconnects, so this has
+        // to survive being dropped at any point.
+        private void Serve(Socket client)
+        {
+            SendAll(client, Greeting());
+            var header = new byte[FrameHeader];
+            while(true)
             {
-            }
-            catch(Exception e)
-            {
-                this.Log(LogLevel.Error, "sigrok listener stopped: {0}", e);
+                if(!ReadAll(client, header, FrameHeader))
+                {
+                    return;
+                }
+                var type = header[0];
+                var length = (int)ReadLe32(header, 4);
+                if(length < 0 || length > MaxFramePayload)
+                {
+                    return;
+                }
+                var payload = length > 0 ? new byte[length] : Array.Empty<byte>();
+                if(length > 0 && !ReadAll(client, payload, length))
+                {
+                    return;
+                }
+                if(type == CmdStart)
+                {
+                    var rate = length >= 8 ? ReadLe64(payload, 0) : sampleRate;
+                    StartStream(client, rate);
+                }
+                else if(type == CmdStop)
+                {
+                    StopStream();
+                }
             }
         }
 
-        private CaptureRequest RequestCapture(ProtocolSession session)
+        private byte[] Greeting()
         {
-            var request = new CaptureRequest(session);
-            requests.Enqueue(request);
-            return request;
+            var meta = new List<byte>();
+            AppendString(meta, deviceName);
+            foreach(var name in ChannelNames)
+            {
+                AppendString(meta, name);
+            }
+            var packet = new byte[GreetingSize + meta.Count];
+            Encoding.ASCII.GetBytes(Magic, 0, Magic.Length, packet, 0);
+            WriteLe16(packet, 8, ProtocolVersion);
+            WriteLe16(packet, 10, (ushort)DataWidth);
+            WriteLe32(packet, 12, (uint)meta.Count);
+            WriteLe64(packet, 16, sampleRate);
+            meta.CopyTo(packet, GreetingSize);
+            return packet;
         }
 
-        private sealed class ProtocolSession
+        private static void AppendString(List<byte> to, string value)
         {
-            public ProtocolSession(AM32_Sigrok owner, Socket socket)
+            var bytes = Encoding.UTF8.GetBytes(value);
+            to.Add((byte)(bytes.Length & 0xFF));
+            to.Add((byte)(bytes.Length >> 8));
+            to.AddRange(bytes);
+        }
+
+        // Socket thread: latch the request only. Virtual time and the
+        // flush timer belong to the emulation thread, so the stream is
+        // actually created in OnFlush.
+        private void StartStream(Socket client, ulong rate)
+        {
+            if(rate == 0 || rate > 1000000000ul)
+            {
+                SendError(client, "unsupported sample rate");
+                return;
+            }
+            lock(pendingLock)
+            {
+                pendingClient = client;
+                pendingRate = rate;
+                pendingStart = true;
+                pendingStop = true;
+            }
+        }
+
+        private void StopStream()
+        {
+            lock(pendingLock)
+            {
+                pendingStart = false;
+                pendingClient = null;
+                pendingStop = true;
+            }
+        }
+
+        // Emulation thread: apply whatever the socket thread asked for.
+        private void ServicePending()
+        {
+            Socket client = null;
+            ulong rate = 0;
+            bool start, stop;
+            lock(pendingLock)
+            {
+                start = pendingStart;
+                stop = pendingStop;
+                client = pendingClient;
+                rate = pendingRate;
+                pendingStart = false;
+                pendingStop = false;
+                pendingClient = null;
+            }
+            if(stop)
+            {
+                var previous = active;
+                active = null;
+                if(previous != null)
+                {
+                    previous.Stop();
+                }
+            }
+            if(start && client != null)
+            {
+                active = new Stream(this, client, rate, NowNs);
+                this.Log(LogLevel.Info, "sigrok streaming at {0} Hz", rate);
+            }
+        }
+
+        private void SendError(Socket client, string text)
+        {
+            var body = Encoding.UTF8.GetBytes(text);
+            var packet = new byte[FrameHeader + body.Length];
+            packet[0] = MsgError;
+            WriteLe32(packet, 4, (uint)body.Length);
+            Array.Copy(body, 0, packet, FrameHeader, body.Length);
+            SendAll(client, packet);
+        }
+
+        private static void SendAll(Socket socket, byte[] data)
+        {
+            var sent = 0;
+            while(sent < data.Length)
+            {
+                sent += socket.Send(data, sent, data.Length - sent,
+                                    SocketFlags.None);
+            }
+        }
+
+        private static bool ReadAll(Socket socket, byte[] into, int length)
+        {
+            var got = 0;
+            while(got < length)
+            {
+                int n;
+                try
+                {
+                    n = socket.Receive(into, got, length - got, SocketFlags.None);
+                }
+                catch(Exception)
+                {
+                    return false;
+                }
+                if(n <= 0)
+                {
+                    return false;
+                }
+                got += n;
+            }
+            return true;
+        }
+
+        // A started stream: samples are packed on the emulation thread and
+        // written by a thread of its own, so a client that reads slowly
+        // applies backpressure through the queue rather than stalling the
+        // emulation inside a socket write.
+        private sealed class Stream
+        {
+            public Stream(AM32_Sigrok owner, Socket socket, ulong rate,
+                          long startNs)
             {
                 this.owner = owner;
                 this.socket = socket;
+                Rate = rate;
+                StartNs = startNs;
+                EmittedNs = startNs;
+                sender = new Thread(SendLoop)
+                {
+                    IsBackground = true,
+                    Name = "am32 sigrok sender",
+                };
+                sender.Start();
             }
 
-            public uint MaskCurrent { get; private set; }
-            public uint ValueCurrent { get; private set; }
-            public uint MaskLast { get; private set; }
-            public uint ValueLast { get; private set; }
-            public uint MaskEdge { get; private set; }
-            public uint Delay { get; private set; }
+            public ulong Rate { get; private set; }
+            public long StartNs { get; private set; }
+            public long EmittedNs { get; set; }
+            public long EmittedSamples { get; set; }
 
-            public void Run()
+            public void Append(uint state, int count)
             {
-                var buf = new byte[4096];
-                while(true)
+                var low = (byte)state;
+                var high = (byte)(state >> 8);
+                for(var i = 0; i < count; i++)
                 {
-                    var count = socket.Receive(buf);
-                    if(count <= 0)
+                    pending.Add(low);
+                    pending.Add(high);
+                }
+                if(pending.Count >= PushThreshold)
+                {
+                    Push();
+                }
+            }
+
+            public void Push()
+            {
+                if(pending.Count == 0 || stopped)
+                {
+                    return;
+                }
+                var payload = pending.ToArray();
+                pending.Clear();
+                var packet = new byte[FrameHeader + payload.Length];
+                packet[0] = MsgData;
+                WriteLe32(packet, 4, (uint)payload.Length);
+                Array.Copy(payload, 0, packet, FrameHeader, payload.Length);
+                try
+                {
+                    queue.Add(packet);
+                }
+                catch(Exception)
+                {
+                }
+            }
+
+            public void Stop()
+            {
+                stopped = true;
+                pending.Clear();
+                try
+                {
+                    queue.CompleteAdding();
+                }
+                catch(Exception)
+                {
+                }
+            }
+
+            private void SendLoop()
+            {
+                try
+                {
+                    foreach(var packet in queue.GetConsumingEnumerable())
                     {
-                        return;
-                    }
-                    for(var i = 0; i < count; i++)
-                    {
-                        Feed(buf[i]);
-                    }
-                }
-            }
-
-            private void Feed(byte value)
-            {
-                if(escaped)
-                {
-                    escaped = false;
-                    Command(value);
-                    return;
-                }
-                if(value == Escape)
-                {
-                    escaped = true;
-                    return;
-                }
-                if(value == ResetCommand)
-                {
-                    Reset();
-                    return;
-                }
-                Command(value);
-            }
-
-            private void Reset()
-            {
-                if(captureRequest != null)
-                {
-                    captureRequest.Cancelled = true;
-                    captureRequest.Ready.Set();
-                    captureRequest = null;
-                }
-                state = State.Idle;
-                payload = 0;
-                payloadRemaining = 0;
-                MaskCurrent = ValueCurrent = MaskLast = ValueLast = MaskEdge = 0;
-                Delay = 0;
-            }
-
-            private void Command(byte value)
-            {
-                if(state == State.Payload)
-                {
-                    payload = (payload << 8) | value;
-                    if(--payloadRemaining == 0)
-                    {
-                        StorePayload();
-                        state = State.Idle;
-                    }
-                    return;
-                }
-                if(state == State.Trigger)
-                {
-                    state = value == 0xF1 ? State.Current
-                        : value == 0xF9 ? State.Last
-                        : value == 0xF5 ? State.Edge : State.Idle;
-                    return;
-                }
-                if(state == State.Current)
-                {
-                    BeginPayload(value == 0xF3 ? Target.MaskCurrent
-                        : value == 0xF7 ? Target.ValueCurrent : Target.None,
-                        DataBytes);
-                    return;
-                }
-                if(state == State.Last)
-                {
-                    BeginPayload(value == 0xFB ? Target.MaskLast
-                        : value == 0xFF ? Target.ValueLast : Target.None,
-                        DataBytes);
-                    return;
-                }
-                if(state == State.Edge)
-                {
-                    BeginPayload(value == 0xF6 ? Target.MaskEdge : Target.None,
-                                 DataBytes);
-                    return;
-                }
-                if(state == State.LogicAnalyzer)
-                {
-                    BeginPayload(value == 0x1F ? Target.Delay : Target.None,
-                                 owner.AddressBytes);
-                    return;
-                }
-
-                switch(value)
-                {
-                case 0xBB:
-                    Send(new byte[] { (byte)'I', (byte)'D', (byte)'B', (byte)'G' });
-                    break;
-                case 0xAA:
-                    SendWidths();
-                    break;
-                case 0x10:
-                    Send(new byte[4]);
-                    break;
-                case 0x60:
-                    Send(new byte[1]);
-                    break;
-                case 0xF0:
-                    state = State.Trigger;
-                    break;
-                case 0x0F:
-                    state = State.LogicAnalyzer;
-                    break;
-                case 0xFE:
-                    Capture();
-                    break;
-                case 0x00:
-                    break;
-                }
-            }
-
-            private void BeginPayload(Target target, int bytes)
-            {
-                if(target == Target.None)
-                {
-                    state = State.Idle;
-                    return;
-                }
-                this.target = target;
-                payload = 0;
-                payloadRemaining = bytes;
-                state = State.Payload;
-            }
-
-            private void StorePayload()
-            {
-                var value = payload & ValidMask;
-                switch(target)
-                {
-                case Target.MaskCurrent: MaskCurrent = value; break;
-                case Target.ValueCurrent: ValueCurrent = value; break;
-                case Target.MaskLast: MaskLast = value; break;
-                case Target.ValueLast: ValueLast = value; break;
-                case Target.MaskEdge: MaskEdge = value; break;
-                case Target.Delay: Delay = payload; break;
-                }
-            }
-
-            private void Capture()
-            {
-                var request = owner.RequestCapture(this);
-                captureRequest = request;
-                var buf = new byte[256];
-                while(!request.Ready.WaitOne(10))
-                {
-                    if(owner.clientSocket != socket)
-                    {
-                        request.Cancelled = true;
-                        return;
-                    }
-                    if(socket.Poll(0, SelectMode.SelectRead))
-                    {
-                        var count = socket.Receive(buf);
-                        if(count <= 0)
-                        {
-                            request.Cancelled = true;
-                            return;
-                        }
-                        for(var i = 0; i < count; i++)
-                        {
-                            Feed(buf[i]);
-                        }
+                        SendAll(socket, packet);
                     }
                 }
-                captureRequest = null;
-                if(!request.Cancelled && request.Data != null)
+                catch(Exception)
                 {
-                    Send(request.Data);
+                    // the client went away; ListenLoop cleans up
                 }
-                request.Ready.Close();
-            }
-
-            private void SendWidths()
-            {
-                var data = new byte[8];
-                WriteLittleEndian(data, 0, DataWidth);
-                WriteLittleEndian(data, 4, owner.addressWidth);
-                Send(data);
-            }
-
-            private static void WriteLittleEndian(byte[] data, int offset,
-                                                  uint value)
-            {
-                data[offset] = (byte)value;
-                data[offset + 1] = (byte)(value >> 8);
-                data[offset + 2] = (byte)(value >> 16);
-                data[offset + 3] = (byte)(value >> 24);
-            }
-
-            private void Send(byte[] data)
-            {
-                var offset = 0;
-                while(offset < data.Length)
+                finally
                 {
-                    var sent = socket.Send(data, offset, data.Length - offset,
-                                           SocketFlags.None);
-                    if(sent <= 0)
-                    {
-                        throw new SocketException();
-                    }
-                    offset += sent;
+                    stopped = true;
                 }
             }
 
             private readonly AM32_Sigrok owner;
             private readonly Socket socket;
-            private bool escaped;
-            private State state;
-            private Target target;
-            private uint payload;
-            private int payloadRemaining;
-            private CaptureRequest captureRequest;
-
-            private enum State { Idle, Trigger, Current, Last, Edge,
-                                 LogicAnalyzer, Payload }
-            private enum Target { None, MaskCurrent, ValueCurrent, MaskLast,
-                                  ValueLast, MaskEdge, Delay }
+            private readonly List<byte> pending = new List<byte>();
+            private readonly BlockingCollection<byte[]> queue
+                = new BlockingCollection<byte[]>(QueueDepth);
+            private readonly Thread sender;
+            private volatile bool stopped;
         }
 
-        private sealed class CaptureRequest
+        private static void WriteLe16(byte[] to, int at, ushort value)
         {
-            public CaptureRequest(ProtocolSession session)
-            {
-                MaskCurrent = session.MaskCurrent;
-                ValueCurrent = session.ValueCurrent;
-                MaskLast = session.MaskLast;
-                ValueLast = session.ValueLast;
-                MaskEdge = session.MaskEdge;
-                Delay = session.Delay;
-            }
-
-            public readonly uint MaskCurrent;
-            public readonly uint ValueCurrent;
-            public readonly uint MaskLast;
-            public readonly uint ValueLast;
-            public readonly uint MaskEdge;
-            public uint Delay;
-            public uint SampleRate;
-            public bool Triggered;
-            public volatile bool Cancelled;
-            public long TriggerNs;
-            public byte[] Data;
-            public readonly ManualResetEvent Ready = new ManualResetEvent(false);
+            to[at] = (byte)value;
+            to[at + 1] = (byte)(value >> 8);
         }
 
-        private struct Edge
+        private static void WriteLe32(byte[] to, int at, uint value)
         {
-            public Edge(long timeNs, int channel, bool value)
+            for(var i = 0; i < 4; i++)
             {
-                TimeNs = timeNs;
-                Channel = channel;
-                Value = value;
+                to[at + i] = (byte)(value >> (8 * i));
             }
-
-            public uint Apply(uint state)
-            {
-                var bit = 1u << Channel;
-                return Value ? state | bit : state & ~bit;
-            }
-
-            public readonly long TimeNs;
-            public readonly int Channel;
-            public readonly bool Value;
         }
 
+        private static void WriteLe64(byte[] to, int at, ulong value)
+        {
+            for(var i = 0; i < 8; i++)
+            {
+                to[at + i] = (byte)(value >> (8 * i));
+            }
+        }
+
+        private static uint ReadLe32(byte[] from, int at)
+        {
+            return (uint)(from[at] | (from[at + 1] << 8)
+                          | (from[at + 2] << 16) | (from[at + 3] << 24));
+        }
+
+        private static ulong ReadLe64(byte[] from, int at)
+        {
+            ulong value = 0;
+            for(var i = 7; i >= 0; i--)
+            {
+                value = (value << 8) | from[at + i];
+            }
+            return value;
+        }
+
+        // The names the frontend shows. They are part of the greeting and
+        // the driver rejects a device whose metadata changes between the
+        // scan and the open, so this stays fixed.
+        private static readonly string[] ChannelNames =
+        {
+            "input", "ws2812",
+            "A.mode0", "A.mode1", "A.mode2",
+            "B.mode0", "B.mode1", "B.mode2",
+            "C.mode0", "C.mode1", "C.mode2",
+            "comparator", "sense0", "sense1",
+        };
+
+        private const string Magic = "RenodeLA";
+        private const string DefaultName = "AM32 in Renode";
+        private const ushort ProtocolVersion = 1;
+        private const int GreetingSize = 24;
+        private const int FrameHeader = 8;
+        private const int MaxFramePayload = 16 * 1024 * 1024;
+        private const byte CmdStart = 0x01;
+        private const byte CmdStop = 0x02;
+        private const byte MsgData = 0x80;
+        private const byte MsgError = 0x81;
         private const int DataWidth = 14;
         private const int DataBytes = (DataWidth + 7) / 8;
-        private const uint DefaultAddressWidth = 20;
-        private const uint MinAddressWidth = 8;
-        private const uint MaxAddressWidth = 26;
         private const uint ValidMask = (1u << DataWidth) - 1;
         private const uint BridgeMask = ValidMask & ~3u;
         private const uint DefaultSampleRate = 10000000;
-        private const byte Escape = 0x55;
-        private const byte ResetCommand = 0xEE;
-
-        private uint addressWidth = DefaultAddressWidth;
-        private int AddressBytes => (int)((addressWidth + 7) / 8);
-        private uint SampleCount => 1u << (int)addressWidth;
+        private const uint FlushPeriodUs = 1000;
+        private const int PushThreshold = 64 * 1024;
+        private const int QueueDepth = 64;
+        private const long MaxSamplesPerEmit = 4 * 1000 * 1000;
 
         private readonly IMachine machine;
         private readonly object lifecycle = new object();
-        private readonly ConcurrentQueue<CaptureRequest> requests
-            = new ConcurrentQueue<CaptureRequest>();
-        private readonly Edge[] edges = new Edge[1 << 20];
+        private readonly LimitTimer flush;
+
         private volatile Socket listenerSocket;
         private volatile Socket clientSocket;
         private Thread listenerThread;
-        private CaptureRequest active;
-        private uint sampleRate;
-        private int port;
-        private int edgeHead;
-        private int edgeCount;
-        private uint baseState;
+        private volatile Stream active;
+        private readonly object pendingLock = new object();
+        private Socket pendingClient;
+        private ulong pendingRate;
+        private bool pendingStart;
+        private bool pendingStop;
         private uint currentState;
-        private uint captures;
+        private uint sampleRate;
+        private string deviceName = DefaultName;
+        private int port;
+        private uint clients;
+        private long streamedSamples;
     }
 }
