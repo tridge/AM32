@@ -94,25 +94,26 @@ timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
 // stock-timer table.
 
 // INTERVAL_TIMER, counting commutation intervals
-timer4: Timers.STM32_Timer @ sysbus 0x40000800
+timer4: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40000800
     frequency: 144000000
     initialLimit: 0xFFFF
     -> nvic@30
 
 // TEN_KHZ_TIMER: the 20kHz loop interrupt (TMR1_BRK_TMR9_IRQn)
-timer9: Timers.STM32_Timer @ sysbus 0x40014C00
+timer9: Timers.AM32_STM32_BasicTimer @ sysbus 0x40014C00
     frequency: 144000000
     initialLimit: 0xFFFF
     -> nvic@24
 
 // UTILITY_TIMER, the 1MHz microsecond clock delayMicros() spins on
-timer10: Timers.STM32_Timer @ sysbus 0x40015000
+timer10: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40015000
     frequency: 144000000
     initialLimit: 0xFFFF
+    synchronize: false
     -> nvicInput25@1
 
 // COM_TIMER (TMR1_TRG_HALL_TMR11_IRQn)
-timer11: Timers.STM32_Timer @ sysbus 0x40015400
+timer11: Timers.AM32_STM32_BasicTimer @ sysbus 0x40015400
     frequency: 144000000
     initialLimit: 0xFFFF
     -> nvic@26

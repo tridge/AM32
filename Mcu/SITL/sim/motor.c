@@ -70,6 +70,7 @@ static void dump_ring(void);
 
 static struct {
     double theta; // mechanical angle, rad
+    double theta_e; // electrical angle, normalised to [0, 2*pi)
     double omega; // mechanical speed, rad/s
     double i[3]; // phase currents, A
     double ke; // V/(rad/s) mechanical
@@ -128,6 +129,10 @@ void motor_config_changed(void)
     // line to line and two phases conduct in series, so halve it. All
     // other motor parameters are read from sitl_cfg on every step
     m.ke = 0.5 * 60.0 / (TWO_PI * sitl_cfg.motor.kv);
+    m.theta_e = fmod(m.theta * (sitl_cfg.motor.poles / 2), TWO_PI);
+    if (m.theta_e < 0) {
+        m.theta_e += TWO_PI;
+    }
 }
 
 void motor_add_signals(double acc[8])
@@ -188,18 +193,18 @@ void motor_init(void)
 void motor_set_theta(double theta)
 {
     m.theta = theta;
+    m.theta_e = fmod(theta * (sitl_cfg.motor.poles / 2), TWO_PI);
+    if (m.theta_e < 0) {
+        m.theta_e += TWO_PI;
+    }
 }
 
 /*
   normalised trapezoidal BEMF shape over one electrical revolution.
   Rising zero crossing at 0, falling at pi, flat top from pi/6..5pi/6
  */
-static double trap_shape(double thetae)
+static double trap_shape_normalized(double thetae)
 {
-    thetae = fmod(thetae, TWO_PI);
-    if (thetae < 0) {
-        thetae += TWO_PI;
-    }
     const double s = M_PI / 6; // 30 degree ramp
     if (thetae < s) {
         return thetae / s;
@@ -371,11 +376,15 @@ void motor_step(uint64_t now_ns, uint32_t dt_ns)
     // BEMF per phase
     // phase order such that the AM32 comStep sequence 1..6 advances the
     // field by +60 degrees electrical per step (verified by detent test)
-    const double thetae = m.theta * pole_pairs;
+    double thetae = m.theta_e;
     double e[3], shape[3];
     for (int p = 0; p < 3; p++) {
-        shape[p] = trap_shape(thetae + p * (TWO_PI / 3.0));
+        shape[p] = trap_shape_normalized(thetae);
         e[p] = m.ke * m.omega * shape[p];
+        thetae += TWO_PI / 3.0;
+        if (thetae >= TWO_PI) {
+            thetae -= TWO_PI;
+        }
     }
 
     // gate states from the phase mode and the emulated PWM timer. On a
@@ -776,6 +785,12 @@ void motor_step(uint64_t now_ns, uint32_t dt_ns)
         m.omega = 0;
     }
     m.theta += m.omega * dt;
+    m.theta_e += m.omega * dt * pole_pairs;
+    if (m.theta_e >= TWO_PI) {
+        m.theta_e -= TWO_PI;
+    } else if (m.theta_e < 0) {
+        m.theta_e += TWO_PI;
+    }
     if (m.theta > TWO_PI || m.theta < -TWO_PI) {
         m.theta = fmod(m.theta, TWO_PI);
     }

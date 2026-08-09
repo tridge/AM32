@@ -1,11 +1,12 @@
 //
 // Generates a servo PWM throttle signal as pin edges.
 //
-// Deliberately pin-level rather than writing capture values into
-// dma_buffer directly: the point is to exercise the real detectInput()
-// and checkServo() wrap arithmetic in Src/signal.c, which is the
-// auto-detection logic most likely to carry an MCU porting bug. Poking
-// the buffer would bypass exactly the code under test.
+// Servo is deliberately pin-level rather than writing capture values into
+// dma_buffer directly: the point is to exercise the real detectInput() and
+// checkServo() wrap arithmetic in Src/signal.c, which is the auto-detection
+// logic most likely to carry an MCU porting bug. DShot has an optional
+// frame-batch path, but it still supplies every captured edge through the
+// timer and modeled DMA rather than injecting a decoded command.
 //
 // The output drives two things, and both are needed: the capture
 // timer's channel 1 input, and the GPIO pin, because
@@ -24,6 +25,7 @@ using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -47,9 +49,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AM32ThrottleGenerator : IDoubleWordPeripheral, IKnownSize,
                                          INumberedGPIOOutput, IGPIOReceiver
     {
-        public AM32ThrottleGenerator(IMachine machine)
+        public AM32ThrottleGenerator(IMachine machine,
+                                     bool batchDshotFrames = false)
         {
             this.machine = machine;
+            BatchDshotFrames = batchDshotFrames;
             var conns = new Dictionary<int, IGPIO>();
             conns[0] = new GPIO();
             Connections = conns;
@@ -168,6 +172,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // sender asked for rather than a fixed zero.
         public bool TelemetryBit { get; set; }
 
+        // Batch a complete DShot input frame into the capture timer. This
+        // removes 32 host clock callbacks per frame, while the timer still
+        // generates all 32 CCR values and DMA requests for guest firmware.
+        // It is optional so pin-level porting tests can retain every edge.
+        public bool BatchDshotFrames
+        {
+            get { return batchDshotFrames; }
+            set
+            {
+                batchDshotFrames = value;
+                if(!value)
+                {
+                    CancelBatchedFrame();
+                }
+            }
+        }
+
         public bool Enabled
         {
             get { return enabled; }
@@ -182,6 +203,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // of the frame and the firmware sees signal loss
                     // rather than a stuck-low line.
                     frameTimer.Enabled = false;
+                    CancelBatchedFrame();
                     transmitting = false;
                     DriveIdle();
                     high = false;
@@ -202,6 +224,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // re-reset every two seconds forever.
             high = false;
             bitIndex = 0;
+            CancelBatchedFrame();
             transmitting = false;
             frameTimer.Enabled = false;
             Connections[0].Unset();
@@ -259,6 +282,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             frame = DshotFrame();
             bitIndex = 0;
+            if(BatchDshotFrames)
+            {
+                if(dshotFrameSink == null)
+                {
+                    dshotFrameSink = machine.GetPeripheralsOfType<IAM32DshotFrameSink>()
+                        .FirstOrDefault();
+                }
+                // The wire remains at its idle level for the host-side
+                // batch. CompleteDshotFrame supplies the transitions as
+                // capture timestamps after the simulated frame duration.
+                transmitting = false;
+                DriveIdle();
+                if(dshotFrameSink != null
+                   && dshotFrameSink.BeginDshotFrame(frame, BitPeriodNs))
+                {
+                    batchedFrame = true;
+                    transmitting = true;
+                    high = false;
+                    frameTimer.Limit = BitPeriodNs * 16;
+                    frameTimer.Enabled = true;
+                    return;
+                }
+            }
             BeginBit();
         }
 
@@ -318,6 +364,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void DshotStep()
         {
+            if(batchedGap)
+            {
+                batchedGap = false;
+                StartDshotFrame();
+                return;
+            }
+            if(batchedFrame)
+            {
+                batchedFrame = false;
+                transmitting = false;
+                high = false;
+                DriveIdle();
+                dshotFrameSink.CompleteDshotFrame();
+                batchedGap = true;
+                frameTimer.Limit = FrameGapNs;
+                frameTimer.Enabled = true;
+                return;
+            }
             var bitNs = BitPeriodNs;
             if(high)
             {
@@ -403,6 +467,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return ((payload << 4) | crc) & 0xFFFF;
         }
 
+        private void CancelBatchedFrame()
+        {
+            batchedFrame = false;
+            batchedGap = false;
+            if(dshotFrameSink != null)
+            {
+                dshotFrameSink.CancelDshotFrame();
+            }
+        }
+
         private const uint DefaultFrameUs = 20000;
 
         private readonly IMachine machine;
@@ -418,5 +492,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool escLevel = true;
         private uint frame;
         private int bitIndex;
+        private IAM32DshotFrameSink dshotFrameSink;
+        private bool batchedFrame;
+        private bool batchedGap;
+        private bool batchDshotFrames;
     }
 }

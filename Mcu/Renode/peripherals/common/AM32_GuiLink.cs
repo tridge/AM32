@@ -495,7 +495,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     // time. The receive thread already stored the value;
                     // this is the acknowledgement.
                     var pace = paceTarget;
-                    if(pace > 0 && pace < 1.0f)
+                    if(pace > 0 && pace <= 1.0f)
                     {
                         this.Log(LogLevel.Info, "pacing to {0:F3}x", pace);
                         Reply(c.From, true,
@@ -505,7 +505,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     {
                         this.Log(LogLevel.Info, "pacing off");
                         Reply(c.From, true, "unpaced: the emulator runs as "
-                              + "fast as it can below real time");
+                              + "fast as it can");
                     }
                     break;
                 case 8: // variable watch subscribe. Same command number,
@@ -973,7 +973,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void Pace()
         {
             var target = paceTarget;
-            if(float.IsNaN(target) || target <= 0 || target >= 1.0f)
+            if(float.IsNaN(target) || target <= 0 || target > 1.0f)
             {
                 paceValid = false;
                 return;
@@ -1142,7 +1142,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong lastFlushNs;
         private uint lastReplyCount;
 
-        // pacing (cmd 2): simulated over wall time to hold, 0 or >=1 is
+        // pacing (cmd 2): simulated over wall time to hold, 0 or >1 is
         // unpaced. Written by the state socket thread, read in Pace().
         private volatile float paceTarget;
         private readonly Stopwatch paceClock = Stopwatch.StartNew();

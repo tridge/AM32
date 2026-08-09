@@ -152,36 +152,40 @@ timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
     0 -> nvic@13
     1 -> nvic@14
 
-timer2: Timers.STM32_Timer @ sysbus 0x40000000
+timer2: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40000000
     frequency: 64000000
     initialLimit: 0xFFFFFFFF
+    synchronize: false
     -> nvic@15
 
 // timer3 is declared by the target overlay: it is the capture timer on
 // every G0 group so far, and belongs with the DMA channel and input pin
 // that go with it.
 
-timer4: Timers.STM32_Timer @ sysbus 0x40000800
+// These timers are not AM32 control-loop interrupt sources. The derived
+// counter model keeps their register/time behavior without the five permanent
+// clock entries created by each general STM32 timer.
+timer4: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40000800
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@16
 
-timer6: Timers.STM32_Timer @ sysbus 0x40001000
+timer6: Timers.AM32_STM32_BasicTimer @ sysbus 0x40001000
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@17
 
-timer7: Timers.STM32_Timer @ sysbus 0x40001400
+timer7: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40001400
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@18
 
-timer14: Timers.STM32_Timer @ sysbus 0x40002000
+timer14: Timers.AM32_STM32_BasicTimer @ sysbus 0x40002000
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@19
 
-timer15: Timers.STM32_Timer @ sysbus 0x40014000
+timer15: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40014000
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@20
@@ -190,7 +194,7 @@ timer15: Timers.STM32_Timer @ sysbus 0x40014000
 // groups capture the throttle on TIM16_CH1 instead of TIM3_CH1, so
 // which of the two is the capture timer is a per target choice.
 
-timer17: Timers.STM32_Timer @ sysbus 0x40014800
+timer17: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40014800
     frequency: 64000000
     initialLimit: 0xFFFF
     -> nvic@22
@@ -305,18 +309,6 @@ systemMemory: Memory.MappedMemory @ sysbus 0x1FFF7000
 // samples TIM1 by querying OutputRef(), not by listening for edges.
 // timer3's block is gone for the same reason - it is the capture timer,
 // an input only, and its block would have overridden the DMA wiring.
-
-timer2:
-    0 -> gpioPortA#00@2 | gpioPortA#05@2 | gpioPortA#15@2
-    1 -> gpioPortA#01@2 | gpioPortB#03@2
-    2 -> gpioPortA#02@2 | gpioPortB#10@2 | gpioPortC#06@2
-    3 -> gpioPortA#03@2 | gpioPortB#11@2 | gpioPortC#07@2
-
-timer14:
-    0 -> gpioPortA#04@4 | gpioPortA#07@4 | gpioPortB#01@0 | gpioPortF#00@2
-
-timer17:
-    0 -> gpioPortA#07@5 | gpioPortB#07@2 | gpioPortB#09@2 | gpioPortD#01@2
 
 sysbus:
     init:

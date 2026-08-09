@@ -845,6 +845,14 @@ or drive the wire some other way, to see a running motor.
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --gui
 
+On a hybrid host, `--cpusel N` pins Renode and its in-process motor simulator
+to one host CPU. The launcher, Qt GUI and gdb remain available to the normal
+scheduler, avoiding contention with the emulation thread. For example, the
+current benchmark host is most consistent with Renode on CPU 6:
+
+    python3 Mcu/Renode/gen_target.py VIMDRONES_L431 --gui --cpusel 6 \
+        --renode /data/codex/renode-am32-perf/renode
+
 That starts the emulator with `guilink` serving the SITL's own two UDP
 protocols and opens `Mcu/SITL/sitl_gui.py --backend renode` on them, so
 the throttle slider, the BDShot telemetry readout, the rpm and current
@@ -920,11 +928,11 @@ is on the wire and all of it matters most when the wire has gone quiet:
   application or below `0x08001000` in the bootloader region, and whether
   it has halted at all. A halted core used to be indistinguishable from
   an ESC that would not arm; see the bring-up findings.
-- **the emulation speed it is achieving.** The speedup slider works
-  here too, but only downward: the link sleeps the emulation thread to
-  hold simulated over wall time at the slider value, for slow motion in
-  the motor view. At or above what the host achieves it runs flat out,
-  and the label shows the rate actually reached.
+- **the emulation speed it is achieving.** The speedup slider works here
+  too: the link sleeps the emulation thread to hold simulated over wall
+  time at targets through exactly 1x. The `1x` button requests real-time
+  pacing, while `max` disables pacing and lets the emulator run flat out.
+  The label shows the rate actually reached.
 - **how far through arming it is.** `tenKhzRoutine()` counts
   `armed_timeout_count` up at `LOOP_FREQUENCY_HZ` while the input reads
   zero and wants a full second of it, so the counter is a progress bar.
@@ -1073,8 +1081,8 @@ care:
 - SITL-only exports (`sitl_tone_active`) read as constant 0, so the
   idiomatic "wait out the beeps" line passes immediately; the beeps
   cost virtual time here and are covered by `wait armed == 1`
-- `speedup` below 1 paces the emulation; 0 or above 1 free-runs (an
-  emulated MCU does not exceed real time)
+- `speedup` through 1 paces the emulation; 0 or greater than 1 free-runs, with
+  exactly 1 meaning real-time pacing
 
 ## What is here
 

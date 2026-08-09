@@ -356,6 +356,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         batch.Enabled = false;
                         return;
                     }
+                    // Newer STM32 GPIO models expose the three pieces of
+                    // per-pin state the bridge needs directly. Resolve a
+                    // typed delegate once so this source remains compatible
+                    // with released Renode builds which lack the fast path.
+                    var getPinConfiguration = gpio[i].GetType().GetMethod(
+                        "GetPinConfiguration", new[] { typeof(int) });
+                    if(getPinConfiguration != null
+                       && getPinConfiguration.ReturnType == typeof(uint))
+                    {
+                        gpioPinConfiguration[i] = (Func<int, uint>)Delegate.CreateDelegate(
+                            typeof(Func<int, uint>), gpio[i], getPinConfiguration);
+                    }
                 }
                 if(syscfgBase != 0)
                 {
@@ -448,16 +460,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 if(f1Gpio)
                 {
-                    cfgl[i] = gpio[i].ReadDoubleWord(0);
-                    cfgh[i] = gpio[i].ReadDoubleWord(CfghOffset);
-                    odr[i] = gpio[i].ReadDoubleWord(OdrOffsetF1);
+                    if(gpioPinConfiguration[i] == null)
+                    {
+                        cfgl[i] = gpio[i].ReadDoubleWord(0);
+                        cfgh[i] = gpio[i].ReadDoubleWord(CfghOffset);
+                        odr[i] = gpio[i].ReadDoubleWord(OdrOffsetF1);
+                    }
                 }
                 else
                 {
-                    moder[i] = gpio[i].ReadDoubleWord(0);
-                    odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
-                    afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
-                    afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
+                    if(gpioPinConfiguration[i] == null)
+                    {
+                        moder[i] = gpio[i].ReadDoubleWord(0);
+                        odr[i] = gpio[i].ReadDoubleWord(OdrOffset);
+                        afrl[i] = gpio[i].ReadDoubleWord(AfrlOffset);
+                        afrh[i] = gpio[i].ReadDoubleWord(AfrhOffset);
+                    }
                 }
             }
 
@@ -470,13 +488,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // a pin only carries the timer output when it is in
                 // alternate mode AND selects the timer's AF AND the
                 // channel is connected to it
-                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin, timerAf)
+                var hiConfig = PinConfiguration(ph.HighPort, ph.HighPin);
+                var loConfig = PinConfiguration(ph.LowPort, ph.LowPin);
+                var hiTimer = TimerDrives(ph.HighPort, ph.HighPin, timerAf, hiConfig)
                     && timer.ChannelEnabled(ph.CcrChannel)
                     && RemapOk(ph.RemapBit);
-                var loTimer = TimerDrives(ph.LowPort, ph.LowPin, ph.LowAf)
+                var loTimer = TimerDrives(ph.LowPort, ph.LowPin, ph.LowAf, loConfig)
                     && timer.ComplementaryEnabled(ph.CcrChannel);
-                mode[p] = PhaseMode(moe, hiTimer, odr[ph.HighPort], ph.HighPin,
-                                    loTimer, odr[ph.LowPort], ph.LowPin);
+                mode[p] = PhaseMode(moe, hiTimer, loTimer,
+                                    PinOutput(ph.LowPort, ph.LowPin, loConfig));
                 // the shadow, not the register: see ActiveCcr
                 ccr[p] = timer.ActiveCcr(ph.CcrChannel);
             }
@@ -544,8 +564,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // SITL_PHASE_*: 0 float, 1 low, 2 pwm, 3 pwm without
         // complementary, 4 proportional brake
-        private int PhaseMode(bool moe, bool hiTimer, uint odrHi, int pinHi,
-                              bool loTimer, uint odrLo, int pinLo)
+        private int PhaseMode(bool moe, bool hiTimer, bool loTimer, bool lowOn)
         {
             if(!moe)
             {
@@ -558,7 +577,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // the enable pin. Enable off floats the phase whatever
                 // the PWM pin is doing; enable on with the PWM pin still
                 // a plain output means it is held low.
-                if(((odrLo >> pinLo) & 1) == 0)
+                if(!lowOn)
                 {
                     return 0;
                 }
@@ -576,7 +595,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             // USE_INVERTED_LOW targets turn the low FET on by writing BRR,
             // so ODR low means on; see phaseouts.c LOW_BITREG_ON
-            var lowOn = ((odrLo >> pinLo) & 1) != 0;
             if(invertedLow)
             {
                 lowOn = !lowOn;
@@ -595,7 +613,33 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // the AF that selects this timer. MODER alone is not enough: an
         // alternate pin pointing at the wrong AF drives nothing useful,
         // and that is a live porting bug on a new target.
-        private bool TimerDrives(int port, int pin, uint expectedAf)
+        private uint PinConfiguration(int port, int pin)
+        {
+            var direct = gpioPinConfiguration[port];
+            if(direct != null)
+            {
+                return direct(pin);
+            }
+            if(f1Gpio)
+            {
+                return 0;
+            }
+            var af = pin < 8 ? afrl[port] : afrh[port];
+            return ((moder[port] >> (2 * pin)) & 3)
+                | (((odr[port] >> pin) & 1) << 2)
+                | (((af >> (4 * (pin & 7))) & 0xF) << 4);
+        }
+
+        private bool PinOutput(int port, int pin, uint configuration)
+        {
+            if(gpioPinConfiguration[port] != null)
+            {
+                return (configuration & (1u << (f1Gpio ? 4 : 2))) != 0;
+            }
+            return ((odr[port] >> pin) & 1) != 0;
+        }
+
+        private bool TimerDrives(int port, int pin, uint expectedAf, uint configuration)
         {
             if(f1Gpio)
             {
@@ -604,18 +648,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // is no per-pin AF number to check on this generation -
                 // routing is AFIO remap, which the firmware programs
                 // before enabling the outputs and is not modelled.
-                var cfg = pin < 8 ? cfgl[port] : cfgh[port];
-                var nib = (cfg >> (4 * (pin & 7))) & 0xF;
+                var nib = configuration & 0xF;
+                if(gpioPinConfiguration[port] == null)
+                {
+                    var cfg = pin < 8 ? cfgl[port] : cfgh[port];
+                    nib = (cfg >> (4 * (pin & 7))) & 0xF;
+                }
                 return (nib & 3) != 0 && (nib & 8) != 0;
             }
-            if(((moder[port] >> (2 * pin)) & 3) != ModeAlternate)
+            if((configuration & 3) != ModeAlternate)
             {
                 return false;
             }
-            var afr = pin < 8 ? afrl[port] : afrh[port];
             // each pin has exactly one AF that routes this timer to it;
             // accepting any other would mask a real pin-mux porting bug
-            return ((afr >> (4 * (pin & 7))) & 0xF) == expectedAf;
+            return ((configuration >> 4) & 0xF) == expectedAf;
         }
 
         // PA11/PA12 carry TIM1_CH2 and CH3 only while the G0's SYSCFG
@@ -700,6 +747,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly int[] tickMode = new int[3];
         private readonly uint[] tickCcr = new uint[3];
         private readonly IDoubleWordPeripheral[] gpio = new IDoubleWordPeripheral[4];
+        private readonly Func<int, uint>[] gpioPinConfiguration = new Func<int, uint>[4];
         private IDoubleWordPeripheral syscfg;
         private AM32_STM32_AdvancedTimer timer;
         private IAM32Comparator comp;

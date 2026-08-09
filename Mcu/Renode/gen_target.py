@@ -16,6 +16,7 @@ usage:
     gen_target.py TARGET --run               generate, then launch renode
     gen_target.py TARGET --run --exec CMD    ... and script it
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
+    gen_target.py TARGET --gui --cpusel N    ... pinned to host CPU N
     gen_target.py TARGET --sigrok            ... live logic analyser on TCP
     gen_target.py --list                     targets this can emulate
 
@@ -1482,18 +1483,31 @@ def platform(cfg, sigrok=False):
         '',
     ]
 
-    # whichever timers this target is not capturing with, declared stock
+    # On F031 and G031 the non-capture member is the periodic 20kHz
+    # control-loop timer. A general STM32 timer creates four unused
+    # capture/compare clock entries and updates them on every tick; the
+    # basic model represents the update interrupt with one entry.
+    basic_other = fam in ('f031', 'g031')
+    # The representative target captures throttle on only one member of these
+    # timer pairs. Keep the alternate register-visible without paying for the
+    # stock model's five scheduled channel/counter entries.
+    freerunning_other = fam in ('g071', 'f415', 'f421')
+
+    # whichever timers this target is not capturing with
     for other in others:
         oname, oaddr, oirq, oaf = STOCK_TIMER[fam][other]
         L += [
-            '%s: Timers.STM32_Timer @ sysbus 0x%08X' % (oname, oaddr),
+            '%s: Timers.%s @ sysbus 0x%08X'
+            % (oname, ('AM32_STM32_BasicTimer' if basic_other else
+                       'AM32_STM32_FreeRunningTimer' if freerunning_other else
+                       'STM32_Timer'), oaddr),
             '    frequency: %d' % spec['timer_hz'],
             '    initialLimit: 0xFFFF',
             '    -> nvic@%d' % oirq,
             '',
         ]
         # the F1-generation families have no per-pin AF map to restate
-        if oaf:
+        if oaf and not basic_other and not freerunning_other:
             L += ['%s:' % oname] + oaf + ['']
 
     L += [
@@ -1543,6 +1557,11 @@ def platform(cfg, sigrok=False):
         '',
         'throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x%08X'
         % spec['throttle'],
+    ] + ([
+        # TIM15 can consume a complete DShot frame and reply DMA at once,
+        # avoiding tens of thousands of host clock callbacks per second.
+        '    batchDshotFrames: true',
+    ] if fam == 'l431' else []) + [
         '    0 -> %s@0 | gpioPort%s@%s%s' % (
             cap, tp[1], tp[2:], ' | sigrok@0' if sigrok else ''),
         '',
@@ -2041,6 +2060,10 @@ def main():
                          'dotnet portable under tools/linux/ (1.76x '
                          'faster, install it from the renode release '
                          'page), falling back to the vendored mono one')
+    ap.add_argument('--cpusel', type=int, default=None, metavar='N',
+                    help='pin only Renode (including its in-process motor '
+                         'simulator) to host CPU N; the GUI and gdb remain '
+                         'unrestricted')
     ap.add_argument('--elf', default=None,
                     help='default: whatever obj/ holds for the target')
     ap.add_argument('--eeprom', default=None,
@@ -2054,6 +2077,19 @@ def main():
     ap.add_argument('--exec', dest='commands', action='append', default=[],
                     metavar='CMD', help='monitor command to run after loading')
     args = ap.parse_args()
+
+    if args.cpusel is not None:
+        if args.cpusel < 0:
+            ap.error('--cpusel must be a non-negative host CPU number')
+        try:
+            allowed = os.sched_getaffinity(0)
+        except AttributeError:
+            ap.error('--cpusel needs host CPU-affinity support')
+        if args.cpusel not in allowed:
+            ap.error('--cpusel %d is not in this process affinity mask (%s)'
+                     % (args.cpusel, ','.join(str(cpu)
+                                              for cpu in sorted(allowed))))
+        print('Renode host CPU affinity: %d' % args.cpusel)
 
     if args.list:
         for t in all_targets(args.nm):
@@ -2221,8 +2257,17 @@ def main():
         setup += '; %s' % c
     cmd = [find_renode(args.renode), '--disable-xwt', '--console',
            '-e', setup]
+    call_args = {'env': renode_env()}
+    if args.cpusel is not None:
+        # Apply affinity in the forked child immediately before exec. The
+        # motor simulator is a shared library inside Renode, so it shares
+        # this mask; the separately launched Qt GUI and gdb terminal inherit
+        # the launcher's unrestricted mask instead.
+        def select_renode_cpu():
+            os.sched_setaffinity(0, {args.cpusel})
+        call_args['preexec_fn'] = select_renode_cpu
     try:
-        return subprocess.call(cmd, env=renode_env())
+        return subprocess.call(cmd, **call_args)
     finally:
         for p in (gdb_proc, gui_proc):
             if p is not None and p.poll() is None:

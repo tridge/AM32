@@ -18,6 +18,7 @@
 
 cpu: CPU.RiscV32 @ sysbus
     cpuType: "rv32imac_zicsr"
+    privilegeLevels: PrivilegeLevels.Machine
     timeProvider: empty
 
 // one backing store visible at both 0 (where the code runs; the ELF
@@ -93,14 +94,15 @@ timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
 // timer2 is declared by the target overlay: it is the input-capture
 // timer on this family, and belongs with the DMA and pin wiring.
 
-timer3: Timers.STM32_Timer @ sysbus 0x40000400
+timer3: Timers.AM32_STM32_BasicTimer @ sysbus 0x40000400
     frequency: 48000000
     initialLimit: 0xFFFF
     -> nvic@45
 
-timer4: Timers.STM32_Timer @ sysbus 0x40000800
+timer4: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40000800
     frequency: 48000000
     initialLimit: 0xFFFF
+    synchronize: false
     -> nvic@46
 
 dma: DMA.AM32_STM32F0_DMA @ sysbus 0x40020000

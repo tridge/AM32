@@ -412,10 +412,23 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
             sim.set_speedup(0.05)
             time.sleep(1.0)  # let the pace anchor take hold
             paced = measured_ratio(4.0)
-            sim.set_speedup(1.0)
+            sim.set_speedup(0.0)
             check('the link paces the emulation', 0.01 <= paced <= 0.10,
                   'unpaced %.3fx, paced %.3fx against a 0.05x target'
                   % (free, paced))
+        if free >= 1.10:
+            sim.set_speedup(1.0)
+            time.sleep(1.0)
+            realtime = measured_ratio(3.0)
+            sim.set_speedup(0.0)
+            check('the link paces a fast emulator to realtime',
+                  0.90 <= realtime <= 1.10,
+                  'unpaced %.3fx, 1x target produced %.3fx' %
+                  (free, realtime))
+        else:
+            check('the link paces a fast emulator to realtime', True,
+                  'unpaced %.3fx cannot demonstrate a 1x cap; not asserted'
+                  % free)
         return {'armed': armed, 'spin': spin}
     finally:
         for c in (ds, sim):

@@ -38,7 +38,8 @@ namespace Antmicro.Renode.Peripherals.Timers
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class AM32_STM32_CaptureTimer : IDoubleWordPeripheral, IKnownSize,
                                            INumberedGPIOOutput, IGPIOReceiver,
-                                           Miscellaneous.IAM32ReplySource
+                                           Miscellaneous.IAM32ReplySource,
+                                           Miscellaneous.IAM32DshotFrameSink
     {
         // inputBase/inputPin/inputAf describe the pin the throttle
         // arrives on. Without them a capture happens whatever the pin is
@@ -106,6 +107,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             // the wire down, and no dshot frame would get through.
             Connections[OutputLine].Set(true);
             replyBits = 0;
+            batchedDshotFrame = false;
         }
 
         // pulsed by RCC APBxRSTR; receiveDshotDma() resets the timer on
@@ -120,6 +122,63 @@ namespace Antmicro.Renode.Peripherals.Timers
         public void Capture(uint value)
         {
             DoCapture(value);
+        }
+
+        // Record the counter phase at the first edge. The generator will
+        // call CompleteDshotFrame after the 16 bit periods have elapsed;
+        // until then no guest-visible capture has occurred.
+        public bool BeginDshotFrame(uint frame, ulong bitPeriodNanoseconds)
+        {
+            if(batchedDshotFrame || !Counting || OutputMode
+               || !CaptureEnabled || !PinRouted || !CapturesBothEdges)
+            {
+                return false;
+            }
+            batchedDshotFrame = true;
+            batchedFrameValue = frame;
+            batchedBitPeriodNanoseconds = bitPeriodNanoseconds;
+            batchedStartCount = CurrentCount;
+            batchedCounterDivider = (regs[PSC / 4] & MaxCount) + 1;
+            batchedCounterPeriod = (regs[ARR / 4] & MaxCount) + 1;
+            batchDshotReplies = true;
+            // Service the longest reply transfer AM32 configures: 23
+            // encoded/preamble slots plus 14 padding slots. The firmware
+            // selects its padding from the measured shortest edge, not the
+            // nominal incoming bitrate; in particular this L431 model can
+            // select 14 for BDShot300. If a family selects seven instead,
+            // its DMA ignores the final requests after completing at 30.
+            batchedReplyPeriods = 37;
+            return true;
+        }
+
+        public void CompleteDshotFrame()
+        {
+            if(!batchedDshotFrame)
+            {
+                return;
+            }
+            batchedDshotFrame = false;
+            // If firmware reconfigured the timer during the frame, behave
+            // like edges that arrived while capture was unavailable.
+            if(!Counting || OutputMode || !CaptureEnabled)
+            {
+                return;
+            }
+            for(var bit = 0; bit < 16; bit++)
+            {
+                var start = (ulong)bit * batchedBitPeriodNanoseconds;
+                var one = (batchedFrameValue & (0x8000u >> bit)) != 0;
+                var high = one ? batchedBitPeriodNanoseconds * 3 / 4
+                               : batchedBitPeriodNanoseconds * 3 / 8;
+                DoCapture(BatchedCountAt(start));
+                DoCapture(BatchedCountAt(start + high));
+            }
+        }
+
+        public void CancelDshotFrame()
+        {
+            batchedDshotFrame = false;
+            batchDshotReplies = false;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -161,6 +220,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             case CR1:
                 regs[idx] = value;
                 counter.Enabled = (value & CEN) != 0;
+                if(counter.Enabled && OutputMode && batchDshotReplies)
+                {
+                    // Let guest code run while the reply DMA is active,
+                    // then service its periods together at the time the
+                    // complete line code would have finished.
+                    counter.Limit = ((regs[ARR / 4] & MaxCount) + 1)
+                        * batchedReplyPeriods;
+                }
                 return;
             case PSC:
                 regs[idx] = value & MaxCount;
@@ -251,6 +318,13 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
         }
 
+        private uint BatchedCountAt(ulong nanoseconds)
+        {
+            var ticks = nanoseconds * frequency
+                / (batchedCounterDivider * NanosecondsPerSecond);
+            return (uint)((batchedStartCount + ticks) % batchedCounterPeriod);
+        }
+
         // One counter period. In input capture mode this is just the 16
         // bit wrap and nothing happens. In output mode it is one bit of
         // the bidirectional dshot reply: sendDshotDma() puts the timer in
@@ -269,6 +343,20 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 return;
             }
+            if(batchDshotReplies)
+            {
+                for(var i = 0ul; i < batchedReplyPeriods; i++)
+                {
+                    OutputOnePeriod();
+                }
+                counter.Enabled = false;
+                return;
+            }
+            OutputOnePeriod();
+        }
+
+        private void OutputOnePeriod()
+        {
             var level = (regs[ccrOffset / 4] & MaxCount) != 0;
             if(((regs[CCER / 4] >> ccerShift) & CC1P) != 0)
             {
@@ -447,6 +535,21 @@ namespace Antmicro.Renode.Peripherals.Timers
         // disabled the pin is not connected to CCR1 at all
         private bool CaptureEnabled => ((regs[CCER / 4] >> ccerShift) & CC1E) != 0;
 
+        private bool CapturesBothEdges
+        {
+            get
+            {
+                var ccer = regs[CCER / 4] >> ccerShift;
+                if((ccer & CC1NP) != 0)
+                {
+                    return true;
+                }
+                return channel == 1
+                    && ((regs[ccmrOffset / 4] >> ccsShift) & CC1S) == CC1S
+                    && (regs[SMCR / 4] & TsMask) == TsTi1Ed;
+            }
+        }
+
         // the pin only reaches the timer in alternate mode with the AF
         // that selects this timer's channel 1. inputBase 0 means the
         // platform did not say, so do not gate on it.
@@ -509,6 +612,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const uint TsMask = 7u << 4;
         private const uint TsTi1Ed = 4u << 4;
         private const uint MaxCount = 0xFFFF;
+        private const ulong NanosecondsPerSecond = 1000000000;
 
         private const int DmaRequestLine = 0;
         private const int IrqLine = 1;
@@ -533,5 +637,13 @@ namespace Antmicro.Renode.Peripherals.Timers
         // 21 period line code, with room to spare
         private readonly bool[] reply = new bool[64];
         private int replyBits;
+        private bool batchedDshotFrame;
+        private uint batchedFrameValue;
+        private ulong batchedBitPeriodNanoseconds;
+        private uint batchedStartCount;
+        private ulong batchedCounterDivider;
+        private ulong batchedCounterPeriod;
+        private bool batchDshotReplies;
+        private ulong batchedReplyPeriods = 37;
     }
 }

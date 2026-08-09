@@ -159,20 +159,12 @@ timer6: Timers.STM32_Timer @ sysbus 0x40001000
     initialLimit: 0xFFFF
     -> nvic@17
 
-timer7: Timers.STM32_Timer @ sysbus 0x40001400
-    frequency: 48000000
-    initialLimit: 0xFFFF
-    -> nvic@18
-
+// TIM7 and TIM16 are intentionally absent: no F051 target initializes them,
+// and each stock timer adds five entries to Renode's global clock update.
 timer14: Timers.STM32_Timer @ sysbus 0x40002000
     frequency: 48000000
     initialLimit: 0xFFFF
     -> nvic@19
-
-timer16: Timers.STM32_Timer @ sysbus 0x40014400
-    frequency: 48000000
-    initialLimit: 0xFFFF
-    -> nvic@21
 
 timer17: Timers.STM32_Timer @ sysbus 0x40014800
     frequency: 48000000
@@ -212,9 +204,6 @@ crc: CRC.STM32_CRC @ sysbus 0x40023000
 
 timer14:
     0 -> gpioPortA#04@4 | gpioPortA#07@4 | gpioPortB#01@0
-
-timer16:
-    0 -> gpioPortA#06@5 | gpioPortB#06@2 | gpioPortB#08@2
 
 timer17:
     0 -> gpioPortA#07@5 | gpioPortB#07@2 | gpioPortB#09@2

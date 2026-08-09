@@ -78,17 +78,18 @@ timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
 // group C does the reverse (TIM16_CH1 capture, TIM2 loop).
 
 // the free-running 2MHz interval timer (the F051 uses TIM2 for this)
-timer3: Timers.STM32_Timer @ sysbus 0x40000400
+timer3: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40000400
     frequency: 48000000
     initialLimit: 0xFFFF
+    synchronize: false
     -> nvic@16
 
-timer14: Timers.STM32_Timer @ sysbus 0x40002000
+timer14: Timers.AM32_STM32_BasicTimer @ sysbus 0x40002000
     frequency: 48000000
     initialLimit: 0xFFFF
     -> nvic@19
 
-timer17: Timers.STM32_Timer @ sysbus 0x40014800
+timer17: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40014800
     frequency: 48000000
     initialLimit: 0xFFFF
     -> nvic@22

@@ -540,8 +540,8 @@ def main():
                     help='what is serving the ports. "renode" is the emulator '
                          '(Mcu/Renode), which runs a real firmware ELF on an '
                          'emulated MCU and serves the same wire protocols, but '
-                         'has no tone or audio stream and runs below real '
-                         'time - the speedup slider can only slow it further')
+                         'has no tone or audio stream; the speedup slider can '
+                         'pace it up to real time when the host is fast enough')
     ap.add_argument('--renode-can', action='store_true',
                     help='enable the DroneCAN panel against the emulator. '
                          'Only the emulated L431 _CAN targets have a CAN '
@@ -1265,24 +1265,36 @@ def main():
     speed_slider.valueChanged.connect(speed_changed)
     g4.addWidget(speed_slider, 2, 1, 1, 2)
     g4.addWidget(speed_label, 2, 3)
+
+    def set_speed_slider(value):
+        # A click must resend the command even when the slider is already at
+        # that position, e.g. startup at 1x followed by an explicit 1x click.
+        if speed_slider.value() == value:
+            speed_changed()
+        else:
+            speed_slider.setValue(value)
+
     speed_1x = QPushButton('1x')
     speed_1x.setToolTip('Back to real time.')
-    speed_1x.clicked.connect(lambda: speed_slider.setValue(150))
-    g4.addWidget(speed_1x, 2, 4)
+    speed_1x.clicked.connect(lambda: set_speed_slider(150))
     if renode:
-        # the emulator cannot go faster than the host lets it, but the
-        # same command paces it downward for slow motion: the link sleeps
-        # the emulation thread to hold sim/wall time at the slider value
+        # The emulator cannot go faster than the host lets it, but the
+        # same command paces it downward: the link sleeps the emulation
+        # thread to hold sim/wall time at targets through exactly 1x.
+        # Slider targets above 1x and the max button both mean free-run.
         speed_slider.setToolTip(
-            'Emulation pace relative to wall clock. The emulator cannot\n'
-            'reach real time, so at and above what the host achieves the\n'
-            'slider does nothing and it runs flat out; below that it is\n'
-            'slow motion, down to 0.001x for the motor view. The label\n'
-            'shows the rate actually achieved.')
-        speed_1x.setText('max')
-        speed_1x.setToolTip('Back to flat out (the emulator cannot reach '
-                            'real time).')
+            'Emulation pace relative to wall clock. Targets through 1x\n'
+            'pace a sufficiently fast host; targets above 1x run flat out.\n'
+            'The label shows the rate actually achieved.')
+        speed_max = QPushButton('max')
+        speed_max.setToolTip('Run the emulator flat out without pacing.')
+        speed_max.clicked.connect(lambda: set_speed_slider(165))
+        speed_1x.setToolTip('Pace the emulator to real time (1.000x).')
+        g4.addWidget(speed_max, 2, 4)
+        g4.addWidget(speed_1x, 2, 5)
         speed_label.setText('measuring...')
+    else:
+        g4.addWidget(speed_1x, 2, 4)
 
     # stuck rotor: block the prop with a virtual obstruction, from
     # free to completely stuck, to exercise the firmware's stuck

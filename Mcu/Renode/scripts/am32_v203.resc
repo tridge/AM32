@@ -19,6 +19,8 @@ include $repo/Mcu/Renode/peripherals/common/AM32_RegisterFile.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32F0_DMA.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_CaptureTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_BasicTimer.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_FreeRunningTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_Pfic.cs
 include $repo/Mcu/Renode/peripherals/wch/AM32_WCH_SysTick.cs

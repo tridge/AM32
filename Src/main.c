@@ -2091,8 +2091,15 @@ if(zero_crosses < 5){
         }
 
 #if !defined(MCU_G031) && !defined(NEED_INPUT_READY)
+        // Changing priorities is an NVIC register read-modify-write for
+        // every IRQ. The main loop runs much faster than the condition can
+        // change, so avoid rewriting the same priorities on every pass.
+        static int8_t last_dshot_priority_mode = -1;
+        const int8_t dshot_priority_mode =
+            dshot_telemetry && (commutation_interval > DSHOT_PRIORITY_THRESHOLD);
+        if (dshot_priority_mode != last_dshot_priority_mode) {
 #ifdef NXP
-	if (dshot_telemetry && (commutation_interval > DSHOT_PRIORITY_THRESHOLD)) {
+	if (dshot_priority_mode) {
 		NVIC_SetPriority(IC_DMA_IRQ_NAME, 0);
 		NVIC_SetPriority(COM_TIMER_IRQ, 1);
 		NVIC_SetPriority(COMP0_IRQ, 1);
@@ -2104,7 +2111,7 @@ if(zero_crosses < 5){
 		NVIC_SetPriority(COMP1_IRQ, 0);
 	}
 #else
-        if (dshot_telemetry && (commutation_interval > DSHOT_PRIORITY_THRESHOLD)) {
+        if (dshot_priority_mode) {
              NVIC_SetPriority(IC_DMA_IRQ_NAME, 0);
              NVIC_SetPriority(COM_TIMER_IRQ, 1);
              NVIC_SetPriority(COMPARATOR_IRQ, 1);
@@ -2114,6 +2121,8 @@ if(zero_crosses < 5){
              NVIC_SetPriority(COMPARATOR_IRQ, 0);
          }
 #endif
+            last_dshot_priority_mode = dshot_priority_mode;
+        }
 #endif
         if (send_telemetry) {
 #ifdef USE_SERIAL_TELEMETRY

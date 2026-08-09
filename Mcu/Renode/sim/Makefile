@@ -11,7 +11,7 @@ SRCS := am32sim_shim.c $(SITL)/sim/motor.c $(SITL)/sim/sitl_config.c $(SITL)/sim
 OBJS := $(addprefix $(OBJDIR)/,$(notdir $(SRCS:.c=.o)))
 INCS := -I$(SITL)/Inc -I$(SITL)/sim -I$(ROOT)/Inc -I$(ROOT)/Mcu/f051/Inc
 
-CFLAGS := -O2 -g -fPIC -Wall -Wno-unused-parameter
+CFLAGS := -O3 -g -fPIC -Wall -Wno-unused-parameter
 LDFLAGS := -shared -Wl,-soname,libam32sim.so -lm -lpthread
 
 vpath %.c . $(SITL)/sim

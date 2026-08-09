@@ -95,27 +95,29 @@ timer1: Timers.AM32_STM32_AdvancedTimer @ sysbus 0x40012C00
 // the target overlay: whichever is not capturing is declared stock.
 
 // TMR6: the free-running 2MHz interval timer (DIV 59)
-timer6: Timers.STM32_Timer @ sysbus 0x40001000
+timer6: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40001000
     frequency: 120000000
     initialLimit: 0xFFFF
+    synchronize: false
     -> nvic@17
 
 // TMR14: the 20kHz loop timer (DIV 119, 1MHz tick)
-timer14: Timers.STM32_Timer @ sysbus 0x40002000
+timer14: Timers.AM32_STM32_BasicTimer @ sysbus 0x40002000
     frequency: 120000000
     initialLimit: 0xFFFF
     -> nvic@19
 
 // TMR16: the commutation timer
-timer16: Timers.STM32_Timer @ sysbus 0x40014400
+timer16: Timers.AM32_STM32_BasicTimer @ sysbus 0x40014400
     frequency: 120000000
     initialLimit: 0xFFFF
     -> nvic@21
 
 // TMR17: the microsecond counter delayMicros() spins on
-timer17: Timers.STM32_Timer @ sysbus 0x40014800
+timer17: Timers.AM32_STM32_FreeRunningTimer @ sysbus 0x40014800
     frequency: 120000000
     initialLimit: 0xFFFF
+    synchronize: false
     -> nvic@22
 
 // CRM: enable-to-ready flip-flops at the F0-style offsets. CTRL's

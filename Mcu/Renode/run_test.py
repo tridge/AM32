@@ -24,8 +24,8 @@ What differs from the SITL, and why a script may need care:
   scripted reset, exactly as they would on the bench.
 - reset is a machine reset. The virtual clock keeps running, so the
   report's time axis is continuous with no epoch stitching.
-- speedup <1 paces the emulation to that fraction of the wall clock;
-  0 or >=1 free-runs (an emulated MCU cannot exceed real time).
+- speedup <=1 paces the emulation to that fraction of the wall clock;
+  0 or >1 free-runs.
 
 The throttle protocol, physics stream, eeprom access and reset all ride
 the same UDP wire protocols the SITL serves, provided in the emulator

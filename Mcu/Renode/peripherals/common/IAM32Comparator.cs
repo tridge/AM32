@@ -57,6 +57,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         bool TryGetReply(uint index, out uint frame);
     }
 
+    // Optional fast path between the bench-side DShot generator and a
+    // capture timer. It batches the host scheduling of one wire frame, but
+    // the sink must still produce the same captured timestamps and DMA
+    // requests that the individual pin edges would have produced.
+    public interface IAM32DshotFrameSink : IPeripheral
+    {
+        bool BeginDshotFrame(uint frame, ulong bitPeriodNanoseconds);
+        void CompleteDshotFrame();
+        void CancelDshotFrame();
+    }
+
     // Optional edge recorder fed by the motor bridge at its existing
     // physics batch boundary. This exposes state changes without adding a
     // sampling timer to the emulation.
