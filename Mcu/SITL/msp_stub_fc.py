@@ -13,8 +13,11 @@ MSP_SET_PASSTHROUGH switches the link into 4-way mode
 write the settings and flash of a SITL running with --bootloader, the
 same way it would through a real flight controller.
 
-Serves MSP on a pty; run() prints/returns the slave device path to
-hand to --port. Linux/macOS only (pty).
+Serves MSP on a pty by default (Linux/macOS only), printing the slave
+device path to hand to --port. With --usbip it serves on a virtual USB
+serial device instead (sitl_usbip.py), which enumerates as a real
+/dev/ttyACM* once attached to vhci_hcd and so is reachable from tools
+that only accept USB serial ports, the browser included.
 '''
 
 import argparse
@@ -28,6 +31,7 @@ import time
 
 import sitl_dshot as sd
 import sitl_fourway_server
+import sitl_usbip
 
 MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
@@ -41,10 +45,52 @@ MSP_SET_MOTOR = 214
 MSP_SET_PASSTHROUGH = 245
 
 
+class PtyEndpoint(object):
+    '''the serial link as a pty, opened by the client by path'''
+
+    def __init__(self):
+        self.master, self.slave = pty.openpty()
+        # raw mode now: the default line discipline would echo the
+        # client's bytes back at us until pyserial reconfigures it
+        import tty
+        tty.setraw(self.slave)
+        self.path = os.ttyname(self.slave)
+
+    def read(self, timeout=0.1):
+        try:
+            ready, _, _ = select.select([self.master], [], [], timeout)
+        except (OSError, ValueError):
+            return b''
+        if not ready:
+            return b''
+        try:
+            return os.read(self.master, 4096)
+        except OSError:
+            return b''
+
+    def drain(self):
+        out = b''
+        while True:
+            chunk = self.read(0)
+            if not chunk:
+                return out
+            out += chunk
+
+    def write(self, data):
+        os.write(self.master, data)
+
+    def close(self):
+        try:
+            os.close(self.master)
+            os.close(self.slave)
+        except OSError:
+            pass
+
+
 class MspStubFC(object):
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57833,
                  poles=14, rate=500.0, esc_ports=None, state_port=57734,
-                 esc_reset=True, motor=True, verbose=False):
+                 esc_reset=True, motor=True, verbose=False, endpoint=None):
         self.poles = poles
         self.rate = rate
         self.verbose = verbose
@@ -70,12 +116,7 @@ class MspStubFC(object):
         self.edt_seen = False
         self.last_edt_cmd = 0.0
         self.running = True
-        self.master, self.slave = pty.openpty()
-        # raw mode now: the default line discipline would echo the
-        # client's bytes back at us until pyserial reconfigures it
-        import tty
-        tty.setraw(self.slave)
-        self.slave_path = os.ttyname(self.slave)
+        self.ep = endpoint if endpoint is not None else PtyEndpoint()
         # driving DShot at the ESC would fight the 4-way session for the
         # signal wire, so it can be left off for pure configurator work
         self.dshot_thread = None
@@ -85,6 +126,11 @@ class MspStubFC(object):
             self.dshot_thread.start()
         self.msp_thread = threading.Thread(target=self._msp_loop, daemon=True)
         self.msp_thread.start()
+
+    @property
+    def slave_path(self):
+        '''the serial device a client should open'''
+        return self.ep.path
 
     def _log(self, msg):
         if self.verbose:
@@ -100,11 +146,7 @@ class MspStubFC(object):
         if self.dshot_thread is not None:
             self.dshot_thread.join(0.5)
         self.fourway.close()
-        try:
-            os.close(self.master)
-            os.close(self.slave)
-        except OSError:
-            pass
+        self.ep.close()
         self.port.close()
 
     # -- DShot side ----------------------------------------------------
@@ -174,7 +216,7 @@ class MspStubFC(object):
         ck = 0
         for b in hdr + payload:
             ck ^= b
-        os.write(self.master, b'$M>' + hdr + payload + bytes([ck]))
+        self.ep.write(b'$M>' + hdr + payload + bytes([ck]))
 
     def _handle(self, cmd, payload):
         if cmd == MSP_API_VERSION:
@@ -219,26 +261,8 @@ class MspStubFC(object):
                 self.motor_value = struct.unpack('<H', payload[0:2])[0]
             self._reply(cmd)
         else:
-            os.write(self.master, b'$M!' + struct.pack('<BB', 0, cmd)
-                     + bytes([cmd]))
-
-    def _drain(self):
-        '''non-blocking read of whatever is already buffered'''
-        out = b''
-        while True:
-            try:
-                ready, _, _ = select.select([self.master], [], [], 0)
-            except (OSError, ValueError):
-                return out
-            if not ready:
-                return out
-            try:
-                chunk = os.read(self.master, 4096)
-            except OSError:
-                return out
-            if not chunk:
-                return out
-            out += chunk
+            self.ep.write(b'$M!' + struct.pack('<BB', 0, cmd)
+                          + bytes([cmd]))
 
     def _fourway(self, chunk):
         '''run the 4-way session until the client exits the interface'''
@@ -250,10 +274,10 @@ class MspStubFC(object):
             # which is close to the client's timeout). Our one reply
             # satisfies it; leaving it queued would answer twice and
             # shift every later response by one.
-            stale = self._drain()
+            stale = self.ep.drain()
             if stale and stale != self.fourway.last_request:
                 self._log('discarding %u unexpected bytes' % len(stale))
-            os.write(self.master, resp)
+            self.ep.write(resp)
         if self.fourway.exited:
             self._log('4-way interface exited')
             self.in_fourway = False
@@ -261,16 +285,7 @@ class MspStubFC(object):
     def _msp_loop(self):
         buf = b''
         while self.running:
-            try:
-                ready, _, _ = select.select([self.master], [], [], 0.1)
-            except (OSError, ValueError):
-                return
-            if not ready:
-                continue
-            try:
-                chunk = os.read(self.master, 256)
-            except OSError:
-                return
+            chunk = self.ep.read(0.1)
             if not chunk:
                 continue
             if self.in_fourway:
@@ -320,6 +335,14 @@ def main():
                         help='never reset an ESC that does not answer')
     parser.add_argument('--no-motor', action='store_true',
                         help='do not drive DShot, 4-way and MSP only')
+    parser.add_argument('--usbip', action='store_true',
+                        help='serve on a virtual USB serial device instead '
+                             'of a pty, so tools that only take USB ports '
+                             '(a browser) can reach it')
+    parser.add_argument('--usbip-port', type=int, default=3240,
+                        help='USB/IP tcp port')
+    parser.add_argument('--attach', action='store_true',
+                        help='with --usbip, run usbip attach for you')
     parser.add_argument('--poles', type=int, default=14)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
@@ -327,18 +350,40 @@ def main():
     ports = None
     if args.esc_ports:
         ports = [int(p) for p in args.esc_ports.split(',') if p.strip()]
+
+    endpoint = None
+    if args.usbip:
+        def log(msg):
+            if args.verbose:
+                print('usbip: %s' % msg, file=sys.stderr, flush=True)
+        endpoint = sitl_usbip.UsbipServer(port=args.usbip_port, log=log)
+
     stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
                      poles=args.poles, esc_ports=ports,
                      state_port=args.state_port,
                      esc_reset=not args.no_esc_reset,
-                     motor=not args.no_motor, verbose=args.verbose)
+                     motor=not args.no_motor, verbose=args.verbose,
+                     endpoint=endpoint)
+    if args.usbip:
+        if args.attach and not sitl_usbip.attach(port=args.usbip_port):
+            print('usbip attach failed', file=sys.stderr)
+            stub.close()
+            return 1
+        if not args.attach:
+            print('attach the virtual FC with:\n  sudo usbip attach -r '
+                  '127.0.0.1 -b %s' % sitl_usbip.BUSID, file=sys.stderr,
+                  flush=True)
+        tty_path = sitl_usbip.find_tty(timeout=10 if args.attach else 60)
+        if tty_path is None:
+            print('no tty appeared, is vhci_hcd loaded?', file=sys.stderr)
     print(stub.slave_path, flush=True)
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         stub.close()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

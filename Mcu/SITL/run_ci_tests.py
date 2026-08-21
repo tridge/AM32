@@ -14,6 +14,7 @@ import glob
 import os
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -843,6 +844,109 @@ def test_fc_fourway(sitl_path, bootloader):
             stub.close()
 
 
+def test_usbip_device():
+    '''the virtual USB serial device: enumeration and both data
+    directions, driven straight over the USB/IP socket so it needs no
+    vhci_hcd and no root'''
+    import sitl_usbip
+
+    server = sitl_usbip.UsbipServer(port=0)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(5.0)
+        sock.connect(('127.0.0.1', server.port))
+
+        def recv(n):
+            out = b''
+            while len(out) < n:
+                b = sock.recv(n - len(out))
+                if not b:
+                    raise IOError('usbip connection closed')
+                out += b
+            return out
+
+        seq = [0]
+
+        def submit(direction, ep, length, setup=b'\0' * 8, data=b''):
+            seq[0] += 1
+            sock.sendall(struct.pack('>IIIII', 1, seq[0], 0, direction, ep)
+                         + struct.pack('>Iiiii8s', 0, length, 0, 0, 0, setup)
+                         + data)
+            hdr = recv(48)
+            command, sq = struct.unpack('>II', hdr[:8])
+            status, actual = struct.unpack('>ii', hdr[20:28])
+            payload = recv(actual) if direction == 1 and actual > 0 else b''
+            return command, sq, status, payload
+
+        # import the device, as the vhci driver does when it attaches
+        sock.sendall(struct.pack('>HHI', 0x0111, 0x8003, 0)
+                     + b'1-1'.ljust(32, b'\0'))
+        version, code, status = struct.unpack('>HHI', recv(8))
+        dev = recv(312)
+        vid, pid = struct.unpack('>HH', dev[300:304])
+        check('usbip import', code == 0x0003 and status == 0
+              and (vid, pid) == (0x1209, 0x0001),
+              'code=0x%04x status=%u id=%04x:%04x' % (code, status, vid, pid))
+
+        # GET_DESCRIPTOR(device), the host\'s first control transfer
+        setup = struct.pack('<BBHHH', 0x80, 6, 0x0100, 0, 18)
+        _, _, st, desc = submit(1, 0, 18, setup)
+        check('usbip device descriptor',
+              st == 0 and len(desc) == 18 and desc[1] == 1
+              and struct.unpack('<HH', desc[8:12]) == (0x1209, 0x0001),
+              'status=%d len=%d' % (st, len(desc)))
+
+        setup = struct.pack('<BBHHH', 0x80, 6, 0x0200, 0, 255)
+        _, _, st, cfg = submit(1, 0, 255, setup)
+        total = struct.unpack('<H', cfg[2:4])[0] if len(cfg) >= 4 else 0
+        check('usbip config descriptor',
+              st == 0 and len(cfg) == total and cfg[4] == 2
+              and bytes([0x0A, 0x00, 0x00]) in cfg,
+              'status=%d len=%d total=%d ifaces=%d'
+              % (st, len(cfg), total, cfg[4] if len(cfg) > 4 else 0))
+
+        # host to device, then device to host on the bulk pair
+        _, _, st, _ = submit(0, sitl_usbip.EP_BULK, 5, data=b'hello')
+        got = server.read(1.0)
+        check('usbip bulk out', st == 0 and got == b'hello',
+              'status=%d got=%r' % (st, got))
+
+        # a read urb queued before there is anything to send must be
+        # completed by the write, not answered empty
+        seq[0] += 1
+        pending = seq[0]
+        sock.sendall(struct.pack('>IIIII', 1, pending, 0, 1,
+                                 sitl_usbip.EP_BULK)
+                     + struct.pack('>Iiiii8s', 0, 64, 0, 0, 0, b'\0' * 8))
+        time.sleep(0.2)
+        server.write(b'world')
+        hdr = recv(48)
+        sq = struct.unpack('>I', hdr[4:8])[0]
+        actual = struct.unpack('>i', hdr[24:28])[0]
+        payload = recv(actual)
+        check('usbip bulk in', sq == pending and payload == b'world',
+              'seq=%u payload=%r' % (sq, payload))
+
+        # the notification endpoint never completes, so the host has to
+        # be able to take its urb back
+        seq[0] += 1
+        intr = seq[0]
+        sock.sendall(struct.pack('>IIIII', 1, intr, 0, 1, sitl_usbip.EP_INTR)
+                     + struct.pack('>Iiiii8s', 0, 8, 0, 0, 0, b'\0' * 8))
+        time.sleep(0.2)
+        seq[0] += 1
+        sock.sendall(struct.pack('>IIIII', 2, seq[0], 0, 0, 0)
+                     + struct.pack('>I24s', intr, b''))
+        hdr = recv(48)
+        command = struct.unpack('>I', hdr[:4])[0]
+        st = struct.unpack('>i', hdr[20:24])[0]
+        check('usbip unlink', command == 4 and st != 0,
+              'command=%u status=%d' % (command, st))
+    finally:
+        sock.close()
+        server.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     # don't hardcode the firmware version in the default binary path
@@ -879,6 +983,7 @@ def main():
     test_dataset_params()
     test_fc_capture(args.sitl)
     test_fc_fourway(args.sitl, args.bootloader)
+    test_usbip_device()
 
     if failures:
         print('\n%d FAILED: %s' % (len(failures), ', '.join(failures)))

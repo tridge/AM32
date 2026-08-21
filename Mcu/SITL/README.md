@@ -156,8 +156,38 @@ as separate ESCs on the 4-way interface, `--no-motor` leaves the DShot
 output off (it would otherwise share the signal wire with the 4-way
 session), and an ESC that is running the application instead of the
 bootloader is reset into it over the state port, the way a real FC
-power cycles one. Browsers cannot open a pty, so the web configurator
-needs a bridge (or a virtual USB serial device) in front of this.
+power cycles one.
+
+#### A virtual USB serial device
+
+A pty is enough for tools that open a port by path, but not for a
+browser: Chrome's Web Serial only lists what the kernel enumerated as a
+USB serial device. `--usbip` therefore serves the same byte stream as a
+simulated USB CDC-ACM adapter over the USB/IP protocol
+(`sitl_usbip.py`), which the Linux `vhci_hcd` driver attaches as a real
+device:
+
+```
+sudo modprobe vhci_hcd
+python3 Mcu/SITL/msp_stub_fc.py --usbip --attach --no-motor
+```
+
+`--attach` runs `usbip attach` (root, from the distribution's usbip
+package); without it the command to run by hand is printed. The device
+then appears in `dmesg`, as `/dev/ttyACM*` and as
+`/dev/serial/by-id/usb-AM32_AM32_SITL_serial_SITL-if00`, and is
+indistinguishable from hardware to anything above the driver - Chrome
+included. It enumerates as pid.codes `1209:0001`, which the AM32
+configurator accepts as a flight controller.
+
+`--usbip-port` moves the USB/IP listener off the well known port 3240,
+which is worth doing when something else on the machine already exports
+devices there (the attach command printed at startup follows the
+option). Detach with `sudo usbip detach -p 0`.
+
+Windows has no equivalent in the box: attaching a remote USB/IP device
+needs a signed client driver, so a bridge or a virtual COM port driver
+is the practical route there for now.
 
 Tools in `Mcu/SITL/`:
 
@@ -212,8 +242,9 @@ python3 Mcu/SITL/make_gui_env.py
   executable with the SITL bundled (so it runs the simulator out of the
   box); CI builds one for Linux and Windows. The UI backends
   live in `sitl_gui_backend.py`, UI-independent for headless tests
-- `msp_stub_fc.py` — fake Betaflight FC: MSP on a pty, DShot to the
-  SITL, and BLHeli 4-way passthrough to the simulated ESC bootloader
+- `msp_stub_fc.py` — fake Betaflight FC: MSP on a pty (or on a virtual
+  USB serial device, `sitl_usbip.py`), DShot to the SITL, and BLHeli
+  4-way passthrough to the simulated ESC bootloader
   (`sitl_fourway_server.py`). Used by `scripts/esc_capture_fc.py` for
   hardware-free telemetry capture and by configurators for settings and
   flashing
