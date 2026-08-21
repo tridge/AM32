@@ -1,6 +1,6 @@
 '''
 fake Betaflight FC: a minimal MSP server bridged to the SITL's UDP
-DShot input
+DShot input, with BLHeli 4-way passthrough to the simulated ESC
 
 Lets scripts/esc_capture_fc.py run against the SITL binary with no
 hardware: the stub answers the MSP preflight queries, streams
@@ -8,18 +8,26 @@ bidirectional DShot600 to the SITL from the latest MSP_SET_MOTOR
 value, decodes the BDShot/EDT replies and serves them back as
 MSP_MOTOR_TELEMETRY, just like a real FC does.
 
+MSP_SET_PASSTHROUGH switches the link into 4-way mode
+(sitl_fourway_server.py), so an unmodified ESC configurator can read and
+write the settings and flash of a SITL running with --bootloader, the
+same way it would through a real flight controller.
+
 Serves MSP on a pty; run() prints/returns the slave device path to
 hand to --port. Linux/macOS only (pty).
 '''
 
+import argparse
 import os
 import pty
 import select
 import struct
+import sys
 import threading
 import time
 
 import sitl_dshot as sd
+import sitl_fourway_server
 
 MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
@@ -28,14 +36,24 @@ MSP_STATUS = 101
 MSP_BOXIDS = 119
 MSP_MOTOR_CONFIG = 131
 MSP_MOTOR_TELEMETRY = 139
+MSP_BATTERY_STATE = 130
 MSP_SET_MOTOR = 214
+MSP_SET_PASSTHROUGH = 245
 
 
 class MspStubFC(object):
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57833,
-                 poles=14, rate=500.0):
+                 poles=14, rate=500.0, esc_ports=None, state_port=57734,
+                 esc_reset=True, motor=True, verbose=False):
         self.poles = poles
         self.rate = rate
+        self.verbose = verbose
+        # the ESCs reachable over 4-way passthrough: one SITL input port
+        # each, defaulting to the one we drive with DShot
+        self.fourway = sitl_fourway_server.FourWayServer(
+            esc_ports=esc_ports or [sitl_port], host=sitl_host,
+            state_port=state_port, esc_reset=esc_reset, log=self._log)
+        self.in_fourway = False
         # set to stop updating the telemetry while still answering MSP,
         # reproducing Betaflight serving its cached values after the
         # BDShot replies stop arriving (it never marks them stale)
@@ -58,11 +76,19 @@ class MspStubFC(object):
         import tty
         tty.setraw(self.slave)
         self.slave_path = os.ttyname(self.slave)
-        self.dshot_thread = threading.Thread(target=self._dshot_loop,
-                                             daemon=True)
+        # driving DShot at the ESC would fight the 4-way session for the
+        # signal wire, so it can be left off for pure configurator work
+        self.dshot_thread = None
+        if motor:
+            self.dshot_thread = threading.Thread(target=self._dshot_loop,
+                                                 daemon=True)
+            self.dshot_thread.start()
         self.msp_thread = threading.Thread(target=self._msp_loop, daemon=True)
-        self.dshot_thread.start()
         self.msp_thread.start()
+
+    def _log(self, msg):
+        if self.verbose:
+            print('FC: %s' % msg, file=sys.stderr, flush=True)
 
     def close(self):
         self.running = False
@@ -71,7 +97,9 @@ class MspStubFC(object):
         # _msp_loop polls with a short timeout, so both workers can leave
         # before their descriptors are closed.
         self.msp_thread.join(0.5)
-        self.dshot_thread.join(0.5)
+        if self.dshot_thread is not None:
+            self.dshot_thread.join(0.5)
+        self.fourway.close()
         try:
             os.close(self.master)
             os.close(self.slave)
@@ -178,6 +206,14 @@ class MspStubFC(object):
                     # unused outputs: no telemetry at all
                     out += struct.pack('<IHBHHH', 0, 10000, 0, 0, 0, 0)
             self._reply(cmd, out)
+        elif cmd == MSP_BATTERY_STATE:
+            # cells, capacity, voltage in 0.1V, mAh drawn, current in 0.01A
+            self._reply(cmd, struct.pack('<BHBHH', 4, 1500, 126, 0, 0))
+        elif cmd == MSP_SET_PASSTHROUGH:
+            self._reply(cmd, bytes([self.fourway.esc_count]))
+            self._log('4-way passthrough to %u ESC(s)'
+                      % self.fourway.esc_count)
+            self.in_fourway = True
         elif cmd == MSP_SET_MOTOR:
             if len(payload) >= 2:
                 self.motor_value = struct.unpack('<H', payload[0:2])[0]
@@ -185,6 +221,42 @@ class MspStubFC(object):
         else:
             os.write(self.master, b'$M!' + struct.pack('<BB', 0, cmd)
                      + bytes([cmd]))
+
+    def _drain(self):
+        '''non-blocking read of whatever is already buffered'''
+        out = b''
+        while True:
+            try:
+                ready, _, _ = select.select([self.master], [], [], 0)
+            except (OSError, ValueError):
+                return out
+            if not ready:
+                return out
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError:
+                return out
+            if not chunk:
+                return out
+            out += chunk
+
+    def _fourway(self, chunk):
+        '''run the 4-way session until the client exits the interface'''
+        resp = self.fourway.feed(chunk)
+        if resp:
+            # a 4-way client is strictly request/response, so anything
+            # waiting for us now is a retry of the command we just
+            # answered (a 256 byte read is 130ms of 19200 baud wire time,
+            # which is close to the client's timeout). Our one reply
+            # satisfies it; leaving it queued would answer twice and
+            # shift every later response by one.
+            stale = self._drain()
+            if stale and stale != self.fourway.last_request:
+                self._log('discarding %u unexpected bytes' % len(stale))
+            os.write(self.master, resp)
+        if self.fourway.exited:
+            self._log('4-way interface exited')
+            self.in_fourway = False
 
     def _msp_loop(self):
         buf = b''
@@ -200,6 +272,9 @@ class MspStubFC(object):
             except OSError:
                 return
             if not chunk:
+                continue
+            if self.in_fourway:
+                self._fourway(chunk)
                 continue
             buf += chunk
             while True:
@@ -222,10 +297,48 @@ class MspStubFC(object):
                 buf = buf[6 + size:]
                 if good:
                     self._handle(cmd, payload)
+                if self.in_fourway:
+                    if buf:
+                        self._fourway(buf)
+                    buf = b''
+                    break
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='fake Betaflight FC for the AM32 SITL')
+    parser.add_argument('--host', default='127.0.0.1', help='SITL host')
+    parser.add_argument('--sitl-port', type=int, default=57833,
+                        help='SITL input port driven with DShot')
+    parser.add_argument('--esc-ports', default=None,
+                        help='comma separated SITL input ports of the ESCs '
+                             'reachable over 4-way (default --sitl-port)')
+    parser.add_argument('--state-port', type=int, default=57734,
+                        help='SITL state port, used to reset an ESC into the '
+                             'bootloader (0 disables)')
+    parser.add_argument('--no-esc-reset', action='store_true',
+                        help='never reset an ESC that does not answer')
+    parser.add_argument('--no-motor', action='store_true',
+                        help='do not drive DShot, 4-way and MSP only')
+    parser.add_argument('--poles', type=int, default=14)
+    parser.add_argument('--verbose', action='store_true')
+    args = parser.parse_args()
+
+    ports = None
+    if args.esc_ports:
+        ports = [int(p) for p in args.esc_ports.split(',') if p.strip()]
+    stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
+                     poles=args.poles, esc_ports=ports,
+                     state_port=args.state_port,
+                     esc_reset=not args.no_esc_reset,
+                     motor=not args.no_motor, verbose=args.verbose)
+    print(stub.slave_path, flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stub.close()
 
 
 if __name__ == '__main__':
-    stub = MspStubFC()
-    print(stub.slave_path, flush=True)
-    while True:
-        time.sleep(1)
+    main()
