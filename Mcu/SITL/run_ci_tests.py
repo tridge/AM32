@@ -12,6 +12,7 @@ exits non-zero if any test fails.
 import argparse
 import glob
 import os
+import select
 import signal
 import struct
 import subprocess
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sitl_dshot as sd
 import sitl_params
 import sitl_tones
+from sitl_fourway_server import crc16_xmodem
 from sitl_gui_backend import EepromClient, SimStream, ToneStream, AudioStream
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -701,12 +703,155 @@ def test_fc_capture(sitl_path):
             stub.close()
 
 
+class FourWayClient(object):
+    '''the configurator side of the link: MSP on a serial port, then
+    BLHeli 4-way after MSP_SET_PASSTHROUGH. The framing here is written
+    from the protocol rather than shared with sitl_fourway_server, so the
+    two implementations have to agree'''
+
+    MSP_SET_PASSTHROUGH = 245
+
+    def __init__(self, path):
+        import tty
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.fd)
+
+    def close(self):
+        os.close(self.fd)
+
+    def _read(self, n, timeout=3.0):
+        out = b''
+        deadline = time.time() + timeout
+        while len(out) < n and time.time() < deadline:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                out += os.read(self.fd, n - len(out))
+        return out
+
+    def msp(self, cmd, payload=b''):
+        hdr = struct.pack('<BB', len(payload), cmd)
+        ck = 0
+        for b in hdr + payload:
+            ck ^= b
+        os.write(self.fd, b'$M<' + hdr + payload + bytes([ck]))
+        head = self._read(5)
+        if head[:3] != b'$M>':
+            raise IOError('bad msp reply %r' % head)
+        size = head[3]
+        return self._read(size + 1)[:size]
+
+    def passthrough(self):
+        return self.msp(self.MSP_SET_PASSTHROUGH)[0]
+
+    def cmd(self, command, address=0, params=b'\x00'):
+        '''one 4-way transaction, returning (params, ack)'''
+        body = (bytes([0x2F, command, (address >> 8) & 0xFF, address & 0xFF,
+                       len(params) & 0xFF]) + bytes(params))
+        os.write(self.fd, body + struct.pack('>H', crc16_xmodem(body)))
+        head = self._read(5)
+        if len(head) != 5 or head[0] != 0x2E:
+            raise IOError('bad 4-way reply %r' % head)
+        size = head[4] or 256
+        rest = self._read(size + 3)
+        if len(rest) != size + 3:
+            raise IOError('short 4-way reply')
+        if struct.unpack('>H', rest[-2:])[0] != crc16_xmodem(head + rest[:-2]):
+            raise IOError('4-way reply crc error')
+        return rest[:size], rest[size]
+
+
+def test_fc_fourway(sitl_path, bootloader):
+    '''the fake FC\'s 4-way passthrough: a configurator speaking MSP to
+    the stub must reach the ESC bootloader through it, exactly as it
+    would through a real flight controller'''
+    if bootloader is None:
+        print('SKIP: fc 4-way, no --bootloader given')
+        sys.stdout.flush()
+        return
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: fc 4-way, %s' % ex)
+        sys.stdout.flush()
+        return
+    import msp_stub_fc
+    from sitl_fourway_server import (CMD_DEVICE_INIT_FLASH, CMD_DEVICE_READ,
+                                     CMD_DEVICE_WRITE, CMD_INTERFACE_EXIT,
+                                     CMD_INTERFACE_TEST_ALIVE, ACK_OK)
+    with Sitl(sitl_path, ['--can-uri', 'none', '--bootloader', bootloader],
+              nosleep=False):
+        stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT,
+                                     state_port=STATE_PORT, motor=False)
+        client = None
+        try:
+            client = FourWayClient(stub.slave_path)
+            check('fc 4-way esc count', client.passthrough() == 1, '')
+
+            info, ack = client.cmd(CMD_DEVICE_INIT_FLASH, params=b'\x00')
+            # escDeviceInfo_t: signature (little endian), pin code, boot pages
+            sig = info[0] | (info[1] << 8) if len(info) == 4 else 0
+            check('fc 4-way init flash', ack == ACK_OK and (sig & 0xFF) == 0x06,
+                  'ack=0x%02x info=%s' % (ack, info.hex()))
+            check('fc 4-way boot pin', len(info) == 4 and (info[2] & 0x0F) < 16,
+                  'pin=0x%02x' % (info[2] if len(info) == 4 else 0))
+
+            _, ack = client.cmd(CMD_INTERFACE_TEST_ALIVE)
+            check('fc 4-way keep alive', ack == ACK_OK, 'ack=0x%02x' % ack)
+
+            # the v3 devinfo block, read through the magic address as a
+            # configurator does, tells us where the eeprom lives
+            block, ack = client.cmd(CMD_DEVICE_READ, address=0x23,
+                                    params=bytes([27]))
+            m1, m2 = struct.unpack('<II', block[0:8]) if len(block) >= 8 else (0, 0)
+            check('fc 4-way devinfo read',
+                  ack == ACK_OK and (m1, m2) == (0x5925E3DA, 0x4EB863D9),
+                  'ack=0x%02x magic=0x%08x,0x%08x' % (ack, m1, m2))
+            if ack != ACK_OK or len(block) < 27:
+                return
+            eeprom_start = struct.unpack('<H', block[23:25])[0]
+
+            settings, ack = client.cmd(CMD_DEVICE_READ, address=eeprom_start,
+                                       params=bytes([48]))
+            check('fc 4-way eeprom read', ack == ACK_OK and len(settings) == 48,
+                  'ack=0x%02x len=%d' % (ack, len(settings)))
+
+            # write it back with one byte changed and read it again: the
+            # whole set address / set buffer / program sequence in one go
+            written = bytearray(settings)
+            written[0] = 0x01
+            written[26] = (written[26] + 1) & 0xFF
+            _, ack = client.cmd(CMD_DEVICE_WRITE, address=eeprom_start,
+                                params=bytes(written))
+            check('fc 4-way eeprom write', ack == ACK_OK, 'ack=0x%02x' % ack)
+            back, ack = client.cmd(CMD_DEVICE_READ, address=eeprom_start,
+                                   params=bytes([48]))
+            # byte 2 is BOOT_LOADER_REVISION, which the bootloader stamps
+            # with its own version as it programs the page
+            check('fc 4-way eeprom readback',
+                  ack == ACK_OK and len(back) == 48
+                  and back[:2] + back[3:] == bytes(written[:2] + written[3:]),
+                  'ack=0x%02x back=%s' % (ack, back.hex()))
+            check('fc 4-way bootloader version stamp',
+                  len(back) == 48 and back[2] not in (0x00, 0xFF),
+                  'version=0x%02x' % (back[2] if len(back) == 48 else 0))
+
+            _, ack = client.cmd(CMD_INTERFACE_EXIT)
+            check('fc 4-way exit', ack == ACK_OK, 'ack=0x%02x' % ack)
+        finally:
+            if client is not None:
+                client.close()
+            stub.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     # don't hardcode the firmware version in the default binary path
     pat = os.path.join(HERE, '..', '..', 'obj', 'AM32_AM32_SITL_CAN_*.elf')
     hits = sorted(glob.glob(pat))
     ap.add_argument('--sitl', default=os.path.normpath(hits[0]) if hits else None)
+    ap.add_argument('--bootloader', default=None,
+                    help='bootloader SITL elf from the am32-bootloader repo, '
+                         'enables the 4-way passthrough test')
     args = ap.parse_args()
 
     if not os.path.exists(args.sitl):
@@ -733,6 +878,7 @@ def main():
     test_dronecan_params(args.sitl)
     test_dataset_params()
     test_fc_capture(args.sitl)
+    test_fc_fourway(args.sitl, args.bootloader)
 
     if failures:
         print('\n%d FAILED: %s' % (len(failures), ', '.join(failures)))

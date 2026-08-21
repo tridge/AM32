@@ -153,6 +153,16 @@ class FourWay(object):
             return False
         return self.prog_flash(timeout=timeout)
 
+    def erase_flash(self, addr16, timeout=4.0):
+        '''CMD_ERASE_FLASH at the given address. The AM32 bootloader
+        erases as part of programming, so this only checks the address
+        is writable'''
+        if not self.set_address(addr16):
+            return False
+        self.port.flush_serial()
+        self.port.send_serial(with_crc(bytes([CMD_ERASE_FLASH, 0])))
+        return self._ack(timeout) == ACK_OK
+
     def read_flash(self, size, addr16=None, set_addr=True, timeout=4.0):
         '''read size bytes (1..256, 256 sent as 0) from the current or
         given protocol address. Returns bytes or None on CRC error'''

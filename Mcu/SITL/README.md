@@ -128,7 +128,36 @@ am32-bootloader repo), which bit-bangs the 4-way configuration protocol
 on the signal pin and detects the input type from the line state at
 boot; the main firmware ignores type 4 and uses type 5 only as the idle
 line level. The bootloader replies with type 4 packets carrying its
-serial output. `sitl_fourway.py` implements the 4-way client side.
+serial output. `sitl_fourway.py` implements the one-wire client side.
+
+### Configurators against the SITL
+
+A configurator does not talk to an ESC directly: it talks MSP to a
+flight controller, asks it for BLHeli 4-way passthrough, and the FC
+translates each 4-way command into the ESC's one-wire bootloader
+protocol. `msp_stub_fc.py` is that flight controller, so an unmodified
+configurator can read and write the settings and flash of a simulated
+ESC. Run the SITL chained with the bootloader, then the stub:
+
+```
+obj/AM32_AM32_SITL_CAN_*.elf --can-uri none \
+    --bootloader <am32-bootloader>/obj/AM32_SITL_BOOTLOADER_PB4_CAN_*.elf
+python3 Mcu/SITL/msp_stub_fc.py --no-motor --verbose
+```
+
+The stub prints the pty to use as the serial port, e.g.
+
+```
+SerialPortConnector_CLI settings /dev/pts/7
+```
+
+`--esc-ports` lists the input ports of several SITL instances to serve
+as separate ESCs on the 4-way interface, `--no-motor` leaves the DShot
+output off (it would otherwise share the signal wire with the 4-way
+session), and an ESC that is running the application instead of the
+bootloader is reset into it over the state port, the way a real FC
+power cycles one. Browsers cannot open a pty, so the web configurator
+needs a bridge (or a virtual USB serial device) in front of this.
 
 Tools in `Mcu/SITL/`:
 
@@ -183,6 +212,11 @@ python3 Mcu/SITL/make_gui_env.py
   executable with the SITL bundled (so it runs the simulator out of the
   box); CI builds one for Linux and Windows. The UI backends
   live in `sitl_gui_backend.py`, UI-independent for headless tests
+- `msp_stub_fc.py` — fake Betaflight FC: MSP on a pty, DShot to the
+  SITL, and BLHeli 4-way passthrough to the simulated ESC bootloader
+  (`sitl_fourway_server.py`). Used by `scripts/esc_capture_fc.py` for
+  hardware-free telemetry capture and by configurators for settings and
+  flashing
 - `dshot_test.py` — headless scripted test (arming, throttle, EDT,
   bad-CRC injection), e.g.:
 
