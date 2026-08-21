@@ -10,8 +10,13 @@ configurator included - can talk to whatever is on the other end of the
 byte stream (msp_stub_fc.py, which is a flight controller as far as a
 configurator is concerned).
 
-    python3 Mcu/SITL/msp_stub_fc.py --usbip --no-motor
-    sudo usbip attach -r 127.0.0.1 -b 1-1
+    python3 Mcu/SITL/msp_stub_fc.py --usbip --attach --no-motor
+
+vhci_hcd is handed a socket to speak USB/IP over, and does not care what
+kind: a unix socket works as well as TCP and is the default here, so
+nothing has to claim a port or be reachable from the network. TCP
+(--usbip-port) is for a client on another machine, or one that can only
+attach the usbip way.
 
 The device enumerates as pid.codes 1209:0001 (their test ID, which the
 AM32 configurator accepts as a flight controller) with a CDC-ACM
@@ -30,6 +35,7 @@ what a real device does with a queued read.
 import argparse
 import errno
 import glob
+import os
 import socket
 import struct
 import subprocess
@@ -83,6 +89,9 @@ BUSID = '1-1'
 BUSNUM = 1
 DEVNUM = 1
 
+VHCI = '/sys/devices/platform/vhci_hcd.0'
+VDEV_ST_NULL = '004'      # a free port in the status table
+
 DEVICE_DESCRIPTOR = struct.pack(
     '<BBHBBBBHHHBBBB',
     18, 1, 0x0200,      # bLength, DEVICE, bcdUSB 2.00
@@ -107,17 +116,22 @@ CONFIG_DESCRIPTOR = b''.join([
     struct.pack('<BBBBHB', 7, 5, 0x80 | EP_BULK, 0x02, 64, 0),
 ])
 
-STRINGS = ['AM32', 'AM32 SITL serial', 'SITL']
+MANUFACTURER = 'AM32'
+PRODUCT = 'AM32 SITL serial'
+DEFAULT_SERIAL = 'SITL'
 
-# udev builds this out of the manufacturer, product and serial strings
-TTY_GLOB = '/dev/serial/by-id/usb-AM32_AM32_SITL_serial_*-if00'
+
+def tty_glob(serial=DEFAULT_SERIAL):
+    '''udev names the link after the manufacturer, product and serial'''
+    name = ('%s %s %s' % (MANUFACTURER, PRODUCT, serial)).replace(' ', '_')
+    return '/dev/serial/by-id/usb-%s-if00' % name
 
 
-def find_tty(timeout=10.0):
+def find_tty(serial=DEFAULT_SERIAL, timeout=10.0):
     '''wait for the attached device to show up as a serial port'''
     deadline = time.time() + timeout
     while True:
-        hits = sorted(glob.glob(TTY_GLOB))
+        hits = sorted(glob.glob(tty_glob(serial)))
         if hits:
             return hits[0]
         if time.time() >= deadline:
@@ -125,13 +139,18 @@ def find_tty(timeout=10.0):
         time.sleep(0.2)
 
 
-def string_descriptor(index):
-    if index == 0:
-        return bytes([4, 3, 0x09, 0x04])       # US English
-    if index > len(STRINGS):
-        return None
-    body = STRINGS[index - 1].encode('utf-16-le')
-    return bytes([len(body) + 2, 3]) + body
+def default_socket_name():
+    '''an abstract socket by default: it lives in the kernel's namespace
+    rather than the filesystem, so a killed run leaves nothing behind
+    and there is no stale socket to clear out. Per uid, since the
+    abstract namespace is shared by everyone in the network namespace'''
+    return '@am32-sitl-usbip.%u' % os.getuid()
+
+
+def socket_address(name):
+    '''bind/connect address for a socket name; a leading @ selects the
+    abstract namespace (the kernel's own notation is a leading NUL)'''
+    return '\0' + name[1:] if name.startswith('@') else name
 
 
 class UsbipServer(object):
@@ -142,9 +161,12 @@ class UsbipServer(object):
     the host reads back.
     '''
 
-    def __init__(self, host='127.0.0.1', port=3240, log=None, rx_max=65536):
+    def __init__(self, unix_path=None, host='127.0.0.1', port=None,
+                 serial=DEFAULT_SERIAL, log=None, rx_max=65536):
         self.log = log or (lambda s: None)
         self.rx_max = rx_max
+        self.serial = serial
+        self.strings = [MANUFACTURER, PRODUCT, serial]
         self.rx = b''
         self.rx_lock = threading.Condition()
         self.tx_held = b''       # bytes with no urb to carry them yet
@@ -155,25 +177,52 @@ class UsbipServer(object):
         self.running = True
         self.attached = threading.Event()
         self.line_coding = struct.pack('<IBBB', 115200, 0, 0, 8)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.sock.bind((host, port))
-        except OSError as ex:
-            # 3240 is the well known USB/IP port, so usbipd or another
-            # exporter may already have it
-            raise OSError('cannot serve USB/IP on %s:%u (%s), try another '
-                          'port' % (host, port, ex))
+        # a unix socket by default: vhci_hcd is given the connected
+        # socket, so nothing needs a port or has to be on the network
+        self.unix_path = None if port is not None else (
+            unix_path or default_socket_name())
+        self.host = host
+        self.port = port
+        if self.unix_path is not None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            if not self.unix_path.startswith('@'):
+                if os.path.exists(self.unix_path):
+                    # a leftover from a killed run; a live one would
+                    # have failed the bind below anyway
+                    os.unlink(self.unix_path)
+            self.sock.bind(socket_address(self.unix_path))
+            if not self.unix_path.startswith('@'):
+                # a filesystem socket can be locked down to us; an
+                # abstract one is reachable by anyone in the network
+                # namespace, like the SITL's own udp ports
+                os.chmod(self.unix_path, 0o600)
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.sock.bind((host, port))
+            except OSError as ex:
+                # 3240 is the well known USB/IP port, so usbipd or
+                # another exporter may already have it
+                raise OSError('cannot serve USB/IP on %s:%u (%s), try '
+                              'another port' % (host, port, ex))
+            self.port = self.sock.getsockname()[1]
         self.sock.listen(1)
-        self.port = self.sock.getsockname()[1]
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
     @property
+    def endpoint(self):
+        '''where a client attaches to us'''
+        if self.unix_path is not None:
+            return self.unix_path
+        return '%s:%u' % (self.host, self.port)
+
+    @property
     def path(self):
         '''the serial device the host sees, once it has attached us'''
-        hits = sorted(glob.glob(TTY_GLOB))
-        return hits[0] if hits else 'usbip:%u (not attached)' % self.port
+        hits = sorted(glob.glob(tty_glob(self.serial)))
+        return hits[0] if hits else '%s (not attached)' % self.endpoint
 
     # -- serial side ---------------------------------------------------
 
@@ -211,6 +260,11 @@ class UsbipServer(object):
             self.sock.close()
         except OSError:
             pass
+        if self.unix_path is not None and not self.unix_path.startswith('@'):
+            try:
+                os.unlink(self.unix_path)
+            except OSError:
+                pass
         with self.send_lock:
             if self.conn is not None:
                 try:
@@ -226,7 +280,7 @@ class UsbipServer(object):
                 conn, addr = self.sock.accept()
             except OSError:
                 return
-            self.log('connection from %s:%u' % addr)
+            self.log('connection from %s' % (addr or self.endpoint,))
             self.conn = conn
             try:
                 self._session(conn)
@@ -380,6 +434,14 @@ class UsbipServer(object):
                 except OSError:
                     pass
 
+    def _string_descriptor(self, index):
+        if index == 0:
+            return bytes([4, 3, 0x09, 0x04])       # US English
+        if index > len(self.strings):
+            return None
+        body = self.strings[index - 1].encode('utf-16-le')
+        return bytes([len(body) + 2, 3]) + body
+
     def _control(self, setup, data, length):
         '''answer a control transfer, returning (status, reply bytes)'''
         rtype, request, value, index, wlength = struct.unpack('<BBHHH', setup)
@@ -391,7 +453,7 @@ class UsbipServer(object):
             if dtype == 2:
                 return ST_OK, CONFIG_DESCRIPTOR[:wlength]
             if dtype == 3:
-                desc = string_descriptor(dindex)
+                desc = self._string_descriptor(dindex)
                 if desc is None:
                     return ST_STALL, b''
                 return ST_OK, desc[:wlength]
@@ -423,33 +485,121 @@ class UsbipServer(object):
         return ST_STALL, b''
 
 
-def attach(host='127.0.0.1', port=3240, busid=BUSID, sudo=True):
-    '''attach the exported device to the local vhci_hcd'''
-    # --tcp-port is a global option, it has to come before the command
-    cmd = ['usbip']
-    if port != 3240:
-        cmd += ['--tcp-port', str(port)]
-    cmd += ['attach', '-r', host, '-b', busid]
-    if sudo:
-        cmd = ['sudo'] + cmd
-    return subprocess.run(cmd, check=False).returncode == 0
+def _free_vhci_port(speed):
+    """a port of the right hub in the vhci status table, or None.
+
+    columns are hub, port, sta, spd, dev, sockfd, local_busid
+    """
+    want_hs = speed != 5      # only super speed lives on the ss hub
+    for line in open(os.path.join(VHCI, 'status')).read().splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 3 and f[2] == VDEV_ST_NULL and (f[0] == 'hs') == want_hs:
+            return int(f[1])
+    return None
 
 
-def detach(port=None, sudo=True):
-    '''detach every vhci port we own, or one given port number'''
-    ports = [port] if port is not None else range(8)
+def attach_socket(sock, devid, speed):
+    """hand a connected socket to vhci_hcd, which then enumerates the
+    device on it. Needs root, and takes over the socket: the kernel
+    keeps its own reference, so we can exit afterwards"""
+    port = _free_vhci_port(speed)
+    if port is None:
+        raise OSError('no free vhci_hcd port, detach something first')
+    with open(os.path.join(VHCI, 'attach'), 'w') as f:
+        f.write('%u %u %u %u' % (port, sock.fileno(), devid, speed))
+    return port
+
+
+def import_device(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
+    """connect to an exporter and import a device, returning the socket
+    (positioned at the start of the urb phase) with its devid and speed"""
+    if unix_path is not None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_address(unix_path))
+    else:
+        sock = socket.create_connection((host, port))
+    sock.sendall(struct.pack('>HHI', USBIP_VERSION, OP_REQ_IMPORT, 0)
+                 + busid.encode().ljust(32, b'\0'))
+    reply = b''
+    while len(reply) < 8:
+        reply += sock.recv(8 - len(reply))
+    _version, code, status = struct.unpack('>HHI', reply)
+    if code != OP_REP_IMPORT or status != 0:
+        sock.close()
+        raise OSError('import of %s refused (code 0x%04x status %u)'
+                      % (busid, code, status))
+    dev = b''
+    while len(dev) < 312:
+        chunk = sock.recv(312 - len(dev))
+        if not chunk:
+            sock.close()
+            raise OSError('short device reply')
+        dev += chunk
+    busnum, devnum, speed = struct.unpack('>III', dev[288:300])
+    return sock, (busnum << 16) | devnum, speed
+
+
+def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
+    """import and attach, re-running ourselves under sudo when needed.
+
+    Only the sysfs write needs root, but the socket handed to the kernel
+    has to belong to the process doing the write, so the whole import
+    runs in the privileged child.
+    """
+    if os.geteuid() != 0:
+        cmd = [sys.executable, os.path.abspath(__file__), '--attach-to',
+               unix_path if unix_path is not None else '%s:%u' % (host, port)]
+        return subprocess.run(['sudo'] + cmd, check=False).returncode == 0
+    sock, devid, speed = import_device(unix_path, host, port, busid)
+    try:
+        vhci_port = attach_socket(sock, devid, speed)
+    except OSError:
+        sock.close()
+        raise
+    return vhci_port
+
+
+def detach(port=None):
+    """detach one vhci port, or every port that has a device on it"""
+    if os.geteuid() != 0:
+        cmd = [sys.executable, os.path.abspath(__file__), '--detach']
+        if port is not None:
+            cmd += [str(port)]
+        return subprocess.run(['sudo'] + cmd, check=False).returncode == 0
+    ports = []
+    if port is not None:
+        ports = [port]
+    else:
+        for line in open(os.path.join(VHCI, 'status')).read().splitlines()[1:]:
+            f = line.split()
+            if len(f) >= 3 and f[2] != VDEV_ST_NULL:
+                ports.append(int(f[1]))
     for p in ports:
-        cmd = ['usbip', 'detach', '-p', str(p)]
-        subprocess.run(['sudo'] + cmd if sudo else cmd, check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(VHCI, 'detach'), 'w') as f:
+            f.write('%u' % p)
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--host', default='127.0.0.1', help='address to serve on')
-    ap.add_argument('--port', type=int, default=3240, help='USB/IP tcp port')
+    ap.add_argument('--socket', default=None,
+                    help='unix socket to serve on, @name for the abstract '
+                         'namespace (default %s)' % default_socket_name())
+    ap.add_argument('--port', type=int, default=None,
+                    help='serve on this tcp port instead of a unix socket')
+    ap.add_argument('--host', default='127.0.0.1',
+                    help='address to serve tcp on')
+    ap.add_argument('--serial', default=DEFAULT_SERIAL,
+                    help='usb serial string, which names the /dev/serial/'
+                         'by-id link; give a second instance its own')
     ap.add_argument('--attach', action='store_true',
-                    help='run usbip attach once we are listening (needs root)')
+                    help='attach to the local vhci_hcd once we are listening '
+                         '(needs root, re-runs itself under sudo)')
+    ap.add_argument('--attach-to', default=None,
+                    help='attach an already exported device and exit; takes '
+                         'a unix socket name or host:port')
+    ap.add_argument('--detach', nargs='?', type=int, const=-1, default=None,
+                    help='detach one vhci port, or all of them')
     ap.add_argument('--verbose', action='store_true')
     args = ap.parse_args()
 
@@ -457,14 +607,43 @@ def main():
         if args.verbose:
             print('usbip: %s' % msg, file=sys.stderr, flush=True)
 
-    server = UsbipServer(host=args.host, port=args.port, log=log)
-    print('exporting %s on %s:%u, attach with:' % (BUSID, args.host, args.port),
-          file=sys.stderr)
-    print('  sudo usbip attach -r %s -b %s' % (args.host, BUSID),
-          file=sys.stderr, flush=True)
-    if args.attach and not attach(args.host, args.port):
-        print('attach failed', file=sys.stderr)
-        return 1
+    if args.detach is not None:
+        return 0 if detach(None if args.detach < 0 else args.detach) else 1
+
+    if args.attach_to is not None:
+        # the privileged half of attach(): import and hand the socket to
+        # the kernel, which keeps it after we exit
+        spec = args.attach_to
+        if ':' in spec and not spec.startswith('@') and '/' not in spec:
+            host, _, port = spec.rpartition(':')
+            vhci_port = attach(host=host, port=int(port))
+        else:
+            vhci_port = attach(unix_path=spec)
+        print('attached on vhci port %u' % vhci_port, file=sys.stderr)
+        return 0
+
+    server = UsbipServer(unix_path=args.socket, host=args.host,
+                         port=args.port, serial=args.serial, log=log)
+    print('exporting %s on %s' % (BUSID, server.endpoint), file=sys.stderr,
+          flush=True)
+    if args.attach:
+        if not attach(unix_path=server.unix_path, host=args.host,
+                      port=server.port):
+            print('attach failed', file=sys.stderr)
+            server.close()
+            return 1
+        tty = find_tty(args.serial, timeout=10)
+        print('attached as %s' % (tty or 'no tty appeared'), file=sys.stderr,
+              flush=True)
+    elif server.unix_path is None:
+        print('attach with: sudo usbip %sattach -r %s -b %s'
+              % ('--tcp-port %u ' % server.port if server.port != 3240 else '',
+                 args.host, BUSID), file=sys.stderr, flush=True)
+    else:
+        print('attach with: %s %s --attach-to %s'
+              % (sys.executable, os.path.abspath(__file__), server.unix_path),
+              file=sys.stderr, flush=True)
+
     # loopback: echo what the host writes, so the device can be tested
     # with a terminal before anything is wired to it
     try:
