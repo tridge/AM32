@@ -190,7 +190,12 @@ class UsbipServer(object):
                     # a leftover from a killed run; a live one would
                     # have failed the bind below anyway
                     os.unlink(self.unix_path)
-            self.sock.bind(socket_address(self.unix_path))
+            try:
+                self.sock.bind(socket_address(self.unix_path))
+            except OSError as ex:
+                raise OSError('cannot export USB/IP on %s (%s), another '
+                              'instance is probably running'
+                              % (self.unix_path, ex))
             if not self.unix_path.startswith('@'):
                 # a filesystem socket can be locked down to us; an
                 # abstract one is reachable by anyone in the network
