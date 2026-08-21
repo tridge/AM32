@@ -844,17 +844,27 @@ def test_fc_fourway(sitl_path, bootloader):
             stub.close()
 
 
-def test_usbip_device():
+def test_usbip_device(unix=False):
     '''the virtual USB serial device: enumeration and both data
     directions, driven straight over the USB/IP socket so it needs no
-    vhci_hcd and no root'''
+    vhci_hcd and no root. Both transports, since the export can be a
+    unix socket (no port to collide with anything) or tcp'''
     import sitl_usbip
 
-    server = sitl_usbip.UsbipServer(port=0)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    name = '@am32-usbip-test.%u' % os.getpid()
+    what = 'usbip unix' if unix else 'usbip tcp'
+    server = sitl_usbip.UsbipServer(unix_path=name if unix else None,
+                                    port=None if unix else 0, serial='TEST')
+    if unix:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.settimeout(5.0)
-        sock.connect(('127.0.0.1', server.port))
+        if unix:
+            sock.connect(sitl_usbip.socket_address(name))
+        else:
+            sock.connect(('127.0.0.1', server.port))
 
         def recv(n):
             out = b''
@@ -884,14 +894,14 @@ def test_usbip_device():
         version, code, status = struct.unpack('>HHI', recv(8))
         dev = recv(312)
         vid, pid = struct.unpack('>HH', dev[300:304])
-        check('usbip import', code == 0x0003 and status == 0
+        check('%s import' % what, code == 0x0003 and status == 0
               and (vid, pid) == (0x1209, 0x0001),
               'code=0x%04x status=%u id=%04x:%04x' % (code, status, vid, pid))
 
         # GET_DESCRIPTOR(device), the host\'s first control transfer
         setup = struct.pack('<BBHHH', 0x80, 6, 0x0100, 0, 18)
         _, _, st, desc = submit(1, 0, 18, setup)
-        check('usbip device descriptor',
+        check('%s device descriptor' % what,
               st == 0 and len(desc) == 18 and desc[1] == 1
               and struct.unpack('<HH', desc[8:12]) == (0x1209, 0x0001),
               'status=%d len=%d' % (st, len(desc)))
@@ -899,7 +909,7 @@ def test_usbip_device():
         setup = struct.pack('<BBHHH', 0x80, 6, 0x0200, 0, 255)
         _, _, st, cfg = submit(1, 0, 255, setup)
         total = struct.unpack('<H', cfg[2:4])[0] if len(cfg) >= 4 else 0
-        check('usbip config descriptor',
+        check('%s config descriptor' % what,
               st == 0 and len(cfg) == total and cfg[4] == 2
               and bytes([0x0A, 0x00, 0x00]) in cfg,
               'status=%d len=%d total=%d ifaces=%d'
@@ -908,7 +918,7 @@ def test_usbip_device():
         # host to device, then device to host on the bulk pair
         _, _, st, _ = submit(0, sitl_usbip.EP_BULK, 5, data=b'hello')
         got = server.read(1.0)
-        check('usbip bulk out', st == 0 and got == b'hello',
+        check('%s bulk out' % what, st == 0 and got == b'hello',
               'status=%d got=%r' % (st, got))
 
         # a read urb queued before there is anything to send must be
@@ -924,7 +934,7 @@ def test_usbip_device():
         sq = struct.unpack('>I', hdr[4:8])[0]
         actual = struct.unpack('>i', hdr[24:28])[0]
         payload = recv(actual)
-        check('usbip bulk in', sq == pending and payload == b'world',
+        check('%s bulk in' % what, sq == pending and payload == b'world',
               'seq=%u payload=%r' % (sq, payload))
 
         # the notification endpoint never completes, so the host has to
@@ -940,7 +950,7 @@ def test_usbip_device():
         hdr = recv(48)
         command = struct.unpack('>I', hdr[:4])[0]
         st = struct.unpack('>i', hdr[20:24])[0]
-        check('usbip unlink', command == 4 and st != 0,
+        check('%s unlink' % what, command == 4 and st != 0,
               'command=%u status=%d' % (command, st))
     finally:
         sock.close()
@@ -983,7 +993,8 @@ def main():
     test_dataset_params()
     test_fc_capture(args.sitl)
     test_fc_fourway(args.sitl, args.bootloader)
-    test_usbip_device()
+    test_usbip_device(unix=False)
+    test_usbip_device(unix=True)
 
     if failures:
         print('\n%d FAILED: %s' % (len(failures), ', '.join(failures)))

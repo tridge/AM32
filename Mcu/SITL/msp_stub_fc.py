@@ -339,10 +339,17 @@ def main():
                         help='serve on a virtual USB serial device instead '
                              'of a pty, so tools that only take USB ports '
                              '(a browser) can reach it')
-    parser.add_argument('--usbip-port', type=int, default=3240,
-                        help='USB/IP tcp port')
+    parser.add_argument('--usbip-socket', default=None,
+                        help='unix socket the virtual device is exported on, '
+                             '@name for the abstract namespace')
+    parser.add_argument('--usbip-port', type=int, default=None,
+                        help='export the virtual device on this tcp port '
+                             'instead of a unix socket')
+    parser.add_argument('--usbip-serial', default=sitl_usbip.DEFAULT_SERIAL,
+                        help='usb serial string of the virtual device, which '
+                             'names its /dev/serial/by-id link')
     parser.add_argument('--attach', action='store_true',
-                        help='with --usbip, run usbip attach for you')
+                        help='with --usbip, attach it to vhci_hcd for you')
     parser.add_argument('--poles', type=int, default=14)
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args()
@@ -356,7 +363,9 @@ def main():
         def log(msg):
             if args.verbose:
                 print('usbip: %s' % msg, file=sys.stderr, flush=True)
-        endpoint = sitl_usbip.UsbipServer(port=args.usbip_port, log=log)
+        endpoint = sitl_usbip.UsbipServer(unix_path=args.usbip_socket,
+                                          port=args.usbip_port,
+                                          serial=args.usbip_serial, log=log)
 
     stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
                      poles=args.poles, esc_ports=ports,
@@ -365,16 +374,22 @@ def main():
                      motor=not args.no_motor, verbose=args.verbose,
                      endpoint=endpoint)
     if args.usbip:
-        if args.attach and not sitl_usbip.attach(port=args.usbip_port):
-            print('usbip attach failed', file=sys.stderr)
-            stub.close()
-            return 1
-        if not args.attach:
-            print('attach the virtual FC with:\n  sudo usbip attach -r '
-                  '127.0.0.1 -b %s' % sitl_usbip.BUSID, file=sys.stderr,
-                  flush=True)
-        tty_path = sitl_usbip.find_tty(timeout=10 if args.attach else 60)
-        if tty_path is None:
+        print('virtual FC exported on %s' % endpoint.endpoint,
+              file=sys.stderr, flush=True)
+        if args.attach:
+            if not sitl_usbip.attach(unix_path=endpoint.unix_path,
+                                     port=endpoint.port):
+                print('attach failed', file=sys.stderr)
+                stub.close()
+                return 1
+        else:
+            print('attach it with: %s %s --attach-to %s'
+                  % (sys.executable, sitl_usbip.__file__,
+                     endpoint.unix_path or '%s:%u' % (args.host,
+                                                      endpoint.port)),
+                  file=sys.stderr, flush=True)
+        if sitl_usbip.find_tty(args.usbip_serial,
+                               timeout=10 if args.attach else 60) is None:
             print('no tty appeared, is vhci_hcd loaded?', file=sys.stderr)
     print(stub.slave_path, flush=True)
     try:

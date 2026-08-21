@@ -172,18 +172,31 @@ sudo modprobe vhci_hcd
 python3 Mcu/SITL/msp_stub_fc.py --usbip --attach --no-motor
 ```
 
-`--attach` runs `usbip attach` (root, from the distribution's usbip
-package); without it the command to run by hand is printed. The device
-then appears in `dmesg`, as `/dev/ttyACM*` and as
+The device then appears in `dmesg`, as `/dev/ttyACM*` and as
 `/dev/serial/by-id/usb-AM32_AM32_SITL_serial_SITL-if00`, and is
 indistinguishable from hardware to anything above the driver - Chrome
 included. It enumerates as pid.codes `1209:0001`, which the AM32
 configurator accepts as a flight controller.
 
-`--usbip-port` moves the USB/IP listener off the well known port 3240,
-which is worth doing when something else on the machine already exports
-devices there (the attach command printed at startup follows the
-option). Detach with `sudo usbip detach -p 0`.
+vhci_hcd is handed the socket to speak USB/IP over rather than opening
+it itself, and does not care what kind it is, so the export defaults to
+an abstract unix socket (`@am32-sitl-usbip.<uid>`): no port for anything
+to collide with, nothing reachable from the network, and nothing left in
+the filesystem if the process is killed. `--usbip-socket` names a
+different one, a name without a leading `@` being a filesystem path,
+which is the one to use when the socket should be protected by its
+permissions rather than open to the network namespace. `--usbip-port`
+exports over tcp instead, for a client on another machine or one that
+can only attach the `usbip` way.
+
+`--attach` does the import and the attach itself (re-running itself
+under sudo for the sysfs write, since only that needs root), so the
+usbip userspace package is not required; without it the command to run
+by hand is printed. `python3 Mcu/SITL/sitl_usbip.py --detach` detaches
+everything again, as does `sudo usbip detach -p 0`.
+
+A second instance needs its own `--usbip-serial`, since udev names the
+`/dev/serial/by-id` link after the usb serial string.
 
 Windows has no equivalent in the box: attaching a remote USB/IP device
 needs a signed client driver, so a bridge or a virtual COM port driver
