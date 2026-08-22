@@ -19,9 +19,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public class AM32_RegisterFile : IDoubleWordPeripheral, IKnownSize
     {
-        public AM32_RegisterFile(IMachine machine, int size = 0x400)
+        public AM32_RegisterFile(IMachine machine, int size = 0x400,
+            bool preserveOnReset = false)
         {
             this.size = size;
+            this.preserveOnReset = preserveOnReset;
             regs = new uint[size / 4];
         }
 
@@ -29,6 +31,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void Reset()
         {
+            if(preserveOnReset)
+            {
+                return;
+            }
             for(var i = 0; i < regs.Length; i++)
             {
                 regs[i] = 0;
@@ -51,6 +57,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private readonly int size;
+        private readonly bool preserveOnReset;
         private readonly uint[] regs;
     }
 }

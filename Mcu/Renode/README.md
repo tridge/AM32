@@ -29,6 +29,15 @@ not by their names.
 The SEQURE_G431 pair currently fails its spin assertions to a known
 low-speed startup fidelity gap described below.
 
+Pass `--bootloader-elf` to load an application and bootloader together
+and start the MCU from the bootloader, including after an emulated MCU
+reset. With no option the existing direct-to-application boot remains
+the default. For example, using a prebuilt bootloader from a neighbouring
+AM32-bootloader tree:
+
+    Mcu/Renode/gen_target.py AM32REF_F051 --run \
+        --bootloader-elf ../AM32-bootloader.2/obj/AM32_F051_BOOTLOADER_PA2_V18.elf
+
 Targets are classified by asking the preprocessor which MCU each one
 resolves to, not by their names - a cheap substring prefilter narrows
 the candidate list first, but the family decision is the

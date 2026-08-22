@@ -14,6 +14,8 @@ practical rather than checking 52 platform files into the tree.
 usage:
     gen_target.py TARGET [--outdir DIR]      write the pair, print both paths
     gen_target.py TARGET --run               generate, then launch renode
+    gen_target.py TARGET --run --bootloader-elf ELF
+                                             boot through a bootloader ELF
     gen_target.py TARGET --run --exec CMD    ... and script it
     gen_target.py TARGET --gui               ... driven by Mcu/SITL/sitl_gui.py
     gen_target.py TARGET --gui --cpusel N    ... pinned to host CPU N
@@ -30,6 +32,7 @@ import argparse
 import glob
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1620,7 +1623,98 @@ def ws2812_block(cfg, spec, sigrok=False):
     ] + routes + ['']
 
 
-def script(cfg, repl_path):
+def bootloader_lma_segments(bootloader_elf, outdir, target):
+    '''Extract initialized data whose ELF virtual address is RAM but whose
+       physical/load address is flash. Renode's physical-address LoadELF
+       zero-fills the segment's whole RAM-sized p_memsz at p_paddr, corrupting
+       an application immediately above the bootloader. Loading the ELF by
+       virtual address avoids that, and these small files restore only the
+       real p_filesz initializer bytes at their flash load addresses.'''
+    with open(bootloader_elf, 'rb') as f:
+        data = f.read()
+    if len(data) < 52 or data[:4] != b'\x7fELF':
+        raise Unsupported('%s is not an ELF file' % bootloader_elf)
+    if data[4] != 1 or data[5] != 1:
+        raise Unsupported('%s is not a little-endian ELF32 file'
+                          % bootloader_elf)
+    phoff = struct.unpack_from('<I', data, 28)[0]
+    phentsize, phnum = struct.unpack_from('<HH', data, 42)
+    if phentsize < 32 or phoff + phentsize * phnum > len(data):
+        raise Unsupported('%s has an invalid program header table'
+                          % bootloader_elf)
+    segments = []
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        p_type, p_offset, p_vaddr, p_paddr, p_filesz, _p_memsz = \
+            struct.unpack_from('<IIIIII', data, off)
+        if p_type != 1 or p_filesz == 0 or p_paddr == p_vaddr:
+            continue
+        if p_offset + p_filesz > len(data):
+            raise Unsupported('%s has an invalid load segment' % bootloader_elf)
+        path = os.path.abspath(os.path.join(
+            outdir, '%s_bootloader_lma_%d.bin' % (target, len(segments))))
+        with open(path, 'wb') as f:
+            f.write(data[p_offset:p_offset + p_filesz])
+        segments.append((path, p_paddr))
+    return segments
+
+
+def bootloader_script(cfg, bootloader_elf, lma_segments=None):
+    '''Commands appended to a generated target script when a bootloader is
+       requested. LoadELF makes it the initial program; replacing the family
+       reset macro makes watchdog/NVIC resets return there too, as hardware
+       does. The application ELF remains loaded above the bootloader so the
+       bootloader can validate and jump to it normally.'''
+    if bootloader_elf is None:
+        return []
+    elf = os.path.abspath(bootloader_elf)
+    lma_loads = ['sysbus LoadBinary @%s 0x%08X' % item
+                 for item in (lma_segments or [])]
+    if cfg['family'] == 'v203':
+        # CH32V203 executes through the zero-based flash alias and has no
+        # Cortex-M vector table. Its CPU reset does not reload an ELF entry
+        # point, so reload the bootloader just as the family script normally
+        # reloads the application.
+        return [
+            '',
+            '# Boot from the supplied CH32V203 bootloader. The app loaded by',
+            '# the family script remains at 0x1000.',
+            'sysbus LoadELF @%s true' % elf,
+        ] + lma_loads + [
+            'macro reset',
+            '"""',
+            '    sysbus LoadELF @%s true' % elf,
+        ] + ['    %s' % line for line in lma_loads] + [
+            '"""',
+            '',
+        ]
+    boot_base = 0 if cfg['family'] == 'a153' else 0x08000000
+    lines = [
+        '',
+        '# Load by virtual address so ELF RAM/BSS segments go to RAM rather',
+        '# than zero-filling their flash LMA over the application. Explicit',
+        '# LoadBinary commands below restore initialized-data bytes at LMA.',
+        'sysbus LoadELF @%s true' % elf,
+    ] + lma_loads + [
+        'cpu VectorTableOffset 0x%08X' % boot_base,
+        'macro reset',
+        '"""',
+        '    cpu VectorTableOffset 0x%08X' % boot_base,
+        '"""',
+    ]
+    if cfg['family'] in ('f051', 'f031'):
+        # These Cortex-M0 parts have no VTOR. On hardware initAfterJump()
+        # copies the application vectors to SRAM and remaps address zero;
+        # Renode does not model that SYSCFG remap, so move its equivalent
+        # vector-table override when the application reaches the same point.
+        lines += [
+            'cpu AddSymbolHook "initAfterJump" '
+            '"cpu.VectorTableOffset = 0x%08X"' % cfg['app_base'],
+        ]
+    return lines + ['']
+
+
+def script(cfg, repl_path, bootloader_elf=None, bootloader_lmas=None):
     return '\n'.join([
         ':name: AM32 %s' % cfg['target'],
         ':description: boots an AM32 %s firmware ELF' % cfg['target'],
@@ -1646,7 +1740,8 @@ def script(cfg, repl_path):
         'connector Connect sysbus.%s canhub' % FAMILY[cfg['family']]['can_name'],
         'connector Connect sysbus.canmcast canhub',
         '',
-    ] if cfg['dronecan'] else []))
+    ] if cfg['dronecan'] else []) + bootloader_script(
+        cfg, bootloader_elf, bootloader_lmas))
 
 
 def throttle_address(target, nm='arm-none-eabi-gcc'):
@@ -1667,13 +1762,18 @@ def capture_timer_name(target, nm='arm-none-eabi-gcc'):
     return 'timer%s' % re.sub(r'\D', '', cfg['timer'])
 
 
-def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False):
+def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False,
+             bootloader_elf=None):
     '''write the pair, return (resc, repl). Raises Unsupported.'''
     cfg = config(target, nm)
     os.makedirs(outdir, exist_ok=True)
     repl = os.path.join(outdir, '%s.repl' % target)
     resc = os.path.join(outdir, '%s.resc' % target)
     extra = []
+    bootloader_lmas = []
+    if bootloader_elf is not None:
+        bootloader_lmas = bootloader_lma_segments(
+            bootloader_elf, outdir, target)
     if cfg['family'] == 'a153':
         # the ROM flash-driver blob, compiled with the same toolchain;
         # the writes go after the include so the machine exists
@@ -1681,7 +1781,8 @@ def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False):
     with open(repl, 'w') as f:
         f.write(platform(cfg, sigrok))
     with open(resc, 'w') as f:
-        f.write(script(cfg, repl) + '\n'.join(extra))
+        f.write(script(cfg, repl, bootloader_elf, bootloader_lmas)
+                + '\n'.join(extra))
     return resc, repl
 
 
@@ -2066,6 +2167,9 @@ def main():
                          'unrestricted')
     ap.add_argument('--elf', default=None,
                     help='default: whatever obj/ holds for the target')
+    ap.add_argument('--bootloader-elf', default=None,
+                    help='also load this bootloader ELF and start/reset the '
+                         'MCU in it (default: no bootloader)')
     ap.add_argument('--eeprom', default=None,
                     help='default: generated to match --model')
     ap.add_argument('--model', default=os.path.join(
@@ -2099,10 +2203,15 @@ def main():
         ap.error('a target is required unless --list')
 
     outdir = args.outdir or os.path.join(REPO, 'obj', 'renode')
+    if args.bootloader_elf is not None:
+        if not os.path.isfile(args.bootloader_elf):
+            ap.error('no bootloader ELF at %s' % args.bootloader_elf)
+        args.bootloader_elf = os.path.abspath(args.bootloader_elf)
     try:
         cfg = config(args.target, args.nm)
         resc, repl = generate(args.target, outdir, args.nm,
-                              sigrok=args.sigrok)
+                              sigrok=args.sigrok,
+                              bootloader_elf=args.bootloader_elf)
     except Unsupported as e:
         print('SKIP: %s' % e)
         return 77
