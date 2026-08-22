@@ -22,9 +22,17 @@
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
+    // CSR also carries the reset cause, which is load-bearing for the
+    // bootloader: checkForSignal() jumps to the application when it finds
+    // the signal pin low, unless the reset was a software one, and the
+    // firmware's own signal-loss reboot is exactly that. Without the flag
+    // an emulated ESC with nothing driving its wire bounces between the
+    // two forever instead of settling in the bootloader, and no
+    // configurator can reach it.
     public class AM32_STM32F0_RCC : IDoubleWordPeripheral, IKnownSize
     {
         public long Size => 0x400;
@@ -38,10 +46,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const long AHBRSTR = 0x28;
         private const long CR2 = 0x34;
 
-        private readonly uint[] regs = new uint[0x100];
+        // CSR reset flags, and the AIRCR write that causes one
+        private const int SftRstF = 28;
+        private const int PinRstF = 26;
+        private const int RmvF = 24;
+        private const ulong Aircr = 0xE000ED0C;
+        private const uint AircrKey = 0x05FA0000;
+        private const uint SysResetReq = 1u << 2;
 
-        public AM32_STM32F0_RCC()
+        private readonly uint[] regs = new uint[0x100];
+        private readonly IMachine machine;
+        private bool pendingSoftwareReset;
+        private bool softwareReset;
+        private bool everReset;
+
+        public AM32_STM32F0_RCC(IMachine machine)
         {
+            this.machine = machine;
+            // The CPU resets the machine on a SYSRESETREQ write to AIRCR,
+            // with no cause reaching us, so watch for the write itself.
+            machine.SystemBus.AddWatchpointHook(
+                Aircr, SysbusAccessWidth.DoubleWord, Access.Write,
+                (cpu, address, width, value) =>
+                {
+                    if((value & 0xFFFF0000u) == AircrKey
+                       && (value & SysResetReq) != 0)
+                    {
+                        pendingSoftwareReset = true;
+                        this.Log(LogLevel.Debug, "SYSRESETREQ seen");
+                    }
+                });
             Reset();
         }
 
@@ -54,6 +88,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // reset state: HSI on and ready, as on silicon
             regs[CR / 4] = (1u << 0) | (1u << 1);
             regs[CR2 / 4] = (1u << 0) | (1u << 1);
+            // the cause survives into the run that follows it, which is
+            // the whole point of the flag
+            softwareReset = pendingSoftwareReset;
+            pendingSoftwareReset = false;
+            this.Log(LogLevel.Debug, "reset cause: software={0}",
+                     softwareReset);
+            regs[CSR / 4] = softwareReset ? (1u << SftRstF)
+                : (everReset ? 0u : (1u << PinRstF));
+            everReset = true;
         }
 
         public uint ReadDoubleWord(long offset)
@@ -72,6 +115,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(idx < 0 || idx >= regs.Length)
             {
                 return;
+            }
+
+            if(offset == CSR && (value & (1u << RmvF)) != 0)
+            {
+                // RMVF clears the reset cause, as the firmware does once
+                // it has read why it started
+                softwareReset = false;
+                value &= 0x00FFFFFFu;
+            }
+            else if(offset == CSR)
+            {
+                // the cause bits are read-only: keep what the reset set
+                value = (value & 0x00FFFFFFu) | (regs[CSR / 4] & 0xFF000000u);
             }
 
             switch(offset)

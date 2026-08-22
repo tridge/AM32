@@ -273,8 +273,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     return;
                 }
-                if(n < 8 || BitConverter.ToUInt16(buf, 0) != InputMagic
-                   || buf[3] != 4)
+                if(n < 6 || BitConverter.ToUInt16(buf, 0) != InputMagic)
+                {
+                    continue;
+                }
+                if(buf[2] == TypeSerial)
+                {
+                    // raw bootloader bytes: header is 6 bytes and the
+                    // payload is buf[3] long, unlike the fixed setpoints
+                    var len = buf[3];
+                    if(n < 6 + len || len == 0)
+                    {
+                        continue;
+                    }
+                    var payload = new byte[len];
+                    Array.Copy(buf, 6, payload, 0, len);
+                    var sflags = BitConverter.ToUInt16(buf, 4);
+                    lock(sync)
+                    {
+                        replyTo = from;
+                        serialFrom = from;
+                    }
+                    generator.QueueSerial(payload, (sflags & FlagGap) != 0);
+                    Volatile.Write(ref lastInputMs, Environment.TickCount);
+                    continue;
+                }
+                if(n < 8 || buf[3] != 4)
                 {
                     continue;
                 }
@@ -357,9 +381,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // replies carry the protocol they were asked for
                 replyType = type;
                 break;
+            case TypeLine:
+                // an adapter holding the wire, which is how the bootloader
+                // is told to stay put at boot; no throttle meaning
+                generator.SetLineLevel((flags & FlagIdleHigh) != 0,
+                                       (flags & FlagFloating) != 0);
+                return;
             default:
-                // types 4 (serial) and 5 (line level) are bootloader and
-                // wire-hold tests, which have no setpoint meaning
                 return;
             }
             generator.FrameUs = FrameUs;
@@ -375,6 +403,37 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // the capture timer from the levels it saw - not read out of the
         // firmware's gcr[] buffer, so this covers the transmit path
         // instead of restating it.
+        // the bootloader's bit-banged answer, framed the way the SITL
+        // sends its serial replies so the same clients read both
+        private void PumpSerial()
+        {
+            EndPoint to;
+            lock(sync)
+            {
+                to = serialFrom;
+            }
+            if(to == null)
+            {
+                return;
+            }
+            var data = generator.TakeSerialRx();
+            if(data == null)
+            {
+                return;
+            }
+            for(var ofs = 0; ofs < data.Length; ofs += SerialMax)
+            {
+                var len = Math.Min(SerialMax, data.Length - ofs);
+                var pkt = new byte[6 + len];
+                Array.Copy(BitConverter.GetBytes(InputMagic), 0, pkt, 0, 2);
+                pkt[2] = TypeSerial;
+                pkt[3] = (byte)len;
+                Array.Copy(BitConverter.GetBytes(FlagIdleHigh), 0, pkt, 4, 2);
+                Array.Copy(data, ofs, pkt, 6, len);
+                Send(inputSocket, pkt, pkt.Length, to);
+            }
+        }
+
         private void PumpReplies()
         {
             EndPoint to;
@@ -1042,6 +1101,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ServiceCommands();
             ApplySetpoint();
             PumpReplies();
+            PumpSerial();
             SampleState();
             SampleMotorAudio();
             WatchStep();
@@ -1119,7 +1179,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const byte TypeDshot150 = 1;
         private const byte TypeDshot300 = 2;
         private const byte TypeDshot600 = 3;
+        private const int SerialMax = 200;
+        private const byte TypeSerial = 4;
+        private const byte TypeLine = 5;
         private const ushort FlagIdleHigh = 0x0001;
+        private const ushort FlagFloating = 0x0002;
+        private const ushort FlagGap = 0x0004;
 
         private const ushort StateMagicCmd = 0x5353;
         private const ushort StateMagicData = 0x5354;
@@ -1204,6 +1269,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ushort setFlags;
         private ushort setData;
         private EndPoint replyTo;
+        private EndPoint serialFrom;
 
         private bool ownsWire;
         private bool silenced;

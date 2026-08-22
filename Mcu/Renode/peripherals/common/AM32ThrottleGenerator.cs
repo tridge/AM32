@@ -68,6 +68,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                         workMode: WorkMode.OneShot,
                                         eventEnabled: true);
             frameTimer.LimitReached += OnTimer;
+            // the serial bit clock and the receive sampler: separate from
+            // the frame timer so a serial session cannot disturb the
+            // throttle state machine's own scheduling
+            serialTimer = new LimitTimer(machine.ClockSource, 1000000000, this,
+                                         "serialtx", 1000,
+                                         direction: Direction.Ascending,
+                                         enabled: false, autoUpdate: false,
+                                         workMode: WorkMode.OneShot,
+                                         eventEnabled: true);
+            serialTimer.LimitReached += SerialStep;
+            rxTimer = new LimitTimer(machine.ClockSource, 1000000000, this,
+                                     "serialrx", 1000,
+                                     direction: Direction.Ascending,
+                                     enabled: false, autoUpdate: false,
+                                     workMode: WorkMode.OneShot,
+                                     eventEnabled: true);
+            rxTimer.LimitReached += SerialRxSample;
             PulseUs = 1000;
             FrameUs = DefaultFrameUs;
             Protocol = 0;
@@ -215,6 +232,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void Reset()
         {
+            if(serialMode)
+            {
+                // The wire side is the bench, not the ESC: a reboot does
+                // not unplug the adapter holding the line, and the
+                // bootloader decides whether to jump by reading exactly
+                // that level as it starts. Drop any half sent frame, keep
+                // driving the line.
+                lock(serialSync)
+                {
+                    txBits.Clear();
+                }
+                serialTimer.Enabled = false;
+                rxTimer.Enabled = false;
+                txDriving = false;
+                rxActive = false;
+                DriveSerialIdle();
+                // The GPIO port clears its input state in its own reset,
+                // and Renode's GPIO drops a Set that matches what it last
+                // propagated, so the level we hold would silently stop
+                // being visible to the guest. The bootloader decides
+                // whether to jump to the application by reading exactly
+                // this pin, so push it again once the ports have reset
+                // too - a short delay, since peripheral reset order is
+                // not defined.
+                reassertPending = true;
+                serialTimer.Limit = ReassertNs;
+                serialTimer.Enabled = true;
+                return;
+            }
             // The generator is the bench-side transmitter: an ESC
             // reboot (NVIC_SystemReset -> machine reset) does not
             // silence the radio or flight controller on the other end
@@ -355,11 +401,237 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             escLevel = value;
+            if(serialMode)
+            {
+                // the ESC's reply is decoded from its own pin rather than
+                // from the shared wire, so our idle drive cannot mask it
+                SerialRxEdge(value);
+                return;
+            }
             // only forward it while we are not driving a frame ourselves
             if(bidirectional && !transmitting)
             {
                 Connections[0].Set(value);
             }
+        }
+
+        // --- one wire serial ------------------------------------------
+        //
+        // The bootloader talks 19200 8N1 bit-banged on this same wire, so
+        // a configurator can be driven against an emulated ESC exactly as
+        // against hardware. Transmission is a queue of line levels clocked
+        // out one bit at a time; reception is a soft UART sampling the
+        // ESC's own pin at the bit centres, started by its falling start
+        // edge. Half duplex is the protocol's business, as on the wire.
+
+        // bytes for the ESC. gap prepends idle bit times so the bootloader
+        // sees a frame boundary, which is what inter-command latency does
+        // on a real adapter
+        public void QueueSerial(byte[] data, bool gap)
+        {
+            if(data == null || data.Length == 0)
+            {
+                return;
+            }
+            lock(serialSync)
+            {
+                if(gap)
+                {
+                    for(var i = 0; i < SerialGapBits; i++)
+                    {
+                        txBits.Enqueue(true);
+                    }
+                }
+                foreach(var b in data)
+                {
+                    txBits.Enqueue(false);              // start
+                    for(var i = 0; i < 8; i++)
+                    {
+                        txBits.Enqueue(((b >> i) & 1) != 0);   // lsb first
+                    }
+                    txBits.Enqueue(true);               // stop
+                }
+            }
+            EnterSerialMode();
+            SerialKick();
+        }
+
+        // whatever the ESC has bit-banged back since the last call
+        public byte[] TakeSerialRx()
+        {
+            lock(serialSync)
+            {
+                if(serialRx.Count == 0)
+                {
+                    return null;
+                }
+                var outBytes = serialRx.ToArray();
+                serialRx.Clear();
+                return outBytes;
+            }
+        }
+
+        // a constant line state, as an adapter holding the wire at boot
+        public void SetLineLevel(bool high, bool floating)
+        {
+            EnterSerialMode();
+            lock(serialSync)
+            {
+                txBits.Clear();
+            }
+            serialTimer.Enabled = false;
+            txDriving = false;
+            // floating releases the wire; the bootloader's own pull-up
+            // decides, which here means leaving the line where the ESC has
+            // it rather than driving a level of our own
+            serialIdleHigh = floating ? escLevel : high;
+            DriveSerialIdle();
+        }
+
+        public uint SerialBaud
+        {
+            get { return serialBaud; }
+            set { serialBaud = value == 0 ? DefaultSerialBaud : value; }
+        }
+
+        // the wire is one or the other: a throttle train and a serial
+        // session cannot share it, which is true of the hardware too
+        private void EnterSerialMode()
+        {
+            if(serialMode)
+            {
+                return;
+            }
+            serialMode = true;
+            frameTimer.Enabled = false;
+            CancelBatchedFrame();
+            transmitting = false;
+            high = false;
+            serialIdleHigh = true;
+            DriveSerialIdle();
+        }
+
+        public void LeaveSerialMode()
+        {
+            if(!serialMode)
+            {
+                return;
+            }
+            serialMode = false;
+            serialTimer.Enabled = false;
+            rxTimer.Enabled = false;
+            rxActive = false;
+            txDriving = false;
+            lock(serialSync)
+            {
+                txBits.Clear();
+            }
+            if(enabled)
+            {
+                StartHigh();
+            }
+        }
+
+        private ulong SerialBitNs()
+        {
+            return 1000000000UL / serialBaud;
+        }
+
+        private void DriveSerialIdle()
+        {
+            Connections[0].Set(serialIdleHigh);
+        }
+
+        // Renode's GPIO only propagates a change, so a level the far end
+        // has forgotten needs the flip to get there
+        private void ForceWire(bool level)
+        {
+            Connections[0].Set(!level);
+            Connections[0].Set(level);
+        }
+
+        private void SerialKick()
+        {
+            if(txDriving)
+            {
+                return;
+            }
+            bool any;
+            lock(serialSync)
+            {
+                any = txBits.Count > 0;
+            }
+            if(!any)
+            {
+                return;
+            }
+            txDriving = true;
+            SerialStep();
+        }
+
+        private void SerialStep()
+        {
+            if(reassertPending)
+            {
+                reassertPending = false;
+                ForceWire(serialIdleHigh);
+                SerialKick();
+                return;
+            }
+            bool bit;
+            lock(serialSync)
+            {
+                if(txBits.Count == 0)
+                {
+                    txDriving = false;
+                    // release: the ESC answers into the idle line
+                    DriveSerialIdle();
+                    return;
+                }
+                bit = txBits.Dequeue();
+            }
+            Connections[0].Set(bit);
+            serialTimer.Limit = SerialBitNs();
+            serialTimer.Enabled = true;
+        }
+
+        // the ESC's start bit: sample the middle of each bit from here
+        private void SerialRxEdge(bool level)
+        {
+            if(rxActive || level || txDriving)
+            {
+                return;
+            }
+            rxActive = true;
+            rxBit = 0;
+            rxByte = 0;
+            rxTimer.Limit = SerialBitNs() + SerialBitNs() / 2;
+            rxTimer.Enabled = true;
+        }
+
+        private void SerialRxSample()
+        {
+            if(rxBit < 8)
+            {
+                if(escLevel)
+                {
+                    rxByte |= (byte)(1 << rxBit);
+                }
+                rxBit++;
+                rxTimer.Limit = SerialBitNs();
+                rxTimer.Enabled = true;
+                return;
+            }
+            // the stop bit: a framing error means we mis-tracked the wire,
+            // so drop the byte rather than hand up a corrupt one
+            if(escLevel)
+            {
+                lock(serialSync)
+                {
+                    serialRx.Enqueue(rxByte);
+                }
+            }
+            rxActive = false;
         }
 
         private void DshotStep()
@@ -481,6 +753,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IMachine machine;
         private readonly LimitTimer frameTimer;
+        private readonly LimitTimer serialTimer;
+        private readonly LimitTimer rxTimer;
+        private readonly object serialSync = new object();
+        private readonly Queue<bool> txBits = new Queue<bool>();
+        private readonly Queue<byte> serialRx = new Queue<byte>();
+        private const uint DefaultSerialBaud = 19200;
+        // a frame separator the bootloader's byte timeout can see
+        private const int SerialGapBits = 20;
+        private uint serialBaud = DefaultSerialBaud;
+        private bool serialMode;
+        private bool serialIdleHigh = true;
+        private bool txDriving;
+        private bool rxActive;
+        private bool reassertPending;
+        private const ulong ReassertNs = 20000;   // 20us after a reset
+        private int rxBit;
+        private byte rxByte;
         private bool high;
         private bool enabled;
         private uint protocol;
