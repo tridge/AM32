@@ -2164,6 +2164,10 @@ def main():
                     help='compiler used to preprocess Inc/targets.h')
     ap.add_argument('--nm-bin', default='arm-none-eabi-nm',
                     help='reads the ELF symbol table for status()')
+    ap.add_argument('--monitor-port', type=int, default=0,
+                    help='serve the Renode monitor on this telnet port '
+                         'instead of the console, so a launcher can poll '
+                         'PC and timing while the emulation runs')
     ap.add_argument('--info', action='store_true',
                     help='print the target\'s family, signal pin and CAN '
                          'support as JSON and exit (for launch.py)')
@@ -2285,7 +2289,8 @@ def main():
             return 77
         print(json.dumps({'target': args.target, 'family': cfg['family'],
                           'pin': cfg['throttle_pin'],
-                          'dronecan': bool(cfg['dronecan'])}))
+                          'dronecan': bool(cfg['dronecan']),
+                          'app_base': cfg['app_base']}))
         return 0
 
     outdir = args.outdir or os.path.join(REPO, 'obj', 'renode')
@@ -2516,8 +2521,10 @@ def main():
 
     for c in args.commands:
         setup += '; %s' % c
-    cmd = [find_renode(args.renode), '--disable-xwt', '--console',
-           '-e', setup]
+    console = (['--port', str(args.monitor_port)] if args.monitor_port
+               else ['--console'])
+    cmd = [find_renode(args.renode), '--disable-xwt'] + console + [
+        '-e', setup]
     call_args = {'env': renode_env()}
     if args.cpusel is not None:
         # Apply affinity in the forked child immediately before exec. The

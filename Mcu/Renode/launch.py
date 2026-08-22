@@ -19,6 +19,11 @@ built for the target's signal pin (a PA2 bootloader on a PB4 target
 answers nothing), so the list only offers AM32_<MCU>_BOOTLOADER_<PIN>*
 builds from the bootloader repo's obj directory.
 
+The Renode monitor is served on a telnet port and polled once a
+second, so the status panel shows the live PC (labelled when it is
+executing inside the bootloader), the emulation speed against real
+time, the retired instruction rate and the machine's virtual time.
+
 with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
@@ -55,6 +60,99 @@ FAMILY_MCU = {
 
 SITL_MAGIC = 0x4453
 STATE_MAGIC = 0x5353
+
+# -- Renode telnet monitor, for live PC / speedup metrics --------------
+# (the same approach as ArduPilot's Renode launcher: poll the monitor
+# once a second and derive realtime speed from virtual-vs-wall deltas)
+
+ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+PROMPT_RE = re.compile(r'\([^)]+\)\s*$')
+METRICS_COMMAND = (
+    'cpu PC; cpu PerformanceInMips; cpu ExecutedInstructions; '
+    'emulation GetTimeSourceInfo'
+)
+
+
+def parse_elapsed(value):
+    '''Renode's [days.]HH:MM:SS.s elapsed-time format, in seconds'''
+    fields = value.strip().split(':')
+    if len(fields) != 3:
+        raise ValueError('bad elapsed time %s' % value)
+    days = 0
+    hours = fields[0]
+    if '.' in hours:
+        days_text, hours = hours.split('.', 1)
+        days = int(days_text)
+    return (days * 86400 + int(hours) * 3600 + int(fields[1]) * 60 +
+            float(fields[2]))
+
+
+def clean_monitor_text(data):
+    text = data.decode('utf-8', errors='replace')
+    text = ANSI_RE.sub('', text).replace('\r', '')
+    # telnet negotiation bytes decode as replacement characters
+    return text.replace('\ufffd', '')
+
+
+def parse_metrics(text):
+    values = re.findall(r'(?m)^\s*(0x[0-9A-Fa-f]+)\s*$', text)
+    virtual = re.search(r'(?m)^Elapsed Virtual Time:\s*(\S+)\s*$', text)
+    host = re.search(r'(?m)^Elapsed Host Time:\s*(\S+)\s*$', text)
+    if len(values) < 3 or virtual is None or host is None:
+        raise ValueError('incomplete Renode monitor metrics')
+    return {
+        'pc': int(values[0], 16),
+        'mips': int(values[1], 16),
+        'instructions': int(values[2], 16),
+        'virtual_seconds': parse_elapsed(virtual.group(1)),
+    }
+
+
+class MonitorClient:
+    '''small, single-threaded client for Renode's telnet monitor'''
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sock = None
+
+    def connect(self, timeout=45):
+        self.close()
+        self.sock = socket.create_connection((self.host, self.port),
+                                             timeout=2)
+        self.sock.settimeout(0.5)
+        self._read_to_prompt(timeout)
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def command(self, command, timeout=5):
+        if self.sock is None:
+            raise OSError('monitor is not connected')
+        self.sock.sendall((command + '\n').encode('ascii'))
+        return self._read_to_prompt(timeout, expected=command)
+
+    def _read_to_prompt(self, timeout, expected=None):
+        deadline = time.monotonic() + timeout
+        data = bytearray()
+        while time.monotonic() < deadline:
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise OSError('Renode monitor disconnected')
+            data.extend(chunk)
+            text = clean_monitor_text(data)
+            if ((expected is None or expected in text) and
+                    PROMPT_RE.search(text)):
+                return text
+        raise TimeoutError('timed out waiting for the Renode monitor')
 
 
 def bootloader_dirs(explicit=None):
@@ -179,6 +277,8 @@ class Lab(object):
         self.bootloader = 'auto'          # auto | none | path
         self.firmware = 'auto'            # auto | none | path
         self.eeprom = 'defaults'          # defaults | blank
+        self.metrics = None               # latest monitor sample
+        self.generation = 0               # invalidates old pollers
         self.conf = 'serial'              # off | serial | usb
         self.protocol = '4way'            # 4way | direct
         self.can_bus = 0
@@ -231,13 +331,16 @@ class Lab(object):
     # -- lifecycle -----------------------------------------------------
 
     @staticmethod
-    def wait_port_free(port, timeout=8.0):
-        '''wait for a UDP port to be bindable; the previous emulator's
+    def wait_port_free(port, timeout=8.0, tcp=False):
+        '''wait for a port to be bindable; the previous emulator's
         teardown can outlive the Stop click by a moment'''
         deadline = time.time() + timeout
         while True:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s = socket.socket(socket.AF_INET,
+                              socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM)
             try:
+                if tcp:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(('127.0.0.1', port))
                 return True
             except OSError:
@@ -256,13 +359,17 @@ class Lab(object):
             if not self.wait_port_free(port):
                 return ('udp port %u is still in use - a leftover emulator? '
                         'try: pkill -f renode' % port)
+        if not self.wait_port_free(self.args.monitor_port, tcp=True):
+            return ('monitor port %u is still in use - a leftover emulator? '
+                    'try: pkill -f renode' % self.args.monitor_port)
         bl = self.pick_bootloader()
         if isinstance(bl, str) and not os.path.isfile(bl):
             return bl
         cmd = [sys.executable, os.path.join(HERE, 'gen_target.py'),
                self.target, '--link',
                '--gui-port', str(self.args.gui_port),
-               '--gui-state-port', str(self.args.state_port)]
+               '--gui-state-port', str(self.args.state_port),
+               '--monitor-port', str(self.args.monitor_port)]
         if bl is not None:
             cmd += ['--bootloader-elf', bl]
         if self.firmware == 'none':
@@ -305,6 +412,9 @@ class Lab(object):
             if not self.status.startswith('emulator exited'):
                 self.status = 'emulator did not come up'
             return
+        self.generation += 1
+        threading.Thread(target=self._metrics_loop,
+                         args=(self.generation,), daemon=True).start()
         if bl is not None:
             self._enter_bootloader()
         if self.conf == 'off':
@@ -330,6 +440,76 @@ class Lab(object):
         finally:
             s.close()
         self.log('holding the signal wire; ESC reset into the bootloader')
+
+    def _metrics_loop(self, generation):
+        '''poll the Renode monitor for PC and timing, and derive the
+        realtime speedup from virtual-vs-wall deltas over a sliding
+        window (Renode advances in bursts, so an instant ratio just
+        flaps around the true speed)'''
+        client = MonitorClient('127.0.0.1', self.args.monitor_port)
+        history = []
+        try:
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline:
+                if generation != self.generation or not self.runner.running():
+                    return
+                try:
+                    client.connect()
+                    break
+                except (OSError, TimeoutError):
+                    client.close()
+                    time.sleep(0.5)
+            else:
+                self.log_q.put(('__monitor_error__', generation,
+                                'monitor did not become ready'))
+                return
+            while generation == self.generation and self.runner.running():
+                try:
+                    current = parse_metrics(client.command(
+                        METRICS_COMMAND, timeout=60 if not history else 5))
+                except (OSError, TimeoutError, ValueError) as error:
+                    self.log_q.put(('__monitor_error__', generation,
+                                    str(error)))
+                    return
+                current['wall_seconds'] = time.monotonic()
+                history.append(current)
+                while (len(history) > 2 and current['wall_seconds']
+                        - history[1]['wall_seconds'] >= 8):
+                    history.pop(0)
+                if len(history) > 1:
+                    base = history[0]
+                    wall = current['wall_seconds'] - base['wall_seconds']
+                    virtual = (current['virtual_seconds']
+                               - base['virtual_seconds'])
+                    executed = (current['instructions']
+                                - base['instructions'])
+                    if wall > 0 and virtual >= 0:
+                        current['speedup'] = virtual / wall
+                        current['executed_mips'] = executed / wall / 1e6
+                self.log_q.put(('__metrics__', generation, current))
+                time.sleep(1)
+        finally:
+            client.close()
+
+    def format_metrics(self):
+        '''one status line: PC (with the flash region it is executing
+        from), realtime speedup, executed MIPS and virtual time'''
+        m = self.metrics
+        if m is None:
+            return ''
+        where = ''
+        app_base = (self.info or {}).get('app_base')
+        if app_base:
+            flash_base = 0x08000000 if app_base >= 0x08000000 else 0
+            if flash_base <= m['pc'] < app_base:
+                where = ' (bootloader)'
+        parts = ['PC 0x%08X%s' % (m['pc'], where)]
+        if m.get('speedup') is not None:
+            parts.append('%.2fx realtime' % m['speedup'])
+        if m.get('executed_mips') is not None:
+            parts.append('%.0f of %u MIPS' % (m['executed_mips'], m['mips']))
+        parts.append('vt %.1fs' % m['virtual_seconds'])
+        return ' | '.join(parts)
 
     def _start_stub(self):
         import msp_stub_fc
@@ -370,6 +550,8 @@ class Lab(object):
         self.log(self.status)
 
     def stop(self):
+        self.generation += 1
+        self.metrics = None
         if self.stub is not None:
             self.stub.close()
             self.stub = None
@@ -431,6 +613,9 @@ def main():
                     help='emulator input port (default off the SITL\'s '
                          '57733, so both can run)')
     ap.add_argument('--state-port', type=int, default=57834)
+    ap.add_argument('--monitor-port', type=int, default=57835,
+                    help='Renode telnet monitor port, polled for the live '
+                         'PC / speedup display')
     ap.add_argument('--bootloader-dir', default=None,
                     help='directory of bootloader ELFs (default: the '
                          'bootloader repo next to this one, or '
@@ -611,11 +796,19 @@ def main():
     status_label = QLabel('stopped')
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     grid.addWidget(status_label, 8, 0, 1, 2)
+    metrics_label = QLabel('')
+    metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    metrics_label.setToolTip(
+        'Live from the Renode monitor: current PC (labelled when it is\n'
+        'executing the bootloader), emulation speed against real time,\n'
+        'instructions actually retired per wall second against the\n'
+        "configured PerformanceInMips, and the machine's virtual time.")
+    grid.addWidget(metrics_label, 9, 0, 1, 4)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 9, 0, 1, 4)
+    grid.addWidget(log_view, 10, 0, 1, 4)
 
     def do_start():
         lab.firmware = fw_combo.currentData() or 'auto'
@@ -648,6 +841,14 @@ def main():
                 item = lab.log_q.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, tuple) and item[0] == '__metrics__':
+                if item[1] == lab.generation:
+                    lab.metrics = item[2]
+                continue
+            if isinstance(item, tuple) and item[0] == '__monitor_error__':
+                if item[1] == lab.generation:
+                    lines.append('[monitor] %s' % item[2])
+                continue
             if isinstance(item, tuple) and item[0] == '__target__':
                 _tag, t, info = item
                 if t != target_combo.currentText():
@@ -668,6 +869,7 @@ def main():
         if lines:
             log_view.appendPlainText('\n'.join(lines))
         status_label.setText(lab.status)
+        metrics_label.setText(lab.format_metrics())
 
     timer = QTimer()
     timer.timeout.connect(drain_log)
@@ -745,9 +947,11 @@ def main():
             do_stop()
             return 'OK'
         if cmd == 'status':
-            return 'STATUS %s | port=%s | emulator=%s' % (
+            extra = lab.format_metrics()
+            return 'STATUS %s | port=%s | emulator=%s%s' % (
                 lab.status, lab.conf_port,
-                'up' if lab.emulator_ready else 'down')
+                'up' if lab.emulator_ready else 'down',
+                ' | ' + extra if extra else '')
         if cmd == 'quit':
             QTimer.singleShot(100, app.quit)
             return 'OK'
