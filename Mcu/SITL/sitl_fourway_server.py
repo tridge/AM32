@@ -261,7 +261,15 @@ class FourWayServer(object):
             size = (params[0] or 256) if params else 256
             data = None
             if self.target in self.connected:
-                data = self._client(self.target).read_flash(size, addr16=address)
+                # one internal retry: a bit-banged wire drops the odd
+                # frame (a real FC's passthrough retries too), and the
+                # bootloader recovers to its receive state on its own
+                for _ in range(2):
+                    data = self._client(self.target).read_flash(size,
+                                                                addr16=address)
+                    if data is not None:
+                        break
+                    self.log('read 0x%04x failed, retrying' % address)
             if data is None:
                 return self._reply(cmd, address, [0], ACK_D_GENERAL_ERROR)
             return self._reply(cmd, address, data, ACK_OK)
@@ -269,7 +277,12 @@ class FourWayServer(object):
         if cmd in (CMD_DEVICE_WRITE, CMD_DEVICE_WRITE_EEPROM):
             ok = False
             if self.target in self.connected and params:
-                ok = self._client(self.target).write(address, bytes(params))
+                for _ in range(2):
+                    ok = self._client(self.target).write(address,
+                                                         bytes(params))
+                    if ok:
+                        break
+                    self.log('write 0x%04x failed, retrying' % address)
             return self._reply(cmd, address, [0],
                                ACK_OK if ok else ACK_D_GENERAL_ERROR)
 

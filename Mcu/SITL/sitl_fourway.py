@@ -23,10 +23,20 @@ magic addresses for CMD_SET_ADDRESS (protocol v2+):
   0x20 eeprom, 0x21 filename, 0x22 continue-from-last, 0x23 devinfo
 '''
 
+import os
 import struct
 import time
 
 import sitl_dshot as sd
+
+# AM32_FW_DEBUG=1 traces every 1-wire transaction outcome to stderr
+_DEBUG = os.environ.get('AM32_FW_DEBUG') == '1'
+
+
+def _dbg(msg):
+    if _DEBUG:
+        import sys
+        print('FW: %s' % msg, file=sys.stderr, flush=True)
 
 ACK_OK = 0x30
 ACK_BAD_CMD = 0xC1
@@ -115,15 +125,19 @@ class FourWay(object):
         self.address_shift = info['address_shift']
         return info
 
-    def _ack(self, timeout=2.0):
+    def _ack(self, timeout=2.0, what=''):
         r = self.port.read_serial(1, timeout=timeout)
-        return r[0] if len(r) == 1 else None
+        ack = r[0] if len(r) == 1 else None
+        if ack != ACK_OK:
+            _dbg('%s ack=%s' % (what, ('0x%02x' % ack) if ack is not None
+                                else 'TIMEOUT'))
+        return ack
 
     def set_address(self, addr16, timeout=2.0):
         frame = with_crc(struct.pack('>BBH', CMD_SET_ADDRESS, 0, addr16))
         self.port.flush_serial()
         self.port.send_serial(frame)
-        return self._ack(timeout) == ACK_OK
+        return self._ack(timeout, 'set_address') == ACK_OK
 
     def set_buffer(self, payload, timeout=2.0):
         '''CMD_SET_BUFFER + payload upload (no ack after the command
@@ -138,12 +152,12 @@ class FourWay(object):
         # command frame first, as the inter-command latency does on a
         # real serial adapter
         self.port.send_serial(with_crc(payload), gap=True)
-        return self._ack(timeout) == ACK_OK
+        return self._ack(timeout, 'set_buffer') == ACK_OK
 
     def prog_flash(self, timeout=4.0):
         self.port.flush_serial()
         self.port.send_serial(with_crc(bytes([CMD_PROG_FLASH, 0])))
-        return self._ack(timeout) == ACK_OK
+        return self._ack(timeout, 'prog_flash') == ACK_OK
 
     def write(self, addr16, payload, timeout=4.0):
         '''write payload at the (16 bit, shifted) protocol address'''

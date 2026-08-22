@@ -68,9 +68,15 @@ def bootloader_dirs(explicit=None):
     return [d for d in cands if os.path.isdir(d)]
 
 
-def find_bootloaders(family, pin, dirs):
-    '''bootloader ELFs built for this target's MCU and signal pin,
-    CAN builds first so a DroneCAN target defaults to one'''
+def find_bootloaders(family, pin, dirs, dronecan=False):
+    '''bootloader ELFs built for this target's MCU and signal pin.
+
+    Ordered so the first entry is the right default: the CAN build for a
+    DroneCAN target, the plain default-flash build otherwise. Loading a
+    CAN (128K) bootloader on a 64K non-CAN target answers the wire but
+    puts the eeprom where neither the firmware nor the configurator
+    expects it, so the ordering is load-bearing.
+    '''
     mcu = FAMILY_MCU.get(family)
     if mcu is None:
         return []
@@ -83,9 +89,16 @@ def find_bootloaders(family, pin, dirs):
     for h in sorted(hits):
         var = re.sub(r'_V\d+\.elf$', '', os.path.basename(h))
         byvar[var] = h
-    out = sorted(byvar.values(),
-                 key=lambda p: ('_CAN_' not in os.path.basename(p), p))
-    return out
+
+    def rank(path):
+        name = os.path.basename(path)
+        is_can = '_CAN_' in name
+        is_sized = re.search(r'_\d+K_', name) is not None
+        if dronecan:
+            return (0 if is_can else 1, name)
+        # plain default-flash first, size variants next, CAN last
+        return ((2 if is_can else (1 if is_sized else 0)), name)
+    return sorted(byvar.values(), key=rank)
 
 
 class ProcRunner(object):
@@ -176,7 +189,7 @@ class Lab(object):
         if self.info is None:
             return []
         return find_bootloaders(self.info['family'], self.info['pin'],
-                                self.bl_dirs)
+                                self.bl_dirs, self.info['dronecan'])
 
     def pick_bootloader(self):
         '''the ELF to load, or None for app-only, or an error string'''
@@ -192,10 +205,6 @@ class Lab(object):
                     'bootloader repo or Browse to it'
                     % (FAMILY_MCU.get(self.info['family'], '?'),
                        self.info['pin']))
-        if self.info['dronecan']:
-            can = [h for h in hits if '_CAN_' in os.path.basename(h)]
-            if can:
-                return can[0]
         return hits[0]
 
     # -- lifecycle -----------------------------------------------------
