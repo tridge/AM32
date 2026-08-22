@@ -162,6 +162,12 @@ def report_link(res, target, motor, bidir=True):
           8.0 < a.get('vbus', 0) < 30.0, 'vbus=%.2fV' % a.get('vbus', 0))
     check('does not spin unarmed', a.get('sim_rpm', 1) < 1.0,
           'rpm=%.0f' % a.get('sim_rpm', -1))
+    check('the motor audio stream delivers physics samples',
+          res.get('audio_samples', 0) > 1000,
+          'samples=%d' % res.get('audio_samples', 0))
+    check('the motor audio stream carries a non-silent signal',
+          res.get('audio_peak', 0) > 1e-6,
+          'peak=%g' % res.get('audio_peak', 0))
 
     rpm = s.get('sim_rpm', 0)
     want = expected(target)
@@ -306,7 +312,8 @@ def run(renode, target_resc, elf, eeprom, model, so, syms, scratch,
             'quit',
             '']))
 
-    cmd = [renode, '--disable-xwt', '--console', '-e', 'include @%s' % resc]
+    cmd = [renode, '--config', os.path.join(scratch, 'renode-config'),
+           '--disable-xwt', '--console', '-e', 'include @%s' % resc]
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=900,
@@ -346,7 +353,7 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
        wall clock, so it holds the same throttle for the same emulated
        interval as the scripted tests however slowly the host runs.
        `seconds` is only a backstop.'''
-    from sitl_gui_backend import DshotPanel, SimStream
+    from sitl_gui_backend import AudioStream, DshotPanel, SimStream
     import sitl_dshot as sd
 
     proc = start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
@@ -358,7 +365,7 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
     tail = collections.deque(maxlen=40)
     threading.Thread(target=drain, args=(proc, tail), daemon=True).start()
 
-    ds = sim = None
+    ds = sim = audio = None
     try:
         deadline = time.time() + seconds
         ds = DshotPanel('127.0.0.1', port)
@@ -369,6 +376,7 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
         ds.enabled = True
         sim = SimStream('127.0.0.1', state_port, period_us=1000)
         sim.enabled = True
+        audio = AudioStream('127.0.0.1', state_port)
 
         # the readiness check as well as the first timestamp: samples only
         # flow once the state port is open and the physics has started
@@ -429,9 +437,14 @@ def run_link(renode, target_resc, elf, eeprom, model, so, scratch,
             check('the link paces a fast emulator to realtime', True,
                   'unpaced %.3fx cannot demonstrate a 1x cap; not asserted'
                   % free)
-        return {'armed': armed, 'spin': spin}
+        audio_batches = audio.take_batches()
+        audio_samples = sum(len(vals) for _, vals in audio_batches)
+        audio_peak = max((abs(v) for _, vals in audio_batches for v in vals),
+                         default=0.0)
+        return {'armed': armed, 'spin': spin,
+                'audio_samples': audio_samples, 'audio_peak': audio_peak}
     finally:
-        for c in (ds, sim):
+        for c in (ds, sim, audio):
             if c is not None:
                 c.running = False
         proc.terminate()
@@ -766,7 +779,8 @@ def start_renode(renode, target_resc, elf, eeprom, model, so, scratch,
     # stdin stays open: the monitor treats EOF as "quit", and this run has
     # to outlive the command that started it
     return subprocess.Popen(
-        [renode, '--disable-xwt', '--console', '-e', 'include @%s' % resc],
+        [renode, '--config', os.path.join(scratch, 'renode-link-config'),
+         '--disable-xwt', '--console', '-e', 'include @%s' % resc],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, env=gen_target.renode_env())
 

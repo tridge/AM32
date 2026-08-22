@@ -183,6 +183,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             capture = null;
             lastReplyCount = 0;
             batchCount = 0;
+            audioBatchCount = 0;
             // the generator is reset too, so the next setpoint has to
             // start it driving again
             driving = false;
@@ -508,6 +509,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                               + "fast as it can");
                     }
                     break;
+                case 4: // physics motor audio
+                    if(!audioSubscribed || !c.From.Equals(audioTo))
+                    {
+                        audioBatchCount = 0;
+                        am32sim_set_audio(0);
+                    }
+                    audioTo = c.From;
+                    audioSubscribed = true;
+                    audioSubscribeMs = Environment.TickCount;
+                    am32sim_set_audio(1);
+                    UpdateTickPeriod();
+                    break;
                 case 8: // variable watch subscribe. Same command number,
                     // reply and data format as the SITL's state port, but
                     // the entries carry (u8 size, u32 address) instead of
@@ -552,9 +565,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     break;
                 default:
-                    // 3 and 4 are the tone and audio streams, which have no
-                    // source here: the SITL derives them from its own fake
-                    // timer, and TIM1 beeps are not modelled
+                    // cmd 3 is the synthesized tone stream. It has no source
+                    // here because the SITL derives it from its fake output
+                    // timer, and Renode does not model TIM1 beeps yet.
                     break;
                 }
             }
@@ -567,12 +580,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // batch would only resample the same state.
         private void SetSamplePeriod(uint us, bool averaged)
         {
-            tick.Limit = Math.Max(20u, Math.Min(us, 100000u));
+            sampleTickUs = Math.Max(20u, Math.Min(us, 100000u));
             if(averaged != averaging)
             {
                 averaging = averaged;
                 am32sim_set_averaging(averaged ? 1 : 0);
             }
+            UpdateTickPeriod();
+        }
+
+        private void UpdateTickPeriod()
+        {
+            var limit = subscribed ? sampleTickUs : IdleTickUs;
+            if(audioSubscribed)
+            {
+                limit = Math.Min(limit, AudioTickUs);
+            }
+            tick.Limit = limit;
         }
 
         private void SampleState()
@@ -590,7 +614,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     averaging = false;
                     am32sim_set_averaging(0);
                 }
-                tick.Limit = IdleTickUs;
+                UpdateTickPeriod();
                 return;
             }
 
@@ -646,6 +670,66 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 batchCount = 0;
                 lastFlushNs = nowNs;
             }
+        }
+
+        private void SampleMotorAudio()
+        {
+            if(!audioSubscribed || bridge == null || !bridge.Started)
+            {
+                return;
+            }
+            if(Environment.TickCount - audioSubscribeMs > SubscriberTimeoutMs)
+            {
+                audioSubscribed = false;
+                audioBatchCount = 0;
+                am32sim_set_audio(0);
+                UpdateTickPeriod();
+                return;
+            }
+
+            var count = am32sim_take_audio(audioSamples, audioTimes,
+                                           AudioBatchSamples);
+            for(var i = 0; i < count; i++)
+            {
+                // The packet format describes a uniformly sampled run. A
+                // reset or a large emulation jump starts a fresh packet.
+                if(audioBatchCount > 0
+                   && audioTimes[i] - audioLastTimeNs > AudioPeriodNs * 2)
+                {
+                    FlushAudio();
+                }
+                if(audioBatchCount == 0)
+                {
+                    audioBatchStartNs = audioTimes[i];
+                }
+                Array.Copy(BitConverter.GetBytes(audioSamples[i]), 0,
+                           audioBatch, AudioBatchHeader + 4 * audioBatchCount, 4);
+                audioLastTimeNs = audioTimes[i];
+                audioBatchCount++;
+                if(audioBatchCount == AudioBatchSamples)
+                {
+                    FlushAudio();
+                }
+            }
+        }
+
+        private void FlushAudio()
+        {
+            if(audioBatchCount == 0)
+            {
+                return;
+            }
+            audioBatch[0] = (byte)(StateMagicAudio & 0xFF);
+            audioBatch[1] = (byte)(StateMagicAudio >> 8);
+            audioBatch[2] = 1;
+            audioBatch[3] = (byte)audioBatchCount;
+            Array.Copy(BitConverter.GetBytes(audioBatchStartNs), 0,
+                       audioBatch, 4, 8);
+            Array.Copy(BitConverter.GetBytes(AudioPeriodNs), 0,
+                       audioBatch, 12, 4);
+            Send(stateSocket, audioBatch,
+                 AudioBatchHeader + 4 * audioBatchCount, audioTo);
+            audioBatchCount = 0;
         }
 
         // ---- variable watch (state cmd 8) ----
@@ -959,6 +1043,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ApplySetpoint();
             PumpReplies();
             SampleState();
+            SampleMotorAudio();
             WatchStep();
             Pace();
         }
@@ -1038,6 +1123,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private const ushort StateMagicCmd = 0x5353;
         private const ushort StateMagicData = 0x5354;
+        private const ushort StateMagicAudio = 0x5357;
         private const ushort StateMagicReply = 0x5355;
         private const ushort StateMagicEeprom = 0x5358;
         private const ushort StateMagicInfo = 0x5359;
@@ -1054,6 +1140,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int SampleSize = 60;
         private const int BatchHeader = 4;
         private const int BatchSamples = 16;
+        private const uint AudioPeriodNs = 20833;
+        // The native bridge queues 48 samples per millisecond, so draining
+        // at the normal idle rate avoids a separate 50kHz Renode callback.
+        private const uint AudioTickUs = 1000;
+        private const int AudioBatchHeader = 16;
+        private const int AudioBatchSamples = 64;
         // what the tick costs when nobody is watching: enough to keep
         // setpoints and telemetry moving, cheap enough to ignore
         private const uint IdleTickUs = 1000;
@@ -1074,6 +1166,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         [DllImport("am32sim")]
         private static extern int am32sim_take_signals([Out] double[] mean);
         [DllImport("am32sim")]
+        private static extern void am32sim_set_audio(int on);
+        [DllImport("am32sim")]
+        private static extern int am32sim_take_audio(
+            [Out] float[] samples, [Out] ulong[] times, int maxSamples);
+        [DllImport("am32sim")]
         private static extern int am32sim_reload_config(string path);
         [DllImport("am32sim")]
         private static extern void am32sim_get_model(ref double kv, ref int poles);
@@ -1089,6 +1186,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly float[] phaseI = new float[3];
         private readonly float[] phaseV = new float[3];
         private readonly double[] signals = new double[8];
+        private readonly float[] audioSamples = new float[AudioBatchSamples];
+        private readonly ulong[] audioTimes = new ulong[AudioBatchSamples];
+        private readonly byte[] audioBatch =
+            new byte[AudioBatchHeader + 4 * AudioBatchSamples];
 
         private Socket inputSocket;
         private Socket stateSocket;
@@ -1140,6 +1241,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private int subscribeMs;
         private int batchCount;
         private ulong lastFlushNs;
+        private uint sampleTickUs = IdleTickUs;
+        private EndPoint audioTo;
+        private bool audioSubscribed;
+        private int audioSubscribeMs;
+        private int audioBatchCount;
+        private ulong audioBatchStartNs;
+        private ulong audioLastTimeNs;
         private uint lastReplyCount;
 
         // pacing (cmd 2): simulated over wall time to hold, 0 or >1 is

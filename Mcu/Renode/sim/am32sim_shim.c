@@ -57,6 +57,73 @@ static double sig_acc[8];
 static uint32_t sig_n;
 static uint32_t comp_toggles;
 
+/* Physics audio is sampled down here, at the motor model's sub-step rate,
+   rather than from the much slower GUI link tick. This is the same signal
+   and nominal rate as Mcu/SITL/Src/sitl_state.c: torque ripple plus a small
+   phase-current-magnitude contribution, high-pass filtered at about 40Hz. */
+#define AUDIO_RATE_HZ 48000
+#define AUDIO_PERIOD_NS (1000000000ULL / AUDIO_RATE_HZ)
+#define AUDIO_CURRENT_WEIGHT 0.02
+#define AUDIO_HPF_A 0.9948
+#define AUDIO_QUEUE_SIZE 1024
+
+static bool audio_enabled;
+static double audio_acc[2];
+static uint32_t audio_acc_n;
+static double audio_hp_y[2], audio_hp_x[2];
+static uint64_t audio_next_ns;
+static float audio_queue[AUDIO_QUEUE_SIZE];
+static uint64_t audio_time_queue[AUDIO_QUEUE_SIZE];
+static uint32_t audio_queue_read, audio_queue_count;
+
+static void audio_reset(void)
+{
+    memset(audio_acc, 0, sizeof(audio_acc));
+    memset(audio_hp_y, 0, sizeof(audio_hp_y));
+    memset(audio_hp_x, 0, sizeof(audio_hp_x));
+    audio_acc_n = 0;
+    audio_next_ns = 0;
+    audio_queue_read = 0;
+    audio_queue_count = 0;
+}
+
+static void audio_step(uint64_t now_ns)
+{
+    if (!audio_enabled) {
+        return;
+    }
+    motor_add_audio(audio_acc);
+    audio_acc_n++;
+    if (now_ns < audio_next_ns) {
+        return;
+    }
+    audio_next_ns = now_ns + AUDIO_PERIOD_NS;
+
+    double sample = 0;
+    for (int k = 0; k < 2; k++) {
+        const double x = audio_acc[k] / audio_acc_n;
+        audio_hp_y[k] = AUDIO_HPF_A * (audio_hp_y[k] + x - audio_hp_x[k]);
+        audio_hp_x[k] = x;
+        sample += k == 0 ? audio_hp_y[k]
+                         : AUDIO_CURRENT_WEIGHT * audio_hp_y[k];
+    }
+    audio_acc[0] = audio_acc[1] = 0;
+    audio_acc_n = 0;
+
+    /* The GUI link normally drains this one sample at a time. Keep a ring
+       so a busy host or a paced emulation does not turn scheduling jitter
+       into missing audio. On overflow, discard the oldest sample. */
+    if (audio_queue_count == AUDIO_QUEUE_SIZE) {
+        audio_queue_read = (audio_queue_read + 1) % AUDIO_QUEUE_SIZE;
+        audio_queue_count--;
+    }
+    const uint32_t write = (audio_queue_read + audio_queue_count)
+                         % AUDIO_QUEUE_SIZE;
+    audio_queue[write] = (float)sample;
+    audio_time_queue[write] = now_ns;
+    audio_queue_count++;
+}
+
 uint64_t sitl_time_ns(void) { return st.now_ns; }
 
 /*
@@ -119,6 +186,7 @@ int am32sim_init(const char* config_path)
     sitl_config_init(argc, argv);
     motor_init();
     memset(&st, 0, sizeof(st));
+    audio_reset();
     st.tick_ps = 20833; /* 48MHz, PSC=0, until Renode says otherwise */
     return 0;
 }
@@ -191,6 +259,7 @@ int am32sim_advance(uint64_t now_ns, int driven)
         }
         const uint8_t comp_before = sitl_comp_out;
         motor_step(st.now_ns, dt);
+        audio_step(st.now_ns);
         if (sitl_comp_out != comp_before) {
             comp_toggles++;
         }
@@ -269,6 +338,34 @@ int am32sim_take_signals(double out[8])
     memset(sig_acc, 0, sizeof(sig_acc));
     sig_n = 0;
     return 1;
+}
+
+void am32sim_set_audio(int on)
+{
+    const bool enable = on != 0;
+    if (enable != audio_enabled) {
+        audio_enabled = enable;
+        audio_reset();
+    }
+}
+
+/* Drain up to max_samples physics-audio samples. Their individual times are
+   returned because a long emulation jump can introduce a discontinuity;
+   the C# packetizer splits such a run rather than claiming it is uniform. */
+int am32sim_take_audio(float out[], uint64_t times[], int max_samples)
+{
+    if (max_samples <= 0) {
+        return 0;
+    }
+    int n = 0;
+    while (audio_queue_count && n < max_samples) {
+        out[n] = audio_queue[audio_queue_read];
+        times[n] = audio_time_queue[audio_queue_read];
+        audio_queue_read = (audio_queue_read + 1) % AUDIO_QUEUE_SIZE;
+        audio_queue_count--;
+        n++;
+    }
+    return n;
 }
 
 /* runtime motor swap, as the SITL's state port cmd 1 does it */
