@@ -105,8 +105,15 @@ class DirectBridge(object):
     no 4-way - the raw 19200 baud bootloader protocol. TX and RX share
     the wire on such an adapter, so the client reads its own
     transmission back; both configurators' direct modes strip that
-    echo. The wire idles high, keeping the bootloader resident across
-    ESC resets."""
+    echo. The echo is released at wire pace, not on receipt: the client
+    only moves on once its bytes have actually left the wire, and the
+    bootloader ends a command frame on line idle, so an instant echo
+    lets the client run its next command seamlessly into the previous
+    frame and nothing ever parses. The wire idles high, keeping the
+    bootloader resident across ESC resets."""
+
+    BAUD = 19200.0
+    GAP_S = 0.001                 # FLAG_GAP's leading line idle
 
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
                  endpoint=None, verbose=False, trace=False):
@@ -115,6 +122,7 @@ class DirectBridge(object):
         self.port = sd.InputPort(sitl_host, sitl_port)
         self.ep = endpoint if endpoint is not None else PtyEndpoint()
         self.running = True
+        self.wire_free = 0.0      # when the queued TX will have left
         self.port.send_level(1)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -130,14 +138,33 @@ class DirectBridge(object):
               file=sys.stderr, flush=True)
 
     def _loop(self):
+        echoes = []               # (due, bytes) awaiting their wire time
         while self.running:
-            chunk = self.ep.read(0.02)
+            timeout = 0.02
+            if echoes:
+                timeout = max(0.0, min(timeout,
+                                       echoes[0][0] - time.time()))
+            chunk = self.ep.read(timeout)
+            now = time.time()
             if chunk:
                 self._trace('rx', chunk)
-                # the self-echo first: on the real adapter it is on the
-                # client's RX before any reply can be
-                self.ep.write(chunk)
-                self.port.send_serial(chunk, idle_high=True)
+                # Frame separation as the wire itself would show it: a
+                # chunk arriving on an idle wire begins a new command
+                # and gets the idle gap the bootloader needs to end the
+                # previous frame; one arriving while bytes are still
+                # going out continues the frame (a USB packet split
+                # mid-command must not be torn apart).
+                gap = now >= self.wire_free
+                if gap:
+                    self.wire_free = now + self.GAP_S
+                self.port.send_serial(chunk, idle_high=True, gap=gap)
+                self.wire_free = (max(self.wire_free, now)
+                                  + len(chunk) * 10.0 / self.BAUD)
+                echoes.append((self.wire_free, chunk))
+            while echoes and echoes[0][0] <= now:
+                _due, data = echoes.pop(0)
+                self._trace('echo', data)
+                self.ep.write(data)
             out = self.port.drain_serial()
             if out:
                 self._trace('tx', out)
