@@ -13,6 +13,12 @@ MSP_SET_PASSTHROUGH switches the link into 4-way mode
 write the settings and flash of a SITL running with --bootloader, the
 same way it would through a real flight controller.
 
+With --direct it is a single-wire adapter on the ESC signal pad
+instead of a flight controller: the raw 19200 baud bootloader protocol
+with the adapter's self-echo, which is how both configurators' direct
+modes expect the wire to behave. The line is held idle-high, so the
+bootloader stays resident across ESC resets.
+
 Serves MSP on a pty by default (Linux/macOS only), printing the slave
 device path to hand to --port. With --usbip it serves on a virtual USB
 serial device instead (sitl_usbip.py), which enumerates as a real
@@ -43,6 +49,12 @@ MSP_MOTOR_TELEMETRY = 139
 MSP_BATTERY_STATE = 130
 MSP_SET_MOTOR = 214
 MSP_SET_PASSTHROUGH = 245
+
+# USB identity for --direct: a vendor id the web configurator treats as
+# a direct single-wire adapter (WCH), with a product id no kernel
+# vendor driver claims, so cdc_acm keeps the port
+DIRECT_VENDOR_ID = 0x1A86
+DIRECT_PRODUCT_ID = 0x0001
 
 
 class PtyEndpoint(object):
@@ -85,6 +97,57 @@ class PtyEndpoint(object):
             os.close(self.slave)
         except OSError:
             pass
+
+
+class DirectBridge(object):
+    """the serial link wired straight to the ESC's signal pad, the way a
+    single-wire USB adapter presents it: no flight controller, no MSP,
+    no 4-way - the raw 19200 baud bootloader protocol. TX and RX share
+    the wire on such an adapter, so the client reads its own
+    transmission back; both configurators' direct modes strip that
+    echo. The wire idles high, keeping the bootloader resident across
+    ESC resets."""
+
+    def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
+                 endpoint=None, verbose=False, trace=False):
+        self.verbose = verbose
+        self.tracing = trace or os.environ.get('AM32_FC_TRACE') == '1'
+        self.port = sd.InputPort(sitl_host, sitl_port)
+        self.ep = endpoint if endpoint is not None else PtyEndpoint()
+        self.running = True
+        self.port.send_level(1)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    @property
+    def slave_path(self):
+        return self.ep.path
+
+    def _trace(self, direction, data):
+        if not self.tracing or not data:
+            return
+        print('DW %s %3u: %s' % (direction, len(data), data.hex(' ')),
+              file=sys.stderr, flush=True)
+
+    def _loop(self):
+        while self.running:
+            chunk = self.ep.read(0.02)
+            if chunk:
+                self._trace('rx', chunk)
+                # the self-echo first: on the real adapter it is on the
+                # client's RX before any reply can be
+                self.ep.write(chunk)
+                self.port.send_serial(chunk, idle_high=True)
+            out = self.port.drain_serial()
+            if out:
+                self._trace('tx', out)
+                self.ep.write(out)
+
+    def close(self):
+        self.running = False
+        self.thread.join(0.5)
+        self.ep.close()
+        self.port.close()
 
 
 class MspStubFC(object):
@@ -363,6 +426,11 @@ def main():
                         help='never reset an ESC that does not answer')
     parser.add_argument('--no-motor', action='store_true',
                         help='do not drive DShot, 4-way and MSP only')
+    parser.add_argument('--direct', action='store_true',
+                        help='be a single-wire adapter on the ESC signal '
+                             'pad instead of a flight controller: raw '
+                             'bootloader protocol with self-echo, no MSP '
+                             'or 4-way')
     parser.add_argument('--usbip', action='store_true',
                         help='serve on a virtual USB serial device instead '
                              'of a pty, so tools that only take USB ports '
@@ -393,18 +461,27 @@ def main():
         def log(msg):
             if args.verbose:
                 print('usbip: %s' % msg, file=sys.stderr, flush=True)
+        ids = ({'vid': DIRECT_VENDOR_ID, 'pid': DIRECT_PRODUCT_ID}
+               if args.direct else {})
         endpoint = sitl_usbip.UsbipServer(unix_path=args.usbip_socket,
                                           port=args.usbip_port,
-                                          serial=args.usbip_serial, log=log)
+                                          serial=args.usbip_serial, log=log,
+                                          **ids)
 
-    stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
-                     poles=args.poles, esc_ports=ports,
-                     state_port=args.state_port,
-                     esc_reset=not args.no_esc_reset,
-                     motor=not args.no_motor, verbose=args.verbose,
-                     endpoint=endpoint, trace=args.trace)
+    if args.direct:
+        stub = DirectBridge(sitl_host=args.host, sitl_port=args.sitl_port,
+                            endpoint=endpoint, verbose=args.verbose,
+                            trace=args.trace)
+    else:
+        stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
+                         poles=args.poles, esc_ports=ports,
+                         state_port=args.state_port,
+                         esc_reset=not args.no_esc_reset,
+                         motor=not args.no_motor, verbose=args.verbose,
+                         endpoint=endpoint, trace=args.trace)
     if args.usbip:
-        print('virtual FC exported on %s' % endpoint.endpoint,
+        print('virtual %s exported on %s'
+              % ('adapter' if args.direct else 'FC', endpoint.endpoint),
               file=sys.stderr, flush=True)
         if args.attach:
             if not sitl_usbip.attach(unix_path=endpoint.unix_path,

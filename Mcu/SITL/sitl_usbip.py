@@ -93,14 +93,15 @@ DEVNUM = 1
 VHCI = '/sys/devices/platform/vhci_hcd.0'
 VDEV_ST_NULL = '004'      # a free port in the status table
 
-DEVICE_DESCRIPTOR = struct.pack(
-    '<BBHBBBBHHHBBBB',
-    18, 1, 0x0200,      # bLength, DEVICE, bcdUSB 2.00
-    0x02, 0x00, 0x00,   # class CDC, no subclass or protocol
-    64,                 # bMaxPacketSize0
-    VENDOR_ID, PRODUCT_ID, 0x0100,
-    1, 2, 3,            # iManufacturer, iProduct, iSerialNumber
-    1)                  # bNumConfigurations
+def device_descriptor(vid, pid):
+    return struct.pack(
+        '<BBHBBBBHHHBBBB',
+        18, 1, 0x0200,      # bLength, DEVICE, bcdUSB 2.00
+        0x02, 0x00, 0x00,   # class CDC, no subclass or protocol
+        64,                 # bMaxPacketSize0
+        vid, pid, 0x0100,
+        1, 2, 3,            # iManufacturer, iProduct, iSerialNumber
+        1)                  # bNumConfigurations
 
 CONFIG_DESCRIPTOR = b''.join([
     struct.pack('<BBHBBBBB', 9, 2, 67, 2, 1, 0, 0xC0, 50),
@@ -163,10 +164,16 @@ class UsbipServer(object):
     '''
 
     def __init__(self, unix_path=None, host='127.0.0.1', port=None,
-                 serial=DEFAULT_SERIAL, log=None, rx_max=65536):
+                 serial=DEFAULT_SERIAL, log=None, rx_max=65536,
+                 vid=VENDOR_ID, pid=PRODUCT_ID):
         self.log = log or (lambda s: None)
         self.rx_max = rx_max
         self.serial = serial
+        # the ids decide more than cosmetics: the web configurator
+        # treats some vendors as direct single-wire adapters rather
+        # than flight controllers
+        self.vid, self.pid = vid, pid
+        self.descriptor = device_descriptor(vid, pid)
         self.strings = [MANUFACTURER, PRODUCT, serial]
         self.rx = b''
         self.rx_lock = threading.Condition()
@@ -361,7 +368,7 @@ class UsbipServer(object):
         return struct.pack('>256s32sIIIHHHBBBBBB',
                            path.encode(), BUSID.encode(),
                            BUSNUM, DEVNUM, SPEED_FULL,
-                           VENDOR_ID, PRODUCT_ID, 0x0100,
+                           self.vid, self.pid, 0x0100,
                            0x02, 0x00, 0x00,   # device class/subclass/proto
                            1, 1, 2)            # config value, configs, ifaces
 
@@ -455,7 +462,7 @@ class UsbipServer(object):
         if recipient_std and request == REQ_GET_DESCRIPTOR:
             dtype, dindex = value >> 8, value & 0xFF
             if dtype == 1:
-                return ST_OK, DEVICE_DESCRIPTOR[:wlength]
+                return ST_OK, self.descriptor[:wlength]
             if dtype == 2:
                 return ST_OK, CONFIG_DESCRIPTOR[:wlength]
             if dtype == 3:
