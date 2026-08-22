@@ -131,16 +131,31 @@ class ProcRunner(object):
     def stop(self):
         if self.proc is None:
             return
+        pgid = self.proc.pid
         if self.proc.poll() is None:
             try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
+                os.killpg(pgid, signal.SIGTERM)
                 try:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                    self.proc.wait()
+                    pass
             except ProcessLookupError:
                 pass
+        # The direct child exiting says nothing about its children:
+        # gen_target dies on SIGTERM in an instant while renode can
+        # linger (and, its stdin gone, spin on the dead console). Sweep
+        # the whole group; a kill of an already-empty group is a no-op.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.2)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         self.proc = None
 
 
@@ -209,11 +224,32 @@ class Lab(object):
 
     # -- lifecycle -----------------------------------------------------
 
+    @staticmethod
+    def wait_port_free(port, timeout=8.0):
+        '''wait for a UDP port to be bindable; the previous emulator's
+        teardown can outlive the Stop click by a moment'''
+        deadline = time.time() + timeout
+        while True:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.bind(('127.0.0.1', port))
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.3)
+            finally:
+                s.close()
+
     def start(self):
         if self.runner.running():
             return 'already running'
         if self.target is None or self.info is None:
             return 'pick a target first'
+        for port in (self.args.gui_port, self.args.state_port):
+            if not self.wait_port_free(port):
+                return ('udp port %u is still in use - a leftover emulator? '
+                        'try: pkill -f renode' % port)
         bl = self.pick_bootloader()
         if isinstance(bl, str) and not os.path.isfile(bl):
             return bl
@@ -232,6 +268,7 @@ class Lab(object):
         if self.args.renode:
             cmd += ['--renode', self.args.renode]
         self.emulator_ready = False
+        self.start_failed = False
         self.conf_port = ''
         self.status = 'starting emulator...'
         self.log('$ ' + ' '.join(cmd))
@@ -245,11 +282,15 @@ class Lab(object):
         configurator side'''
         deadline = time.time() + 120
         while time.time() < deadline and self.runner.running():
-            if self.emulator_ready:
+            if self.emulator_ready or self.start_failed:
                 break
             time.sleep(0.3)
         if not self.emulator_ready:
-            self.status = 'emulator did not come up'
+            # a half-started emulator (a failed port bind still leaves
+            # the machine running) must not linger and block the retry
+            self.runner.stop()
+            if not self.status.startswith('emulator exited'):
+                self.status = 'emulator did not come up'
             return
         if bl is not None:
             self._enter_bootloader()
@@ -320,6 +361,11 @@ class Lab(object):
     def saw_log_line(self, line):
         if 'input port on udp' in line:
             self.emulator_ready = True
+        if 'could not bind the input port' in line:
+            # the machine keeps running without its ports; fail the
+            # start promptly rather than waiting out the ready timeout
+            self.status = 'emulator exited: ' + line.strip()
+            self.start_failed = True
         if line.startswith('[emulator exited'):
             self.emulator_ready = False
             if self.status.startswith('running'):
