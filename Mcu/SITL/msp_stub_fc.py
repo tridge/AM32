@@ -283,16 +283,28 @@ class MspStubFC(object):
         resp = self.fourway.feed(chunk)
         if resp:
             self._trace('tx', resp)
-            # a 4-way client is strictly request/response, so anything
-            # waiting for us now is a retry of the command we just
-            # answered (a 256 byte read is 130ms of 19200 baud wire time,
-            # which is close to the client's timeout). Our one reply
-            # satisfies it; leaving it queued would answer twice and
-            # shift every later response by one.
-            stale = self.ep.drain()
-            if stale and stale != self.fourway.last_request:
-                self._log('discarding %u unexpected bytes' % len(stale))
+            # A slow transaction (a 256 byte flash chunk is ~140ms of
+            # 19200 baud wire time) makes the client retry, and those
+            # retries queue up while we work. Answering each one would
+            # shift every later response by one, so exact duplicates of
+            # the request we just answered are dropped - but ONLY exact
+            # duplicates: a client that timed out and moved on has its
+            # NEXT command queued here, and discarding that starves the
+            # whole session one command at a time.
+            pending = self.ep.drain()
+            dropped = 0
+            last = self.fourway.last_request
+            while last and pending.startswith(last):
+                pending = pending[len(last):]
+                dropped += 1
+            if dropped:
+                self._log('dropped %u retries of the answered command'
+                          % dropped)
             self.ep.write(resp)
+            if pending:
+                self._trace('rx', pending)
+                self._fourway(pending)
+                return
         if self.fourway.exited:
             self._log('4-way interface exited')
             self.in_fourway = False

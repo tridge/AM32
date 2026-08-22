@@ -1709,8 +1709,9 @@ def bootloader_script(cfg, bootloader_elf, lma_segments=None):
         '# The bootloader bit bangs its serial by polling the signal pin',
         '# from the CPU, so wire edges have to reach it inside a bit time.',
         '# The default quantum is twice a 19200 baud bit, which mangles',
-        '# every frame; this is only paid on bootloader runs.',
-        'emulation SetGlobalQuantum "0.000005"',
+        '# every frame; 10us keeps edges well inside half a bit at a',
+        '# quarter of the sync cost of 5us. Only bootloader runs pay it.',
+        'emulation SetGlobalQuantum "0.00001"',
     ]
     if cfg['family'] in ('f051', 'f031'):
         # These Cortex-M0 parts have no VTOR. On hardware initAfterJump()
@@ -2149,6 +2150,12 @@ def main():
                          'this is the cheapest way to buy emulation speed when '
                          'the wire is not what is under test (default 250, '
                          '4kHz)')
+    ap.add_argument('--can-lan', action='store_true',
+                    help='join the multicast CAN bus on the LAN interface '
+                         'as the SITL does, instead of loopback only; a '
+                         'busy bench network reaches every bus number, and '
+                         'foreign CAN traffic makes a CAN bootloader boot '
+                         'the app instead of waiting for a configurator')
     ap.add_argument('--can-bus', type=int, default=0,
                     help='mcast CAN bus number for a DroneCAN target: the '
                          'emulated bxCAN appears on 239.65.82.<N>:57732, '
@@ -2309,6 +2316,8 @@ def main():
     # the emulated ESC on the SITL's multicast CAN bus, where
     # dronecan_gui_tool mcast:N (and the GUI's DroneCAN panel) can see it
     if cfg['dronecan'] and args.can_bus >= 0:
+        if not args.can_lan:
+            setup += '; canmcast LoopbackOnly true'
         setup += '; canmcast Bus %d' % args.can_bus
 
     # status()/watch() at the monitor prompt, since there is no GUI

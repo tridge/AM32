@@ -473,9 +473,14 @@ def main():
     grid.addWidget(QLabel('CAN bus'), 4, 0)
     can_spin = QSpinBox()
     can_spin.setRange(0, 9)
+    can_spin.setValue(8)
     can_spin.setToolTip('mcast bus number for DroneCAN targets '
                         '(239.65.82.N, as the SITL and dronecan_gui_tool '
-                        'use); disabled for targets with no CAN')
+                        'use); disabled for targets with no CAN.\n'
+                        'Defaults off bus 0: CAN traffic from anything '
+                        'else - an ArduPilot SITL, another bench rig - '
+                        'makes the CAN bootloader boot the app instead '
+                        'of waiting for the configurator.')
     can_spin.setEnabled(False)
     grid.addWidget(can_spin, 4, 1)
 

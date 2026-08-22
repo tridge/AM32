@@ -22,6 +22,7 @@ include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_AdvancedTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_BasicTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_FreeRunningTimer.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32L4_Comp.cs
+include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32L4_RCC.cs
 include $repo/Mcu/Renode/peripherals/stm32/AM32_STM32_IWDG.cs
 include $repo/Mcu/Renode/peripherals/common/AM32ThrottleGenerator.cs
 include $repo/Mcu/Renode/peripherals/common/AM32_F051_Bridge.cs

@@ -71,6 +71,10 @@ namespace Antmicro.Renode.Peripherals.CAN
         // run that is not using CAN cannot collide with a real SITL on
         // the same machine. Serialized: reconfiguring while the old
         // receive thread is still draining must not race it.
+        // join and transmit on the loopback interface only, keeping the
+        // bus private to this machine
+        public bool LoopbackOnly { get; set; }
+
         public int Bus
         {
             get { return bus; }
@@ -185,10 +189,21 @@ namespace Antmicro.Renode.Peripherals.CAN
             {
                 // separate transmit socket, so its ephemeral local port
                 // identifies our own datagrams on the receive side
+                var lo = IPAddress.Loopback;
                 tx = new Socket(AddressFamily.InterNetwork,
                                 SocketType.Dgram, ProtocolType.Udp);
                 tx.SetSocketOption(SocketOptionLevel.IP,
                                    SocketOptionName.MulticastTimeToLive, 1);
+                if(LoopbackOnly)
+                {
+                    // multicast out through lo, so the frames never leave
+                    // the machine and LAN traffic on the same group (a
+                    // busy bench network reaches every bus number) never
+                    // reaches the emulated ESC
+                    tx.SetSocketOption(SocketOptionLevel.IP,
+                                       SocketOptionName.MulticastInterface,
+                                       lo.GetAddressBytes());
+                }
                 tx.Connect(new IPEndPoint(group, Port));
 
                 rx = new Socket(AddressFamily.InterNetwork,
@@ -200,7 +215,8 @@ namespace Antmicro.Renode.Peripherals.CAN
                 rx.Bind(new IPEndPoint(group, Port));
                 rx.SetSocketOption(SocketOptionLevel.IP,
                                    SocketOptionName.AddMembership,
-                                   new MulticastOption(group));
+                                   LoopbackOnly ? new MulticastOption(group, lo)
+                                                : new MulticastOption(group));
             }
             catch(SocketException e)
             {
@@ -292,6 +308,15 @@ namespace Antmicro.Renode.Peripherals.CAN
                        && (src.Address.Equals(own.Address)
                            || IPAddress.IsLoopback(src.Address)
                            || IsLocalAddress(src.Address)))
+                    {
+                        continue;
+                    }
+                    // Joining the group on lo does not stop delivery of
+                    // frames another process's membership pulled in from
+                    // the LAN, so a private bus needs a source filter
+                    // too: only this machine's own senders count.
+                    if(LoopbackOnly && !IPAddress.IsLoopback(src.Address)
+                       && !IsLocalAddress(src.Address))
                     {
                         continue;
                     }
