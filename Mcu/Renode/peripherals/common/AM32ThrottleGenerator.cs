@@ -22,6 +22,7 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using System.Collections.Generic;
@@ -143,6 +144,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x08: Protocol = value; break;
             case 0x0C: DshotValue = value; break;
             case 0x10: Bidirectional = value != 0; break;
+            case 0x20: SkipDelay(value); break;
             }
         }
 
@@ -530,6 +532,42 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             set { serialBaud = value == 0 ? DefaultSerialBaud : value; }
         }
 
+        // The bootloader's delayMicroseconds busy-polls the utility
+        // timer's CNT at one native-to-managed transition per four
+        // instructions, which is what makes bootloader serial run
+        // several times slower than its own wire. The generated target
+        // script patches the function to write its argument here and
+        // return; jumping virtual time forward costs one IO access per
+        // delay. (An execution hook on the function was tried first: a
+        // hook fire costs ~2ms of translation machinery, far more than
+        // the busy-wait it replaces.) No interrupt gate: the plain
+        // bootloaders never enable one, and the CAN bootloaders only
+        // queue frames from theirs, so delivery at the end of a skipped
+        // interval instead of part-way through changes nothing.
+        public ulong SkipDelayTimerCnt { get; set; }
+        public ulong SkipDelayElapsedVar { get; set; }
+
+        private void SkipDelay(uint us)
+        {
+            if(us == 0 || !machine.SystemBus.TryGetCurrentCPU(out var icpu)
+               || !(icpu is TranslationCPU tcpu))
+            {
+                return;
+            }
+            tcpu.SkipTime(TimeInterval.FromMicroseconds(us));
+            if(SkipDelayTimerCnt != 0 && SkipDelayElapsedVar != 0)
+            {
+                // the patched-out function stored the timer count in
+                // us_start on entry, and receiveBuffer's inter-byte gap
+                // check measures from it; reproduce the side effect as
+                // of the delay's end
+                var cnt = machine.SystemBus.ReadDoubleWord(
+                    SkipDelayTimerCnt) & 0xFFFFu;
+                machine.SystemBus.WriteWord(
+                    SkipDelayElapsedVar, (ushort)((cnt + us) & 0xFFFF));
+            }
+        }
+
         // the wire is one or the other: a throttle train and a serial
         // session cannot share it, which is true of the hardware too
         private void EnterSerialMode()
@@ -623,7 +661,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             txDriving = true;
+            txDeadlineNs = NowNs();
             SerialStep();
+        }
+
+        private ulong NowNs()
+        {
+            return (ulong)(machine.ElapsedVirtualTime.TimeElapsed
+                           .TotalMicroseconds * 1000.0);
         }
 
         private void SerialStep()
@@ -635,7 +680,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 SerialKick();
                 return;
             }
+            // One timer event per wire EDGE, not per bit: a run of equal
+            // bits is a single level held for run*bitNs. Serial framing
+            // makes runs common (start+zeros, data runs, stop+idle), so
+            // this roughly halves the host callbacks per byte - which is
+            // where an emulated flash spends its time. The next deadline
+            // is computed in virtual time so a late callback (they land
+            // on quantum boundaries) does not stretch the byte.
             bool bit;
+            var run = 0;
             lock(serialSync)
             {
                 if(txBits.Count == 0)
@@ -646,42 +699,94 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return;
                 }
                 bit = txBits.Dequeue();
+                run = 1;
+                while(txBits.Count > 0 && txBits.Peek() == bit)
+                {
+                    txBits.Dequeue();
+                    run++;
+                }
             }
             Connections[0].Set(bit);
-            serialTimer.Limit = SerialBitNs();
+            txDeadlineNs += (ulong)run * SerialBitNs();
+            var now = NowNs();
+            serialTimer.Limit = txDeadlineNs > now ? txDeadlineNs - now : 1;
             serialTimer.Enabled = true;
         }
 
-        // the ESC's start bit: sample the middle of each bit from here
+        // Decode the ESC's reply from its own edges rather than by
+        // sampling every bit centre: the edges arrive as GPIO events
+        // anyway (placed precisely in virtual time by the guest's pin
+        // writes), so the level between two edges decides all the bits
+        // in between and the only timer needed is one per byte, at the
+        // stop bit. This is also more tolerant of the bit-banged
+        // sender's timing than fixed-phase sampling, since every edge
+        // re-anchors the decoding.
         private void SerialRxEdge(bool level)
         {
-            if(rxActive || level || txDriving)
+            var now = NowNs();
+            if(!rxActive)
             {
+                if(level || txDriving)
+                {
+                    return;
+                }
+                RxStart(now);
                 return;
             }
+            var bitNs = SerialBitNs();
+            // which bit boundary this edge lands on, counted from the
+            // start bit's falling edge
+            var k = (int)(((now - rxStartNs) + bitNs / 2) / bitNs);
+            RxFillTo(k - 1);
+            if(k >= 10)
+            {
+                RxFinish();
+                if(!level && !txDriving)
+                {
+                    // the sender ran on into the next byte's start bit
+                    RxStart(now);
+                    return;
+                }
+            }
+            rxLastLevel = level;
+        }
+
+        private void RxStart(ulong now)
+        {
             rxActive = true;
-            rxBit = 0;
+            rxStartNs = now;
             rxByte = 0;
-            rxTimer.Limit = SerialBitNs() + SerialBitNs() / 2;
+            rxFilled = 0;
+            rxLastLevel = false;
+            // fires in the middle of the stop bit
+            rxTimer.Limit = SerialBitNs() * 19 / 2;
             rxTimer.Enabled = true;
         }
 
-        private void SerialRxSample()
+        // bits rxFilled..upto-1 carry the level held since the last edge
+        private void RxFillTo(int upto)
         {
-            if(rxBit < 8)
+            if(upto > 8)
             {
-                if(escLevel)
-                {
-                    rxByte |= (byte)(1 << rxBit);
-                }
-                rxBit++;
-                rxTimer.Limit = SerialBitNs();
-                rxTimer.Enabled = true;
-                return;
+                upto = 8;
             }
-            // the stop bit: a framing error means we mis-tracked the wire,
-            // so drop the byte rather than hand up a corrupt one
-            if(escLevel)
+            while(rxFilled < upto)
+            {
+                if(rxLastLevel)
+                {
+                    rxByte |= (byte)(1 << rxFilled);
+                }
+                rxFilled++;
+            }
+        }
+
+        private void RxFinish()
+        {
+            rxTimer.Enabled = false;
+            RxFillTo(8);
+            // the stop bit is whatever level the wire held after the
+            // last edge; low means we mis-tracked, drop the byte
+            if(rxLastLevel)
             {
                 lock(serialSync)
                 {
@@ -689,6 +794,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
             rxActive = false;
+        }
+
+        // the per-byte timer, in the middle of the stop bit
+        private void SerialRxSample()
+        {
+            if(!rxActive)
+            {
+                return;
+            }
+            RxFinish();
         }
 
         private void DshotStep()
@@ -824,13 +939,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool serialIdleHigh = true;
         private bool txDriving;
         private bool rxActive;
+        private ulong rxStartNs;
+        private int rxFilled;
+        private bool rxLastLevel;
+        private ulong txDeadlineNs;
         private bool reassertPending;
         private const ulong ReassertNs = 20000;   // 20us after a reset
         private const ulong HoldNs = 250000;      // idle level refresh
         private const int EscQuietTicks = 8;      // refreshes to skip after
         private int escQuietTicks;                // the ESC drove the wire
         private bool forcingWire;
-        private int rxBit;
         private byte rxByte;
         private bool high;
         private bool enabled;

@@ -1709,9 +1709,11 @@ def bootloader_script(cfg, bootloader_elf, lma_segments=None):
         '# The bootloader bit bangs its serial by polling the signal pin',
         '# from the CPU, so wire edges have to reach it inside a bit time.',
         '# The default quantum is twice a 19200 baud bit, which mangles',
-        '# every frame; 10us keeps edges well inside half a bit at a',
-        '# quarter of the sync cost of 5us. Only bootloader runs pay it.',
-        'emulation SetGlobalQuantum "0.00001"',
+        '# every frame; 20us stays under the half-bit sampling margin',
+        '# (the wire model schedules by virtual deadline, so timer',
+        '# lateness does not accumulate) at a fraction of the sync cost.',
+        '# Only bootloader runs pay it.',
+        'emulation SetGlobalQuantum "0.00002"',
     ]
     if cfg['family'] in ('f051', 'f031'):
         # These Cortex-M0 parts have no VTOR. On hardware initAfterJump()
@@ -2302,6 +2304,44 @@ def main():
     if not args.no_skip_delays:
         setup += '; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"' % (
             os.path.join(HERE, 'scripts', 'skip_delays.py'))
+        if args.bootloader_elf is not None:
+            # The bootloader's delayMicroseconds busy-polls the utility
+            # timer, and its native-to-managed transition per read is
+            # what makes bootloader serial run ~8x slower than its own
+            # wire; patch it (located in the bootloader ELF: the
+            # application defines the same symbol) to hand the wait to
+            # the throttle peripheral instead. See SkipDelay in
+            # AM32ThrottleGenerator.cs.
+            addrs = symbol_addresses(args.bootloader_elf,
+                                     ('delayMicroseconds', 'us_start'),
+                                     args.nm_bin)
+            # the bootloader's utility timer CNT register: TIM2 on the
+            # STM32s, TMR3 on the AT32s, TIMER16 on the GD32 (see each
+            # family's blutil.h BL_TIMER). Thumb only, so no v203.
+            bl_cnt = {'l431': 0x40000024, 'g431': 0x40000024,
+                      'g071': 0x40000024, 'f031': 0x40000024,
+                      'f051': 0x40000024,
+                      'f415': 0x40000424, 'f421': 0x40000424,
+                      'e230': 0x40014C24}.get(cfg['family'])
+            if ('delayMicroseconds' in addrs and 'us_start' in addrs
+                    and bl_cnt is not None):
+                # patch delayMicroseconds to hand its busy-wait to the
+                # throttle peripheral's skip register (base + 0x20):
+                #   movw r1, #lo ; movt r1, #hi ; str r0, [r1] ; bx lr
+                magic = FAMILY[cfg['family']]['throttle'] + 0x20
+                lo, hi = magic & 0xFFFF, magic >> 16
+                movw = (0xF240 | ((lo >> 11) & 1) << 10 | (lo >> 12) & 0xF,
+                        0x0100 | ((lo >> 8) & 7) << 12 | (lo & 0xFF))
+                movt = (0xF2C0 | ((hi >> 11) & 1) << 10 | (hi >> 12) & 0xF,
+                        0x0100 | ((hi >> 8) & 7) << 12 | (hi & 0xFF))
+                half = movw + movt + (0x6008, 0x4770)
+                fn = addrs['delayMicroseconds'] & ~1
+                setup += ('; throttle SkipDelayTimerCnt 0x%08X'
+                          '; throttle SkipDelayElapsedVar 0x%08X'
+                          % (bl_cnt, addrs['us_start']))
+                for i in range(0, len(half), 2):
+                    setup += ('; sysbus WriteDoubleWord 0x%08X 0x%08X'
+                              % (fn + i * 2, half[i] | half[i + 1] << 16))
 
     # without the physics the bridge never starts and the motor cannot
     # turn, so a bare --run would boot and then look broken
