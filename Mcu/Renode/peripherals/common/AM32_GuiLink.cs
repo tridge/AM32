@@ -416,6 +416,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 return;
             }
+            if(generator.TakeTxDrained())
+            {
+                // an empty serial packet flagged TxDone: the bytes we
+                // were asked to transmit have left the wire. A client
+                // predating the flag drops a zero-length packet, so
+                // this is safe to send unconditionally.
+                var done = new byte[6];
+                Array.Copy(BitConverter.GetBytes(InputMagic), 0, done, 0, 2);
+                done[2] = TypeSerial;
+                done[3] = 0;
+                Array.Copy(BitConverter.GetBytes(FlagTxDone), 0, done, 4, 2);
+                Send(inputSocket, done, done.Length, to);
+            }
             var data = generator.TakeSerialRx();
             if(data == null)
             {
@@ -1185,6 +1198,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const ushort FlagIdleHigh = 0x0001;
         private const ushort FlagFloating = 0x0002;
         private const ushort FlagGap = 0x0004;
+        private const ushort FlagTxDone = 0x0008;
 
         private const ushort StateMagicCmd = 0x5353;
         private const ushort StateMagicData = 0x5354;

@@ -35,6 +35,7 @@ TYPE_LINE = 5
 FLAG_IDLE_HIGH = 0x0001
 FLAG_FLOATING = 0x0002
 FLAG_GAP = 0x0004  # leading 1ms line idle (frame separator)
+FLAG_TX_DONE = 0x0008  # empty serial packet: queued TX has left the wire
 SERIAL_MAX = 200  # max serial payload bytes per packet
 
 TYPE_NAMES = {
@@ -121,15 +122,16 @@ def pack_serial(payload, flags=FLAG_IDLE_HIGH):
 def unpack(buf):
     '''unpack a packet: returns (ptype, flags, data) where data is a u16
     for types 0-3/5 and raw bytes for type 4 serial'''
-    if len(buf) < 7:
-        # smallest valid packet is a type 4 with one payload byte
+    if len(buf) < 6:
+        # smallest valid packet is the type 4 TX-done marker: header only
         return None
     magic, ptype, length, flags = struct.unpack('<HBBH', buf[:6])
     if magic != MAGIC:
         return None
     if ptype == TYPE_SERIAL:
-        if length < 1 or len(buf) != 6 + length:
+        if len(buf) != 6 + length:
             return None
+        # length 0 is the TX-done marker, carrying only its flag
         return (ptype, flags, buf[6:])
     if length != 4 or len(buf) < 8:
         return None
@@ -156,6 +158,7 @@ class InputPort(object):
         self.lock = threading.Lock()
         self.replies = []          # (time, type, flags, data)
         self.serial_rx = b''       # reassembled type 4 serial bytes
+        self.tx_done_count = 0     # FLAG_TX_DONE markers seen
         self.reply_count = 0
         self.sent_count = 0
         self.running = True
@@ -177,6 +180,8 @@ class InputPort(object):
                 continue
             with self.lock:
                 if p[0] == TYPE_SERIAL:
+                    if p[1] & FLAG_TX_DONE:
+                        self.tx_done_count += 1
                     self.serial_rx += p[2]
                 else:
                     self.replies.append((time.time(),) + p)

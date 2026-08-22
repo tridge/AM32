@@ -123,6 +123,8 @@ class DirectBridge(object):
         self.ep = endpoint if endpoint is not None else PtyEndpoint()
         self.running = True
         self.wire_free = 0.0      # when the queued TX will have left
+        self.echoes = []          # pending self-echo, dribbled out
+        self.skew = 2.0           # emulator wire time / wall time
         self.port.send_level(1)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -137,14 +139,37 @@ class DirectBridge(object):
         print('DW %s %3u: %s' % (direction, len(data), data.hex(' ')),
               file=sys.stderr, flush=True)
 
+    def _flush_echoes(self):
+        for e in self.echoes:
+            if e['sent'] < len(e['data']):
+                self._trace('echo', e['data'][e['sent']:])
+                self.ep.write(e['data'][e['sent']:])
+        self.echoes = []
+
+    def _dribble_echoes(self, now):
+        '''Release each pending echo progressively across its estimated
+        transmission time, as the shared wire feeds it back on real
+        hardware. A client paces itself on this echo - typically with an
+        inactivity timeout - so it must trickle in during transmission,
+        not land as one burst at the end: a burst leaves silent windows
+        long enough for the client to give up mid-command and retry a
+        command the ESC goes on to answer.'''
+        while self.echoes:
+            e = self.echoes[0]
+            frac = (now - e['start']) / (e['wire_s'] * self.skew)
+            due = min(len(e['data']), int(len(e['data']) * frac))
+            if due > e['sent']:
+                self._trace('echo', e['data'][e['sent']:due])
+                self.ep.write(e['data'][e['sent']:due])
+                e['sent'] = due
+            if e['sent'] < len(e['data']):
+                return
+            self.echoes.pop(0)
+
     def _loop(self):
-        echoes = []               # (due, bytes) awaiting their wire time
+        tx_done = self.port.tx_done_count
         while self.running:
-            timeout = 0.02
-            if echoes:
-                timeout = max(0.0, min(timeout,
-                                       echoes[0][0] - time.time()))
-            chunk = self.ep.read(timeout)
+            chunk = self.ep.read(0.01)
             now = time.time()
             if chunk:
                 self._trace('rx', chunk)
@@ -158,17 +183,34 @@ class DirectBridge(object):
                 if gap:
                     self.wire_free = now + self.GAP_S
                 self.port.send_serial(chunk, idle_high=True, gap=gap)
-                self.wire_free = (max(self.wire_free, now)
-                                  + len(chunk) * 10.0 / self.BAUD)
-                echoes.append((self.wire_free, chunk))
-            while echoes and echoes[0][0] <= now:
-                _due, data = echoes.pop(0)
-                self._trace('echo', data)
-                self.ep.write(data)
+                wire_s = len(chunk) * 10.0 / self.BAUD
+                self.wire_free = max(self.wire_free, now) + wire_s
+                self.echoes.append({'data': chunk, 'sent': 0,
+                                    'start': now, 'wire_s': wire_s})
+            done = self.port.tx_done_count
+            if done != tx_done:
+                tx_done = done
+                # the emulator says everything queued has left the wire:
+                # calibrate how fast its wire runs against ours, so the
+                # dribble pacing tracks an emulator running slower (or
+                # faster) than real time
+                if self.echoes:
+                    e = self.echoes[0]
+                    took = max(now - e['start'], 1e-3)
+                    total = sum(x['wire_s'] for x in self.echoes)
+                    if total > 0.005:
+                        self.skew += 0.3 * (min(max(took / total, 0.5),
+                                                10.0) - self.skew)
+                self._flush_echoes()
+                self.wire_free = min(self.wire_free, now)
             out = self.port.drain_serial()
             if out:
+                # a reply proves the command that provoked it has fully
+                # left the wire: its echo goes first, in wire order
+                self._flush_echoes()
                 self._trace('tx', out)
                 self.ep.write(out)
+            self._dribble_echoes(now)
 
     def close(self):
         self.running = False

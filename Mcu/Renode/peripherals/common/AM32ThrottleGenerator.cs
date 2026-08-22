@@ -495,6 +495,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // whatever the ESC has bit-banged back since the last call
+        // one-shot: the TX bit queue ran dry since the last call
+        public bool TakeTxDrained()
+        {
+            lock(serialSync)
+            {
+                var was = txDrainedEvent;
+                txDrainedEvent = false;
+                return was;
+            }
+        }
+
         public byte[] TakeSerialRx()
         {
             lock(serialSync)
@@ -694,6 +705,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(txBits.Count == 0)
                 {
                     txDriving = false;
+                    // everything queued has left the wire: tell the
+                    // serial client, whose echo pacing runs on our
+                    // virtual clock, not its own
+                    txDrainedEvent = true;
                     // release: the ESC answers into the idle line
                     DriveSerialIdle();
                     return;
@@ -938,6 +953,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool serialMode;
         private bool serialIdleHigh = true;
         private bool txDriving;
+        private bool txDrainedEvent;
         private bool rxActive;
         private ulong rxStartNs;
         private int rxFilled;
