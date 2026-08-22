@@ -2115,6 +2115,9 @@ def main():
                     help='compiler used to preprocess Inc/targets.h')
     ap.add_argument('--nm-bin', default='arm-none-eabi-nm',
                     help='reads the ELF symbol table for status()')
+    ap.add_argument('--info', action='store_true',
+                    help='print the target\'s family, signal pin and CAN '
+                         'support as JSON and exit (for launch.py)')
     ap.add_argument('--list', action='store_true',
                     help='the targets this can emulate')
     ap.add_argument('--run', action='store_true',
@@ -2211,6 +2214,17 @@ def main():
         return 0
     if not args.target:
         ap.error('a target is required unless --list')
+    if args.info:
+        import json
+        try:
+            cfg = config(args.target, args.nm)
+        except Unsupported as e:
+            print(json.dumps({'error': str(e)}))
+            return 77
+        print(json.dumps({'target': args.target, 'family': cfg['family'],
+                          'pin': cfg['throttle_pin'],
+                          'dronecan': bool(cfg['dronecan'])}))
+        return 0
 
     outdir = args.outdir or os.path.join(REPO, 'obj', 'renode')
     if args.bootloader_elf is not None:

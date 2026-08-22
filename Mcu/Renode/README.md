@@ -850,6 +850,35 @@ Nothing drives the throttle with `--sigrok` alone, so the ESC arms at
 zero and every channel sits flat. Combine it with `--link` or `--gui`,
 or drive the wire some other way, to see a running motor.
 
+### The ESC lab launcher
+
+    python3 Mcu/Renode/launch.py
+
+is the one-window way to get an emulated ESC a configurator can talk
+to: pick the hardware target from the list (with a filter box), pick a
+bootloader and press Start. Bootloaders are matched to the target
+automatically - the ELF must be built for the target's signal pin, so
+the list only offers `AM32_<MCU>_BOOTLOADER_<PIN>*` builds found in the
+bootloader repo checked out next to this one (`--bootloader-dir` or
+`$AM32_BOOTLOADER_OBJ` override the location), with the CAN build
+preferred on DroneCAN targets. Firmware and eeprom default to the
+newest build in `obj/`; a CAN bus number can be set for DroneCAN
+targets.
+
+The **Configurator** selector is the point of the tool: it puts
+Mcu/SITL's fake flight controller - MSP with BLHeli 4-way passthrough
+to the emulated bootloader - in front of the ESC, on a pty for desktop
+tools or on a virtual USB serial device (vhci_hcd, asks for root) that
+Chrome can open, so am32.tridgell.net configures the emulated ESC with
+no hardware. On Start the launcher holds the signal wire and resets the
+ESC, so it is parked in the bootloader before the first connect; the
+status line shows the serial port to hand to the configurator.
+
+`--control-port N` drives the same UI over a localhost TCP connection
+(`target NAME`, `bootloader auto|none|PATH`, `conf off|serial|usb`,
+`start`, `stop`, `status`, `quit`), which is how the scripted tests use
+it.
+
 ### Driving it from the SITL GUI
 
     python3 Mcu/Renode/gen_target.py FD6288_F051 --gui
