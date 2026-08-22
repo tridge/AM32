@@ -1727,7 +1727,8 @@ def bootloader_script(cfg, bootloader_elf, lma_segments=None):
     return lines + ['']
 
 
-def script(cfg, repl_path, bootloader_elf=None, bootloader_lmas=None):
+def script(cfg, repl_path, bootloader_elf=None, bootloader_lmas=None,
+           blank=None):
     return '\n'.join([
         ':name: AM32 %s' % cfg['target'],
         ':description: boots an AM32 %s firmware ELF' % cfg['target'],
@@ -1753,7 +1754,16 @@ def script(cfg, repl_path, bootloader_elf=None, bootloader_lmas=None):
         'connector Connect sysbus.%s canhub' % FAMILY[cfg['family']]['can_name'],
         'connector Connect sysbus.canmcast canhub',
         '',
-    ] if cfg['dronecan'] else []) + bootloader_script(
+    ] if cfg['dronecan'] else []) + ([
+        '# A factory-fresh part: every flash byte erased. This wipes the',
+        '# family script\'s $elf load (the bootloader ELF stands in for',
+        '# $elf, and is loaded properly below) and its eeprom load, so',
+        '# the eeprom - blank or defaults, whichever $eeprom holds - is',
+        '# put back.',
+        'sysbus LoadBinary @%s 0x%08X' % blank,
+        'sysbus LoadBinary $eeprom $eeprom_addr',
+        '',
+    ] if blank is not None else []) + bootloader_script(
         cfg, bootloader_elf, bootloader_lmas))
 
 
@@ -1775,8 +1785,36 @@ def capture_timer_name(target, nm='arm-none-eabi-gcc'):
     return 'timer%s' % re.sub(r'\D', '', cfg['timer'])
 
 
+def flash_region(family):
+    '''base address and size of the family's mapped flash, parsed from
+       the platform file the generated repl includes (the sizes live
+       only there)'''
+    spec = FAMILY[family]
+    path = os.path.join(HERE, 'platforms',
+                        spec.get('base_repl', 'stm32%s_base.repl' % family))
+    base = size = None
+    in_flash = False
+    for line in open(path):
+        stripped = line.strip()
+        if stripped.startswith('flash:'):
+            in_flash = True
+        if not in_flash:
+            continue
+        if base is None:
+            m = re.search(r'sysbus (0x[0-9A-Fa-f]+)', stripped)
+            if m:
+                base = int(m.group(1), 16)
+        m = re.match(r'size: (0x[0-9A-Fa-f]+)$', stripped)
+        if m:
+            size = int(m.group(1), 16)
+            break
+    if base is None or size is None:
+        raise Unsupported('no flash region in %s' % path)
+    return base, size
+
+
 def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False,
-             bootloader_elf=None):
+             bootloader_elf=None, no_firmware=False):
     '''write the pair, return (resc, repl). Raises Unsupported.'''
     cfg = config(target, nm)
     os.makedirs(outdir, exist_ok=True)
@@ -1787,6 +1825,14 @@ def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False,
     if bootloader_elf is not None:
         bootloader_lmas = bootloader_lma_segments(
             bootloader_elf, outdir, target)
+    blank = None
+    if no_firmware:
+        # a factory-fresh part: erased flash reads 0xFF everywhere,
+        # where Renode zero-fills unbacked memory
+        base, size = flash_region(cfg['family'])
+        blank = (os.path.join(outdir, '%s_blank.bin' % target), base)
+        with open(blank[0], 'wb') as f:
+            f.write(b'\xff' * size)
     if cfg['family'] == 'a153':
         # the ROM flash-driver blob, compiled with the same toolchain;
         # the writes go after the include so the machine exists
@@ -1794,7 +1840,7 @@ def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False,
     with open(repl, 'w') as f:
         f.write(platform(cfg, sigrok))
     with open(resc, 'w') as f:
-        f.write(script(cfg, repl, bootloader_elf, bootloader_lmas)
+        f.write(script(cfg, repl, bootloader_elf, bootloader_lmas, blank)
                 + '\n'.join(extra))
     return resc, repl
 
@@ -2192,6 +2238,13 @@ def main():
     ap.add_argument('--bootloader-elf', default=None,
                     help='also load this bootloader ELF and start/reset the '
                          'MCU in it (default: no bootloader)')
+    ap.add_argument('--no-firmware', action='store_true',
+                    help='factory-fresh part: no application, the whole '
+                         'flash erased to 0xFF except the bootloader '
+                         '(needs --bootloader-elf)')
+    ap.add_argument('--blank-eeprom', action='store_true',
+                    help='erased settings area (0xFF) instead of the '
+                         'generated defaults, as a fresh ESC ships')
     ap.add_argument('--eeprom', default=None,
                     help='default: generated to match --model')
     ap.add_argument('--model', default=os.path.join(
@@ -2240,11 +2293,19 @@ def main():
         if not os.path.isfile(args.bootloader_elf):
             ap.error('no bootloader ELF at %s' % args.bootloader_elf)
         args.bootloader_elf = os.path.abspath(args.bootloader_elf)
+    if args.no_firmware and args.bootloader_elf is None:
+        ap.error('--no-firmware needs --bootloader-elf: with neither an '
+                 'application nor a bootloader there is nothing to run')
+    if args.no_firmware and args.elf is not None:
+        ap.error('--no-firmware and --elf are mutually exclusive')
+    if args.blank_eeprom and args.eeprom is not None:
+        ap.error('--blank-eeprom and --eeprom are mutually exclusive')
     try:
         cfg = config(args.target, args.nm)
         resc, repl = generate(args.target, outdir, args.nm,
                               sigrok=args.sigrok,
-                              bootloader_elf=args.bootloader_elf)
+                              bootloader_elf=args.bootloader_elf,
+                              no_firmware=args.no_firmware)
     except Unsupported as e:
         print('SKIP: %s' % e)
         return 77
@@ -2254,16 +2315,22 @@ def main():
     if not (args.run or args.gdb or args.gui or args.link or args.sigrok):
         return 0
 
-    elf = args.elf
-    if elf is None:
-        elf = find_elf(args.target)
+    if args.no_firmware:
+        # the family script loads $elf unconditionally; the bootloader
+        # stands in, and the generated blank-flash fill wipes that load
+        # before the bootloader section reloads it properly
+        elf = args.bootloader_elf
+    else:
+        elf = args.elf
         if elf is None:
-            print('no firmware in obj/ for %s; build it or pass --elf'
-                  % args.target)
+            elf = find_elf(args.target)
+            if elf is None:
+                print('no firmware in obj/ for %s; build it or pass --elf'
+                      % args.target)
+                return 1
+        if not os.path.exists(elf):
+            print('no firmware at %s' % elf)
             return 1
-    if not os.path.exists(elf):
-        print('no firmware at %s' % elf)
-        return 1
 
     # the mcast scheme is 239.65.82.<bus>, one octet only for 0..9, and
     # a DroneCAN node id is 7 bits with 0 meaning dynamic allocation
@@ -2281,7 +2348,16 @@ def main():
     # "Parameters did not match the signature" from LoadBinary, which
     # says nothing about the actual problem
     eeprom = args.eeprom
-    if eeprom is None:
+    if eeprom is None and args.blank_eeprom:
+        # the erased settings area of a fresh ESC: the page holding it,
+        # 0xFF throughout (part sizes end on 16K boundaries, so this
+        # rounding recovers the page extent the family tables imply)
+        eeprom = os.path.join(outdir, '%s_eeprom.bin' % args.target)
+        end = (cfg['eeprom_addr'] // 0x4000 + 1) * 0x4000
+        with open(eeprom, 'wb') as f:
+            f.write(b'\xff' * (end - cfg['eeprom_addr']))
+        print(eeprom)
+    elif eeprom is None:
         eeprom = os.path.join(outdir, '%s_eeprom.bin' % args.target)
         # A fixed node id, because an anonymous node does nothing until
         # a DNA allocator answers, and a bare bench run has none. Input
@@ -2302,8 +2378,11 @@ def main():
     setup = '$repo=@%s; $elf=@%s; $eeprom=@%s; include @%s' % (
         REPO, elf, eeprom, resc)
     if not args.no_skip_delays:
-        setup += '; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"' % (
-            os.path.join(HERE, 'scripts', 'skip_delays.py'))
+        if not args.no_firmware:
+            # the application's startup-tune delays; no application, no
+            # symbol to hook
+            setup += ('; cpu AddSymbolHook "delayMillis" "execfile(\'%s\')"'
+                      % os.path.join(HERE, 'scripts', 'skip_delays.py'))
         if args.bootloader_elf is not None:
             # The bootloader's delayMicroseconds busy-polls the utility
             # timer, and its native-to-managed transition per read is

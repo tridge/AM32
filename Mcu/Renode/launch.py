@@ -21,9 +21,9 @@ builds from the bootloader repo's obj directory.
 
 with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
-  target NAME, bootloader auto|none|PATH, firmware auto|PATH,
-  conf off|serial|usb, protocol 4way|direct, canbus N,
-  start, stop, status, quit
+  target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
+  eeprom defaults|blank, conf off|serial|usb, protocol 4way|direct,
+  canbus N, start, stop, status, quit
 replies are prefixed OK/ERR/STATUS.
 '''
 
@@ -177,7 +177,8 @@ class Lab(object):
         self.target = None
         self.info = None                  # {'family','pin','dronecan'}
         self.bootloader = 'auto'          # auto | none | path
-        self.firmware = 'auto'            # auto | path
+        self.firmware = 'auto'            # auto | none | path
+        self.eeprom = 'defaults'          # defaults | blank
         self.conf = 'serial'              # off | serial | usb
         self.protocol = '4way'            # 4way | direct
         self.can_bus = 0
@@ -264,10 +265,17 @@ class Lab(object):
                '--gui-state-port', str(self.args.state_port)]
         if bl is not None:
             cmd += ['--bootloader-elf', bl]
-        if self.firmware != 'auto':
+        if self.firmware == 'none':
+            if bl is None:
+                return ('a blank ESC still needs its bootloader: pick one, '
+                        'or pick a firmware')
+            cmd += ['--no-firmware']
+        elif self.firmware != 'auto':
             if not os.path.isfile(self.firmware):
                 return 'no firmware at %s' % self.firmware
             cmd += ['--elf', self.firmware]
+        if self.eeprom == 'blank':
+            cmd += ['--blank-eeprom']
         if self.info['dronecan']:
             cmd += ['--can-bus', str(self.can_bus)]
         if self.args.renode:
@@ -519,9 +527,13 @@ def main():
 
     # -- firmware / can ------------------------------------------------
     grid.addWidget(QLabel('Firmware'), 3, 0)
-    fw_edit = QLineEdit()
-    fw_edit.setPlaceholderText('auto: newest obj/AM32_<TARGET>_*.elf')
-    grid.addWidget(fw_edit, 3, 1, 1, 2)
+    fw_combo = QComboBox()
+    fw_combo.addItem('Auto (newest obj/AM32_<TARGET>_*.elf)', 'auto')
+    fw_combo.addItem('None (blank flash, factory-fresh ESC)', 'none')
+    fw_combo.setToolTip(
+        'None gives a part with only the bootloader: everything else\n'
+        'reads erased 0xFF, as an ESC fresh from the factory does.')
+    grid.addWidget(fw_combo, 3, 1, 1, 2)
     fw_browse = QPushButton('Browse...')
     grid.addWidget(fw_browse, 3, 3)
 
@@ -529,7 +541,8 @@ def main():
         path, _ = QFileDialog.getOpenFileName(
             win, 'Firmware ELF', os.path.join(REPO, 'obj'), 'ELF (*.elf)')
         if path:
-            fw_edit.setText(path)
+            fw_combo.insertItem(0, os.path.basename(path), path)
+            fw_combo.setCurrentIndex(0)
     fw_browse.clicked.connect(browse_fw)
 
     grid.addWidget(QLabel('CAN bus'), 4, 0)
@@ -545,6 +558,17 @@ def main():
                         'of waiting for the configurator.')
     can_spin.setEnabled(False)
     grid.addWidget(can_spin, 4, 1)
+
+    grid.addWidget(QLabel('EEPROM'), 4, 2)
+    ee_combo = QComboBox()
+    ee_combo.addItem('Defaults', 'defaults')
+    ee_combo.addItem('Blank (0xFF)', 'blank')
+    ee_combo.setToolTip(
+        'The settings area at the end of flash.\n'
+        'Defaults: a generated eeprom tuned for the simulated motor.\n'
+        'Blank: erased 0xFF, as a factory-fresh ESC ships - what a\n'
+        'configurator sees before the first save.')
+    grid.addWidget(ee_combo, 4, 3)
 
     # -- configurator port ---------------------------------------------
     grid.addWidget(QLabel('Configurator'), 5, 0)
@@ -594,12 +618,15 @@ def main():
     grid.addWidget(log_view, 8, 0, 1, 4)
 
     def do_start():
-        lab.firmware = fw_edit.text().strip() or 'auto'
+        lab.firmware = fw_combo.currentData() or 'auto'
+        lab.eeprom = ee_combo.currentData()
         lab.conf = conf_combo.currentData()
         lab.protocol = proto_combo.currentData()
         lab.can_bus = can_spin.value()
         err = lab.start()
         if err:
+            # also into lab.status, which the control port reports
+            lab.status = err
             status_label.setText(err)
             return
         start_btn.setEnabled(False)
@@ -684,7 +711,17 @@ def main():
             lab.bootloader = rest or 'auto'
             return 'OK'
         if cmd == 'firmware':
-            fw_edit.setText('' if rest in ('', 'auto') else rest)
+            if rest in ('', 'auto', 'none'):
+                fw_combo.setCurrentIndex(fw_combo.findData(rest or 'auto'))
+            else:
+                fw_combo.insertItem(0, os.path.basename(rest), rest)
+                fw_combo.setCurrentIndex(0)
+            return 'OK'
+        if cmd == 'eeprom':
+            i = ee_combo.findData(rest)
+            if i < 0:
+                return 'ERR eeprom defaults|blank'
+            ee_combo.setCurrentIndex(i)
             return 'OK'
         if cmd == 'conf':
             i = conf_combo.findData(rest)
