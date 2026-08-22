@@ -559,19 +559,19 @@ def main():
     can_spin.setEnabled(False)
     grid.addWidget(can_spin, 4, 1)
 
-    grid.addWidget(QLabel('EEPROM'), 4, 2)
+    grid.addWidget(QLabel('EEPROM'), 5, 0)
     ee_combo = QComboBox()
-    ee_combo.addItem('Defaults', 'defaults')
-    ee_combo.addItem('Blank (0xFF)', 'blank')
+    ee_combo.addItem('Defaults, tuned for the simulated motor', 'defaults')
+    ee_combo.addItem('Blank (0xFF, factory-fresh ESC)', 'blank')
     ee_combo.setToolTip(
         'The settings area at the end of flash.\n'
         'Defaults: a generated eeprom tuned for the simulated motor.\n'
         'Blank: erased 0xFF, as a factory-fresh ESC ships - what a\n'
         'configurator sees before the first save.')
-    grid.addWidget(ee_combo, 4, 3)
+    grid.addWidget(ee_combo, 5, 1, 1, 2)
 
     # -- configurator port ---------------------------------------------
-    grid.addWidget(QLabel('Configurator'), 5, 0)
+    grid.addWidget(QLabel('Configurator'), 6, 0)
     conf_combo = QComboBox()
     conf_combo.addItem('Serial port (pty)', 'serial')
     if sys.platform.startswith('linux'):
@@ -583,10 +583,10 @@ def main():
         '/dev/ttyACM* Chrome can open, so am32.tridgell.net works.\n'
         'Attaching the USB device asks for root unless the udev rule\n'
         'from sitl_usbip.py --install-rules is in place.')
-    grid.addWidget(conf_combo, 5, 1, 1, 2)
+    grid.addWidget(conf_combo, 6, 1, 1, 2)
 
     # -- protocol: what sits on that port ------------------------------
-    grid.addWidget(QLabel('Protocol'), 6, 0)
+    grid.addWidget(QLabel('Protocol'), 7, 0)
     proto_combo = QComboBox()
     proto_combo.addItem('FC with 4-way passthrough', '4way')
     proto_combo.addItem('Direct 1-wire adapter', 'direct')
@@ -600,22 +600,22 @@ def main():
         'FC-vs-adapter by USB vendor id, so the USB device enumerates\n'
         'accordingly; the Offline-Configurator uses its direct/1-wire\n'
         'checkbox on the pty or tty.')
-    grid.addWidget(proto_combo, 6, 1, 1, 2)
+    grid.addWidget(proto_combo, 7, 1, 1, 2)
 
     # -- start/stop, status, log ---------------------------------------
     start_btn = QPushButton('Start')
     stop_btn = QPushButton('Stop')
     stop_btn.setEnabled(False)
-    grid.addWidget(start_btn, 7, 2)
-    grid.addWidget(stop_btn, 7, 3)
+    grid.addWidget(start_btn, 8, 2)
+    grid.addWidget(stop_btn, 8, 3)
     status_label = QLabel('stopped')
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    grid.addWidget(status_label, 7, 0, 1, 2)
+    grid.addWidget(status_label, 8, 0, 1, 2)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 8, 0, 1, 4)
+    grid.addWidget(log_view, 9, 0, 1, 4)
 
     def do_start():
         lab.firmware = fw_combo.currentData() or 'auto'
