@@ -545,6 +545,41 @@ def import_device(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
     return sock, (busnum << 16) | devnum, speed
 
 
+UDEV_RULE = (
+    '# let members of dialout attach/detach USB/IP devices without root\n'
+    'ACTION=="add", SUBSYSTEM=="platform", KERNEL=="vhci_hcd.0", '
+    'RUN+="/bin/sh -c \'chgrp dialout /sys%p/attach /sys%p/detach; '
+    'chmod g+w /sys%p/attach /sys%p/detach\'"\n')
+UDEV_RULE_PATH = '/etc/udev/rules.d/99-vhci-user.rules'
+MODULES_LOAD_PATH = '/etc/modules-load.d/vhci-hcd.conf'
+
+
+def install_rules():
+    """one-time root setup after which no attach ever needs root:
+    load vhci_hcd at boot and make its attach/detach files writable by
+    the dialout group (the same group the resulting tty needs anyway)"""
+    if os.geteuid() != 0:
+        cmd = privilege_prefix() + [sys.executable,
+                                    os.path.abspath(__file__),
+                                    '--install-rules']
+        return subprocess.run(cmd, check=False).returncode == 0
+    with open(UDEV_RULE_PATH, 'w') as f:
+        f.write(UDEV_RULE)
+    with open(MODULES_LOAD_PATH, 'w') as f:
+        f.write('vhci_hcd\n')
+    subprocess.run(['modprobe', 'vhci_hcd'], check=False)
+    # apply to the already-loaded module too, not just future boots
+    for name in ('attach', 'detach'):
+        path = os.path.join(VHCI, name)
+        if os.path.exists(path):
+            subprocess.run(['chgrp', 'dialout', path], check=False)
+            subprocess.run(['chmod', 'g+w', path], check=False)
+    subprocess.run(['udevadm', 'control', '--reload'], check=False)
+    print('installed %s and %s; vhci attach now needs no root'
+          % (UDEV_RULE_PATH, MODULES_LOAD_PATH), file=sys.stderr)
+    return True
+
+
 def privilege_prefix():
     """how to run something as root here: nothing if we already are,
     sudo when it needs no password, pkexec when there is a desktop to
@@ -561,13 +596,14 @@ def privilege_prefix():
 
 
 def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
-    """import and attach, re-running ourselves as root when needed.
-
-    Only the sysfs write needs root, but the socket handed to the kernel
-    has to belong to the process doing the write, so the whole import
-    runs in the privileged child.
+    """import and attach, without root when the udev rule from
+    --install-rules is in place (it makes the vhci attach file group
+    writable); otherwise re-run ourselves as root for the sysfs write.
+    The socket handed to the kernel must belong to the process doing
+    that write, so the whole import runs wherever the write happens.
     """
-    if os.geteuid() != 0:
+    if os.geteuid() != 0 and not os.access(os.path.join(VHCI, 'attach'),
+                                           os.W_OK):
         cmd = privilege_prefix() + [
             sys.executable, os.path.abspath(__file__), '--attach-to',
             unix_path if unix_path is not None else '%s:%u' % (host, port)]
@@ -582,8 +618,15 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
 
 
 def detach(port=None):
-    """detach one vhci port, or every port that has a device on it"""
-    if os.geteuid() != 0:
+    """detach one vhci port, or every port carrying OUR busid.
+
+    The vhci is shared machine-wide: an ArduPilot Renode CubeOrange (or
+    anything else) may be attached alongside, so a blanket detach-all
+    would unplug someone else's device. Only ports whose local_busid is
+    ours are swept; an explicit port number is trusted as given.
+    """
+    if os.geteuid() != 0 and not os.access(os.path.join(VHCI, 'detach'),
+                                           os.W_OK):
         cmd = privilege_prefix() + [sys.executable, os.path.abspath(__file__),
                                     '--detach']
         if port is not None:
@@ -595,7 +638,7 @@ def detach(port=None):
     else:
         for line in open(os.path.join(VHCI, 'status')).read().splitlines()[1:]:
             f = line.split()
-            if len(f) >= 3 and f[2] != VDEV_ST_NULL:
+            if len(f) >= 7 and f[2] != VDEV_ST_NULL and f[6] == BUSID:
                 ports.append(int(f[1]))
     for p in ports:
         with open(os.path.join(VHCI, 'detach'), 'w') as f:
@@ -622,13 +665,22 @@ def main():
                     help='attach an already exported device and exit; takes '
                          'a unix socket name or host:port')
     ap.add_argument('--detach', nargs='?', type=int, const=-1, default=None,
-                    help='detach one vhci port, or all of them')
+                    help='detach one vhci port, or every port carrying '
+                         'this tool\'s busid (other USB/IP devices on the '
+                         'machine are left alone)')
+    ap.add_argument('--install-rules', action='store_true',
+                    help='one-time root setup: load vhci_hcd at boot and '
+                         'make its attach/detach group-writable (dialout), '
+                         'so no later attach or detach needs root')
     ap.add_argument('--verbose', action='store_true')
     args = ap.parse_args()
 
     def log(msg):
         if args.verbose:
             print('usbip: %s' % msg, file=sys.stderr, flush=True)
+
+    if args.install_rules:
+        return 0 if install_rules() else 1
 
     if args.detach is not None:
         return 0 if detach(None if args.detach < 0 else args.detach) else 1
