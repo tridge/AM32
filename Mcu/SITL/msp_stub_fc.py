@@ -88,7 +88,7 @@ class PtyEndpoint(object):
 
 
 class MspStubFC(object):
-    def __init__(self, sitl_host='127.0.0.1', sitl_port=57833,
+    def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
                  poles=14, rate=500.0, esc_ports=None, state_port=57734,
                  esc_reset=True, motor=True, verbose=False, endpoint=None):
         self.poles = poles
@@ -323,8 +323,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='fake Betaflight FC for the AM32 SITL')
     parser.add_argument('--host', default='127.0.0.1', help='SITL host')
-    parser.add_argument('--sitl-port', type=int, default=57833,
-                        help='SITL input port driven with DShot')
+    parser.add_argument('--sitl-port', type=int, default=57733,
+                        help='SITL input port, the simulated signal wire')
     parser.add_argument('--esc-ports', default=None,
                         help='comma separated SITL input ports of the ESCs '
                              'reachable over 4-way (default --sitl-port)')

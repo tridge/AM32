@@ -660,7 +660,7 @@ def test_fc_capture(sitl_path):
     import msp_stub_fc
     tool = os.path.join(HERE, '..', '..', 'scripts', 'esc_capture_fc.py')
     with Sitl(sitl_path, ['--can-uri', 'none', '--input-type', '1']):
-        stub = msp_stub_fc.MspStubFC()
+        stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT)
         try:
             r = subprocess.run(
                 [sys.executable, tool, 'sweep', '--port', stub.slave_path,
