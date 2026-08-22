@@ -137,7 +137,15 @@ flight controller, asks it for BLHeli 4-way passthrough, and the FC
 translates each 4-way command into the ESC's one-wire bootloader
 protocol. `msp_stub_fc.py` is that flight controller, so an unmodified
 configurator can read and write the settings and flash of a simulated
-ESC. Run the SITL chained with the bootloader, then the stub:
+ESC.
+
+The GUI does all of this for you: give the **SITL process** panel a
+bootloader as well as a binary, start it, and tick **USB configurator
+port**. The status next to it becomes the serial port to hand to the
+configurator, and unticking gives it back. The rest of this section is
+what that tick does, for running it by hand.
+
+Run the SITL chained with the bootloader, then the stub:
 
 ```
 obj/AM32_AM32_SITL_CAN_*.elf --can-uri none \
@@ -220,7 +228,11 @@ Tools in `Mcu/SITL/`:
   on the ports this GUI drives, instead of starting it separately: pick
   the binary (one is bundled with the packaged build, or Browse), an
   eeprom and an optional bootloader, and Start; leave it stopped to
-  drive a simulator you ran yourself. The simulation panel also has
+  drive a simulator you ran yourself. **USB configurator port** in the
+  same panel presents the running ESC to configurators as a virtual USB
+  serial device (see above); it stops the DShot input while it is on,
+  since a configurator session and a DShot stream cannot share one
+  signal wire. The simulation panel also has
   optional high rate views, both default off:
   pyqtgraph scopes of the phase currents and the phase terminal
   voltages, each in its own window (sample period down to the 500ns

@@ -23,7 +23,7 @@ actual UI paths:
   can_value X, can_rate N, param NAME VALUE, rpm_graph 0|1,
   rpm_window SECONDS, i_window MS, v_window MS,
   wave sine|square FREQ AMP BASE [dshot|can], wave off,
-  snap FILE [rpm], status, quit
+  usb 0|1, usb_status, snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
 --log FILE records every UI action with a timestamp; --replay FILE plays
@@ -1836,6 +1836,23 @@ def main():
     gl.addWidget(sim_stop_btn, 4, 3)
     sim_launch_status = QLabel('not launched from here')
     gl.addWidget(sim_launch_status, 4, 0, 1, 2)
+    usb_check = QCheckBox('USB configurator port')
+    usb_check.setToolTip(
+        'Present the simulated ESC to configurators the way hardware\n'
+        'does: a virtual USB serial device that answers MSP as a flight\n'
+        'controller and passes BLHeli 4-way through to the ESC\n'
+        'bootloader. The AM32 configurator, a browser included, can then\n'
+        'read settings and flash firmware with no hardware and no\n'
+        'changes.\n\n'
+        'Needs the SITL to be running with a bootloader (the field\n'
+        'above) and, for the attach, root - which it asks for.\n'
+        'The DShot input is stopped while this is on: the configurator\n'
+        'session and the DShot stream share one signal wire.')
+    gl.addWidget(usb_check, 5, 0)
+    usb_status = QLabel('off')
+    usb_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    usb_status.setToolTip('The serial port to give the configurator.')
+    gl.addWidget(usb_status, 5, 1, 1, 2)
     sim_pause_check = QCheckBox('pause scroll')
     sim_pause_check.setToolTip('Stop the output pane from following new '
                                'lines, so you can read back through it.')
@@ -1875,6 +1892,93 @@ def main():
     sim_start_btn.clicked.connect(sim_launch)
     sim_stop_btn.clicked.connect(sim_halt)
     top.addWidget(fl, 5, 0, 1, 2)
+
+    # the virtual USB serial device and the fake FC behind it. Bringing
+    # it up attaches to the kernel and waits for the tty, so it runs off
+    # the UI thread and reports back through a queue
+    usb = {'stub': None, 'port': None, 'q': queue.Queue()}
+    usb_serial = 'SITL' if args.port == 57733 else 'SITL-%u' % args.port
+
+    def usb_start():
+        import msp_stub_fc
+        import sitl_usbip
+        # per process socket and, off the default port, a per port usb
+        # serial number, so a second GUI gets its own device and its own
+        # /dev/serial/by-id link rather than colliding with this one
+        stub = msp_stub_fc.MspStubFC(
+            sitl_host=args.host, sitl_port=args.port,
+            state_port=args.state_port, motor=False, poles=args.poles,
+            endpoint=sitl_usbip.UsbipServer(
+                unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(),
+                                                      os.getpid()),
+                serial=usb_serial))
+        usb['stub'] = stub
+        vhci_port = sitl_usbip.attach(unix_path=stub.ep.unix_path)
+        if not vhci_port:
+            raise RuntimeError('attach refused (is vhci_hcd loaded?)')
+        usb['port'] = None if vhci_port is True else vhci_port
+        tty = sitl_usbip.find_tty(usb_serial, timeout=10)
+        if tty is None:
+            raise RuntimeError('attached but no tty appeared')
+        return tty
+
+    def usb_stop():
+        import sitl_usbip
+        if usb['stub'] is not None:
+            usb['stub'].close()
+            usb['stub'] = None
+        sitl_usbip.detach(usb['port'])
+        usb['port'] = None
+
+    def usb_toggled():
+        if usb_check.isChecked():
+            log_action('usb 1')
+            if ds_enable.isChecked():
+                # one signal wire: DShot frames would collide with the
+                # configurator's traffic
+                ds_enable.setChecked(False)
+            usb_check.setEnabled(False)
+            usb_status.setText('starting...')
+
+            def go():
+                try:
+                    usb['q'].put(('ok', usb_start()))
+                except Exception as ex:
+                    try:
+                        usb_stop()
+                    except Exception:
+                        pass
+                    usb['q'].put(('fail', str(ex)))
+            threading.Thread(target=go, daemon=True).start()
+        else:
+            log_action('usb 0')
+            try:
+                usb_stop()
+            except Exception as ex:
+                usb_status.setText('stop failed: %s' % ex)
+                return
+            usb_status.setText('off')
+
+    def usb_poll():
+        try:
+            kind, detail = usb['q'].get_nowait()
+        except queue.Empty:
+            return
+        usb_check.setEnabled(True)
+        if kind == 'ok':
+            usb_status.setText(detail)
+        else:
+            usb_status.setText('failed: %s' % detail)
+            usb_check.setChecked(False)
+
+    if sys.platform.startswith('linux'):
+        usb_check.toggled.connect(usb_toggled)
+    else:
+        usb_check.setEnabled(False)
+        usb_status.setText('Linux only (needs vhci_hcd)')
+    usb_timer = QTimer()
+    usb_timer.timeout.connect(usb_poll)
+    usb_timer.start(200)
 
     def drain_sim_out():
         # drain the whole queue so it can't grow without bound, but only
@@ -2059,6 +2163,10 @@ def main():
         elif cmd == 'sim_status':
             reply('STATUS sim_process: %s'
                   % ('running' if runner.is_running() else 'stopped'))
+        elif cmd == 'usb':
+            usb_check.setChecked(bool(int(cargs[0])))
+        elif cmd == 'usb_status':
+            reply('STATUS usb: %s' % usb_status.text())
         elif cmd == 'sim_log':
             reply('STATUS sim_log: %s'
                   % '\\n'.join(runner.recent()[-20:]))
@@ -2284,6 +2392,8 @@ def main():
         if phys_player is not None:
             phys_player.stop()
         ds.running = False
+        if usb['stub'] is not None:
+            usb_stop()
         runner.stop()
         sim.close()
         if can is not None:

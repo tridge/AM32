@@ -36,6 +36,7 @@ import argparse
 import errno
 import glob
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -544,17 +545,33 @@ def import_device(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
     return sock, (busnum << 16) | devnum, speed
 
 
+def privilege_prefix():
+    """how to run something as root here: nothing if we already are,
+    sudo when it needs no password, pkexec when there is a desktop to
+    ask on (the GUI has no terminal to type into), else sudo anyway"""
+    if os.geteuid() == 0:
+        return []
+    if subprocess.run(['sudo', '-n', 'true'], check=False,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        return ['sudo', '-n']
+    if os.environ.get('DISPLAY') and shutil.which('pkexec'):
+        return ['pkexec']
+    return ['sudo']
+
+
 def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
-    """import and attach, re-running ourselves under sudo when needed.
+    """import and attach, re-running ourselves as root when needed.
 
     Only the sysfs write needs root, but the socket handed to the kernel
     has to belong to the process doing the write, so the whole import
     runs in the privileged child.
     """
     if os.geteuid() != 0:
-        cmd = [sys.executable, os.path.abspath(__file__), '--attach-to',
-               unix_path if unix_path is not None else '%s:%u' % (host, port)]
-        return subprocess.run(['sudo'] + cmd, check=False).returncode == 0
+        cmd = privilege_prefix() + [
+            sys.executable, os.path.abspath(__file__), '--attach-to',
+            unix_path if unix_path is not None else '%s:%u' % (host, port)]
+        return subprocess.run(cmd, check=False).returncode == 0
     sock, devid, speed = import_device(unix_path, host, port, busid)
     try:
         vhci_port = attach_socket(sock, devid, speed)
@@ -567,10 +584,11 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
 def detach(port=None):
     """detach one vhci port, or every port that has a device on it"""
     if os.geteuid() != 0:
-        cmd = [sys.executable, os.path.abspath(__file__), '--detach']
+        cmd = privilege_prefix() + [sys.executable, os.path.abspath(__file__),
+                                    '--detach']
         if port is not None:
             cmd += [str(port)]
-        return subprocess.run(['sudo'] + cmd, check=False).returncode == 0
+        return subprocess.run(cmd, check=False).returncode == 0
     ports = []
     if port is not None:
         ports = [port]

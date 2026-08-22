@@ -141,6 +141,86 @@ def test_launcher(args, env):
               out[-300:] if 'Traceback' in out else 'clean')
 
 
+def test_usb(args, env):
+    """tick the USB configurator port in the GUI: the virtual device and
+    the fake FC behind it have to come up (or fail cleanly, since the
+    attach wants vhci_hcd and root) without hanging the UI, and unticking
+    has to give the port back"""
+    if not sys.platform.startswith('linux'):
+        print('SKIP: gui usb, linux only')
+        return
+    control_port = free_control_port()
+    gui = subprocess.Popen(
+        [args.gui_python, os.path.join(HERE, 'sitl_gui.py'),
+         '--control-port', str(control_port),
+         '--port', '29933', '--state-port', '29934', '--can-uri', 'none'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    responses = []
+    sock = None
+    try:
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            try:
+                sock = socket.create_connection(('127.0.0.1', control_port),
+                                                timeout=5)
+                break
+            except OSError:
+                if gui.poll() is not None:
+                    break
+                time.sleep(1.0)
+        if sock is None:
+            check('GUI usb control port', False, 'GUI exit=%s' % gui.poll())
+            return
+        sock.settimeout(None)
+        f = sock.makefile('r')
+        threading.Thread(target=lambda: [responses.append(ln.rstrip())
+                                         for ln in f], daemon=True).start()
+
+        def send(command, delay=0.2):
+            sock.sendall((command + '\n').encode())
+            time.sleep(delay)
+
+        def usb_state(timeout=30):
+            """the status line once it stops saying 'starting...'"""
+            end = time.time() + timeout
+            state = ''
+            while time.time() < end:
+                send('usb_status', 1.0)
+                hits = [r for r in responses if r.startswith('STATUS usb:')]
+                state = hits[-1][len('STATUS usb:'):].strip() if hits else ''
+                if state and state != 'starting...':
+                    break
+            return state
+
+        send('usb 1', 1.0)
+        state = usb_state()
+        up = state.startswith('/dev')
+        check('GUI usb settles', up or state.startswith('failed:'),
+              'status=%r' % state)
+        if up:
+            del responses[:]
+            send('usb 0', 2.0)
+            check('GUI usb releases the port', usb_state(10) == 'off',
+                  'status=%r' % usb_state(1))
+        else:
+            print('  (no attach here: %s)' % state)
+        send('quit')
+        gui.wait(timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        check('GUI usb exits cleanly', False, str(ex))
+    finally:
+        if sock is not None:
+            sock.close()
+        if gui.poll() is None:
+            gui.kill()
+            gui.wait()
+    check('GUI usb exits cleanly', gui.returncode == 0,
+          'exit=%s' % gui.returncode)
+    out = gui.stdout.read() if gui.stdout else ''
+    check('GUI usb no tracebacks', 'Traceback' not in out,
+          out[-300:] if 'Traceback' in out else 'clean')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--gui-python', required=True)
@@ -284,6 +364,7 @@ def main():
               (out[-300:] if 'Traceback' in out else 'clean'))
 
     test_launcher(args, env)
+    test_usb(args, env)
 
     if failures:
         print('\n%d FAILED' % len(failures))
