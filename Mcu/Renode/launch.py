@@ -4,12 +4,15 @@ Renode ESC lab: pick a hardware target, a bootloader and a firmware,
 press Start, and get an emulated ESC a configurator can talk to.
 
 The emulator runs gen_target.py TARGET --link, serving the SITL wire
-protocols. The configurator port is Mcu/SITL's fake flight controller on
-those ports: MSP with BLHeli 4-way passthrough to the emulated
-bootloader, on a pty or - so a browser can reach it - on a virtual USB
-serial device attached through vhci_hcd. This is the rig for developing
-am32.tridgell.net against emulated CAN and non-CAN ESCs with no
-hardware.
+protocols. The configurator port is served by Mcu/SITL on those ports,
+on a pty or - so a browser can reach it - on a virtual USB serial
+device attached through vhci_hcd. The protocol choice picks what sits
+on that port: the fake flight controller (MSP with BLHeli 4-way
+passthrough to the emulated bootloader, as a real FC provides) or a
+direct single-wire adapter (the raw bootloader protocol with the
+adapter's self-echo, as a USB linker soldered to the signal pad
+provides). This is the rig for developing am32.tridgell.net against
+emulated CAN and non-CAN ESCs with no hardware.
 
 Bootloaders are matched to the target automatically: the ELF must be
 built for the target's signal pin (a PA2 bootloader on a PB4 target
@@ -19,7 +22,8 @@ builds from the bootloader repo's obj directory.
 with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|PATH,
-  conf off|serial|usb, canbus N, start, stop, status, quit
+  conf off|serial|usb, protocol 4way|direct, canbus N,
+  start, stop, status, quit
 replies are prefixed OK/ERR/STATUS.
 '''
 
@@ -175,6 +179,7 @@ class Lab(object):
         self.bootloader = 'auto'          # auto | none | path
         self.firmware = 'auto'            # auto | path
         self.conf = 'serial'              # off | serial | usb
+        self.protocol = '4way'            # 4way | direct
         self.can_bus = 0
         self.status = 'stopped'
         self.conf_port = ''               # the pty / tty path once up
@@ -323,13 +328,24 @@ class Lab(object):
         endpoint = None
         if self.conf == 'usb':
             import sitl_usbip
+            # in direct mode the USB ids make the web configurator
+            # treat the port as a single-wire adapter, not an FC
+            ids = ({'vid': msp_stub_fc.DIRECT_VENDOR_ID,
+                    'pid': msp_stub_fc.DIRECT_PRODUCT_ID}
+                   if self.protocol == 'direct' else {})
             endpoint = sitl_usbip.UsbipServer(
                 unix_path='@am32-renode-usbip.%u.%u' % (os.getuid(),
                                                         os.getpid()),
-                serial='RENODE')
-        self.stub = msp_stub_fc.MspStubFC(
-            sitl_port=self.args.gui_port, state_port=self.args.state_port,
-            motor=False, endpoint=endpoint, verbose=False)
+                serial='RENODE', **ids)
+        if self.protocol == 'direct':
+            self.stub = msp_stub_fc.DirectBridge(
+                sitl_port=self.args.gui_port, endpoint=endpoint,
+                verbose=False)
+        else:
+            self.stub = msp_stub_fc.MspStubFC(
+                sitl_port=self.args.gui_port,
+                state_port=self.args.state_port,
+                motor=False, endpoint=endpoint, verbose=False)
         if self.conf == 'usb':
             import sitl_usbip
             if not sitl_usbip.attach(unix_path=endpoint.unix_path):
@@ -538,31 +554,49 @@ def main():
         conf_combo.addItem('USB device (vhci, for the browser)', 'usb')
     conf_combo.addItem('Off (drive it some other way)', 'off')
     conf_combo.setToolTip(
-        'The fake flight controller in front of the emulated ESC:\n'
-        'MSP plus BLHeli 4-way passthrough, as a real FC provides.\n'
+        'How the configurator reaches the emulated ESC.\n'
         'A pty works for desktop tools; the USB device is a real\n'
         '/dev/ttyACM* Chrome can open, so am32.tridgell.net works.\n'
-        'Attaching the USB device asks for root.')
+        'Attaching the USB device asks for root unless the udev rule\n'
+        'from sitl_usbip.py --install-rules is in place.')
     grid.addWidget(conf_combo, 5, 1, 1, 2)
+
+    # -- protocol: what sits on that port ------------------------------
+    grid.addWidget(QLabel('Protocol'), 6, 0)
+    proto_combo = QComboBox()
+    proto_combo.addItem('FC with 4-way passthrough', '4way')
+    proto_combo.addItem('Direct 1-wire adapter', 'direct')
+    proto_combo.setToolTip(
+        'What the configurator port pretends to be.\n'
+        'FC: MSP with BLHeli 4-way passthrough, as a real flight\n'
+        'controller provides.\n'
+        'Direct: a single-wire adapter soldered to the signal pad -\n'
+        'the raw 19200 baud bootloader protocol, with the self-echo\n'
+        'such an adapter produces. The web configurator decides\n'
+        'FC-vs-adapter by USB vendor id, so the USB device enumerates\n'
+        'accordingly; the Offline-Configurator uses its direct/1-wire\n'
+        'checkbox on the pty or tty.')
+    grid.addWidget(proto_combo, 6, 1, 1, 2)
 
     # -- start/stop, status, log ---------------------------------------
     start_btn = QPushButton('Start')
     stop_btn = QPushButton('Stop')
     stop_btn.setEnabled(False)
-    grid.addWidget(start_btn, 6, 2)
-    grid.addWidget(stop_btn, 6, 3)
+    grid.addWidget(start_btn, 7, 2)
+    grid.addWidget(stop_btn, 7, 3)
     status_label = QLabel('stopped')
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    grid.addWidget(status_label, 6, 0, 1, 2)
+    grid.addWidget(status_label, 7, 0, 1, 2)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 7, 0, 1, 4)
+    grid.addWidget(log_view, 8, 0, 1, 4)
 
     def do_start():
         lab.firmware = fw_edit.text().strip() or 'auto'
         lab.conf = conf_combo.currentData()
+        lab.protocol = proto_combo.currentData()
         lab.can_bus = can_spin.value()
         err = lab.start()
         if err:
@@ -657,6 +691,12 @@ def main():
             if i < 0:
                 return 'ERR conf off|serial|usb'
             conf_combo.setCurrentIndex(i)
+            return 'OK'
+        if cmd == 'protocol':
+            i = proto_combo.findData(rest)
+            if i < 0:
+                return 'ERR protocol 4way|direct'
+            proto_combo.setCurrentIndex(i)
             return 'OK'
         if cmd == 'canbus':
             can_spin.setValue(int(rest))
