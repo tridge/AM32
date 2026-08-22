@@ -95,6 +95,21 @@ class FourWayServer(object):
         self.buf = b''
         self.last_request = b''
 
+    def begin(self):
+        '''start a passthrough session.
+
+        A configurator may open several against one FC - a browser does
+        it every time you reconnect - and each one starts from scratch:
+        the exit flag from the last session would otherwise drop us out
+        of 4-way mode again after its first command, and the ESC has to
+        be re-selected with cmd_DeviceInitFlash anyway.
+        '''
+        self.exited = False
+        self.buf = b''
+        self.last_request = b''
+        self.connected = set()
+        self.target = 0
+
     def close(self):
         for c in self.clients.values():
             c.close()

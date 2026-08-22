@@ -844,6 +844,47 @@ def test_fc_fourway(sitl_path, bootloader):
             stub.close()
 
 
+def test_fc_reconnect():
+    """a configurator may open several passthrough sessions against one
+    FC - a browser does it every time you reconnect - and each has to
+    work. Needs no ESC: the interface commands are answered by the FC
+    itself"""
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: fc reconnect, %s' % ex)
+        sys.stdout.flush()
+        return
+    import msp_stub_fc
+    from sitl_fourway_server import (CMD_INTERFACE_EXIT,
+                                     CMD_INTERFACE_TEST_ALIVE,
+                                     CMD_PROTOCOL_GET_VERSION, ACK_OK,
+                                     PROTOCOL_VERSION)
+    stub = msp_stub_fc.MspStubFC(sitl_port=INPUT_PORT, motor=False)
+    client = None
+    try:
+        client = FourWayClient(stub.slave_path)
+        for session in (1, 2, 3):
+            ok = True
+            detail = ''
+            try:
+                count = client.passthrough()
+                version, ack = client.cmd(CMD_PROTOCOL_GET_VERSION)
+                ok = (count == 1 and ack == ACK_OK
+                      and version == bytes([PROTOCOL_VERSION]))
+                _, ack = client.cmd(CMD_INTERFACE_TEST_ALIVE)
+                ok = ok and ack == ACK_OK
+                _, ack = client.cmd(CMD_INTERFACE_EXIT)
+                ok = ok and ack == ACK_OK
+            except IOError as ex:
+                ok, detail = False, str(ex)
+            check('fc 4-way session %u' % session, ok, detail)
+    finally:
+        if client is not None:
+            client.close()
+        stub.close()
+
+
 def test_usbip_device(unix=False):
     '''the virtual USB serial device: enumeration and both data
     directions, driven straight over the USB/IP socket so it needs no
@@ -993,6 +1034,7 @@ def main():
     test_dataset_params()
     test_fc_capture(args.sitl)
     test_fc_fourway(args.sitl, args.bootloader)
+    test_fc_reconnect()
     test_usbip_device(unix=False)
     test_usbip_device(unix=True)
 

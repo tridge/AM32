@@ -90,10 +90,12 @@ class PtyEndpoint(object):
 class MspStubFC(object):
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
                  poles=14, rate=500.0, esc_ports=None, state_port=57734,
-                 esc_reset=True, motor=True, verbose=False, endpoint=None):
+                 esc_reset=True, motor=True, verbose=False, endpoint=None,
+                 trace=False):
         self.poles = poles
         self.rate = rate
         self.verbose = verbose
+        self.tracing = trace or os.environ.get('AM32_FC_TRACE') == '1'
         # the ESCs reachable over 4-way passthrough: one SITL input port
         # each, defaulting to the one we drive with DShot
         self.fourway = sitl_fourway_server.FourWayServer(
@@ -135,6 +137,15 @@ class MspStubFC(object):
     def _log(self, msg):
         if self.verbose:
             print('FC: %s' % msg, file=sys.stderr, flush=True)
+
+    def _trace(self, direction, data):
+        '''byte level trace of the configurator link, for working out
+        which side of a failed session went quiet. AM32_FC_TRACE=1 turns
+        it on for a stub started by the GUI, which has no command line'''
+        if not self.tracing or not data:
+            return
+        print('FC %s %3u: %s' % (direction, len(data), data.hex(' ')),
+              file=sys.stderr, flush=True)
 
     def close(self):
         self.running = False
@@ -216,7 +227,9 @@ class MspStubFC(object):
         ck = 0
         for b in hdr + payload:
             ck ^= b
-        self.ep.write(b'$M>' + hdr + payload + bytes([ck]))
+        out = b'$M>' + hdr + payload + bytes([ck])
+        self._trace('tx', out)
+        self.ep.write(out)
 
     def _handle(self, cmd, payload):
         if cmd == MSP_API_VERSION:
@@ -252,6 +265,7 @@ class MspStubFC(object):
             # cells, capacity, voltage in 0.1V, mAh drawn, current in 0.01A
             self._reply(cmd, struct.pack('<BHBHH', 4, 1500, 126, 0, 0))
         elif cmd == MSP_SET_PASSTHROUGH:
+            self.fourway.begin()
             self._reply(cmd, bytes([self.fourway.esc_count]))
             self._log('4-way passthrough to %u ESC(s)'
                       % self.fourway.esc_count)
@@ -268,6 +282,7 @@ class MspStubFC(object):
         '''run the 4-way session until the client exits the interface'''
         resp = self.fourway.feed(chunk)
         if resp:
+            self._trace('tx', resp)
             # a 4-way client is strictly request/response, so anything
             # waiting for us now is a retry of the command we just
             # answered (a 256 byte read is 130ms of 19200 baud wire time,
@@ -288,6 +303,7 @@ class MspStubFC(object):
             chunk = self.ep.read(0.1)
             if not chunk:
                 continue
+            self._trace('rx', chunk)
             if self.in_fourway:
                 self._fourway(chunk)
                 continue
@@ -352,6 +368,8 @@ def main():
                         help='with --usbip, attach it to vhci_hcd for you')
     parser.add_argument('--poles', type=int, default=14)
     parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--trace', action='store_true',
+                        help='hex dump every byte to and from the client')
     args = parser.parse_args()
 
     ports = None
@@ -372,7 +390,7 @@ def main():
                      state_port=args.state_port,
                      esc_reset=not args.no_esc_reset,
                      motor=not args.no_motor, verbose=args.verbose,
-                     endpoint=endpoint)
+                     endpoint=endpoint, trace=args.trace)
     if args.usbip:
         print('virtual FC exported on %s' % endpoint.endpoint,
               file=sys.stderr, flush=True)
