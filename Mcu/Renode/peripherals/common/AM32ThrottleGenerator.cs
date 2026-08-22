@@ -50,10 +50,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                          INumberedGPIOOutput, IGPIOReceiver
     {
         public AM32ThrottleGenerator(IMachine machine,
-                                     bool batchDshotFrames = false)
+                                     bool batchDshotFrames = false,
+                                     INumberedGPIOOutput escPort = null,
+                                     int escPin = -1)
         {
             this.machine = machine;
             BatchDshotFrames = batchDshotFrames;
+            // The ESC's own drive of the signal pin, needed to decode the
+            // bootloader's bit banged serial reply. Wired here rather than
+            // in the platform file because re-opening a peripheral block
+            // in a repl does not add connections; Connect() appends an
+            // endpoint alongside the port's existing EXTI wiring.
+            if(escPort != null && escPin >= 0)
+            {
+                escPort.Connections[escPin].Connect(this, 1);
+            }
             var conns = new Dictionary<int, IGPIO>();
             conns[0] = new GPIO();
             Connections = conns;
@@ -408,16 +419,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        // the ESC's end of the shared wire
+        // the ESC's end of the shared wire: input 0 is the capture
+        // timer's reply tap (bidirectional dshot), input 1 the signal
+        // pin's own level (the bootloader's bit banged serial)
         public void OnGPIO(int number, bool value)
         {
-            if(number != 0)
+            if(number != 0 && number != 1)
             {
                 return;
             }
             escLevel = value;
             if(serialMode)
             {
+                if(forcingWire)
+                {
+                    return;
+                }
                 if(value != serialIdleHigh)
                 {
                     escQuietTicks = EscQuietTicks;
@@ -564,11 +581,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // Renode's GPIO only propagates a change, so a level the far end
-        // has forgotten needs the flip to get there
+        // has forgotten needs the flip to get there. The flip comes back
+        // to us through the port's echo, and must not be mistaken for the
+        // ESC starting a byte, so the receiver is gated while it runs.
         private void ForceWire(bool level)
         {
+            forcingWire = true;
             Connections[0].Set(!level);
             Connections[0].Set(level);
+            forcingWire = false;
         }
 
         private void HoldStep()
@@ -808,6 +829,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const ulong HoldNs = 250000;      // idle level refresh
         private const int EscQuietTicks = 8;      // refreshes to skip after
         private int escQuietTicks;                // the ESC drove the wire
+        private bool forcingWire;
         private int rxBit;
         private byte rxByte;
         private bool high;

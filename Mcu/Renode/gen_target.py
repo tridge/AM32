@@ -1086,14 +1086,11 @@ def a153_platform(cfg, sigrok=False):
         '',
         'throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x%08X'
         % FAMILY['a153']['throttle'],
+        '    escPort: gpio%d' % cfg['input_gpio'],
+        '    escPin: %d' % cfg['input_pin'],
         '    0 -> ctimer0@0 | gpio%d@%d%s' % (
             cfg['input_gpio'], cfg['input_pin'],
             ' | sigrok@0' if sigrok else ''),
-        '',
-        '// the ESC end of the shared wire, for the bootloader\'s',
-        '// bit banged serial reply (see the generic families above)',
-        'gpio%d:' % cfg['input_gpio'],
-        '    %d -> throttle@0' % cfg['input_pin'],
         '',
         '// the phase pin arguments are never used on this family: the',
         '// FlexPWM is an IAM32PwmSource, which replaces the GPIO+timer',
@@ -1565,6 +1562,8 @@ def platform(cfg, sigrok=False):
         '',
         'throttle: Miscellaneous.AM32ThrottleGenerator @ sysbus 0x%08X'
         % spec['throttle'],
+        '    escPort: gpioPort%s' % tp[1],
+        '    escPin: %s' % tp[2:],
     ] + ([
         # TIM15 can consume a complete DShot frame and reply DMA at once,
         # avoiding tens of thousands of host clock callbacks per second.
@@ -1572,15 +1571,6 @@ def platform(cfg, sigrok=False):
     ] if fam == 'l431' else []) + [
         '    0 -> %s@0 | gpioPort%s@%s%s' % (
             cap, tp[1], tp[2:], ' | sigrok@0' if sigrok else ''),
-        '',
-        '// The other half of the shared wire: what the ESC itself drives',
-        '// on the signal pin. The firmware only drives it for a',
-        '// bidirectional dshot reply, which leaves through the reply',
-        '// source instead, but the bootloader bit bangs its serial',
-        '// answer straight onto the pin, and that has to reach the',
-        '// generator to be decoded.',
-        'gpioPort%s:' % tp[1],
-        '    %s -> exti@%s | throttle@0' % (tp[2:], tp[2:]),
         '',
         '// Serves the SITL wire protocols to sitl_gui.py. The ports are',
         '// left closed here and opened from the .resc, so a run that is',
