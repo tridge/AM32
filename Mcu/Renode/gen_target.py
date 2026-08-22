@@ -1978,6 +1978,77 @@ def symbol_addresses(elf, names, nm='arm-none-eabi-nm'):
     return found
 
 
+def elf_bytes_at(elf, vaddr, size):
+    '''the file bytes backing [vaddr, vaddr+size) in a little-endian
+       ELF32, or None when no load segment covers them'''
+    with open(elf, 'rb') as f:
+        data = f.read()
+    if len(data) < 52 or data[:4] != b'\x7fELF' or data[4] != 1:
+        return None
+    phoff = struct.unpack_from('<I', data, 28)[0]
+    phentsize, phnum = struct.unpack_from('<HH', data, 42)
+    for i in range(phnum):
+        off = phoff + i * phentsize
+        p_type, p_offset, p_vaddr, _pa, p_filesz, _ms = \
+            struct.unpack_from('<IIIIII', data, off)
+        if p_type != 1:
+            continue
+        if p_vaddr <= vaddr and vaddr + size <= p_vaddr + p_filesz:
+            start = p_offset + (vaddr - p_vaddr)
+            return data[start:start + size]
+    return None
+
+
+def thumb_expand_imm(imm12):
+    '''ARMv7-M ThumbExpandImm: the modified-immediate encoding'''
+    if (imm12 >> 10) & 3 == 0:
+        v = imm12 & 0xFF
+        return [v, v | v << 16, v << 8 | v << 24,
+                v | v << 8 | v << 16 | v << 24][(imm12 >> 8) & 3]
+    rot = imm12 >> 7
+    v = 0x80 | (imm12 & 0x7F)
+    return ((v >> rot) | (v << (32 - rot))) & 0xFFFFFFFF
+
+
+def gpio_read_idr(elf, fn):
+    '''Recognise the bootloader's gpio_read body and return (idr_addr,
+       ubfx_halfword2): the IDR address its load hits and the second
+       halfword of its ubfx (which carries the pin number). Two compiled
+       shapes exist, depending on whether the port base fits a Thumb
+       modified immediate:
+           mov.w r3, #<base>    ; ldr r0, [r3, #<idr>]   (12 bytes)
+           ldr   r3, [pc, #n]   ; ldr r0, [r3, #<idr>]   (literal pool)
+       each followed by ubfx r0, r0, #pin, #1; bx lr. Returns None for
+       anything else (e.g. a build that inlined the function away).'''
+    code = elf_bytes_at(elf, fn, 12)
+    if code is None:
+        return None
+    hw = struct.unpack('<6H', code)
+
+    def ubfx_ok(a, b):
+        # ubfx r0, r0, #lsb, #1: rd 0, width 1, any lsb (the pin)
+        return a == 0xF3C0 and b & 0x8F3F == 0
+
+    def ldr_r0_r3(h):
+        return h & 0xF83F == 0x6818
+
+    if (hw[0] == 0xF04F and (hw[1] >> 8) & 0xF == 3 and ldr_r0_r3(hw[2])
+            and ubfx_ok(hw[3], hw[4]) and hw[5] == 0x4770):
+        imm12 = (((hw[0] >> 10) & 1) << 11) | (((hw[1] >> 12) & 7) << 8) \
+            | (hw[1] & 0xFF)
+        base = thumb_expand_imm(imm12)
+        return base + (((hw[2] >> 6) & 0x1F) << 2), hw[4]
+    if (hw[0] & 0xFF00 == 0x4B00 and ldr_r0_r3(hw[1])
+            and ubfx_ok(hw[2], hw[3]) and hw[4] == 0x4770):
+        literal = ((fn + 4) & ~3) + (hw[0] & 0xFF) * 4
+        word = elf_bytes_at(elf, literal, 4)
+        if word is None:
+            return None
+        base = struct.unpack('<I', word)[0]
+        return base + (((hw[1] >> 6) & 0x1F) << 2), hw[3]
+    return None
+
+
 def write_status(path, elf, nm='arm-none-eabi-nm'):
     '''per-target monitor helpers, with the symbol table baked in'''
     try:
@@ -2397,7 +2468,8 @@ def main():
             # the throttle peripheral instead. See SkipDelay in
             # AM32ThrottleGenerator.cs.
             addrs = symbol_addresses(args.bootloader_elf,
-                                     ('delayMicroseconds', 'us_start'),
+                                     ('delayMicroseconds', 'us_start',
+                                      'gpio_read', 'gpio_read.constprop.0'),
                                      args.nm_bin)
             # the bootloader's utility timer CNT register: TIM2 on the
             # STM32s, TMR3 on the AT32s, TIMER16 on the GD32 (see each
@@ -2426,6 +2498,31 @@ def main():
                 for i in range(0, len(half), 2):
                     setup += ('; sysbus WriteDoubleWord 0x%08X 0x%08X'
                               % (fn + i * 2, half[i] | half[i + 1] << 16))
+            # The serial WAIT loops burn the same way the delay loops
+            # did, polling the signal pin's IDR. Patch gpio_read so its
+            # load goes through the throttle peripheral (base + 0x24),
+            # which returns the real IDR content and, only while the
+            # wire is idle, jumps virtual time forward a little (see
+            # PinReadSkip in AM32ThrottleGenerator.cs). The replacement
+            # keeps the original ubfx, so the pin number is untouched:
+            #   mov.w r3, #<throttle> ; ldr r0, [r3, #0x24]
+            #   ubfx  r0, r0, #pin, #1 ; bx lr
+            gr = addrs.get('gpio_read.constprop.0', addrs.get('gpio_read'))
+            magic = FAMILY[cfg['family']]['throttle']
+            if gr is not None and magic == 0x60000000:
+                gr &= ~1
+                decoded = gpio_read_idr(args.bootloader_elf, gr)
+                if decoded is not None:
+                    idr, ubfx2 = decoded
+                    setup += '; throttle SkipPinIdr 0x%08X' % idr
+                    half = (0xF04F, 0x43C0,   # mov.w r3, #0x60000000
+                            0x6A58,           # ldr r0, [r3, #0x24]
+                            0xF3C0, ubfx2,    # the original ubfx
+                            0x4770)           # bx lr
+                    for i in range(0, len(half), 2):
+                        setup += ('; sysbus WriteDoubleWord 0x%08X 0x%08X'
+                                  % (gr + i * 2,
+                                     half[i] | half[i + 1] << 16))
 
     # without the physics the bridge never starts and the motor cannot
     # turn, so a bare --run would boot and then look broken

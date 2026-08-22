@@ -110,6 +110,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                        workMode: WorkMode.Periodic,
                                        eventEnabled: true);
             holdTimer.LimitReached += HoldStep;
+            // a free-running nanosecond clock: unlike
+            // machine.ElapsedVirtualTime, a timer's value is
+            // interpolated by the reporting CPU's own progress, so a
+            // read from guest context gives the guest's clock at
+            // sub-quantum precision - which is what lets AdvanceWire
+            // place wire levels exactly where the bootloader samples
+            clockTimer = new LimitTimer(machine.ClockSource, 1000000000,
+                                        this, "serialclock",
+                                        long.MaxValue,
+                                        direction: Direction.Ascending,
+                                        enabled: true, autoUpdate: true,
+                                        workMode: WorkMode.Periodic,
+                                        eventEnabled: false);
             PulseUs = 1000;
             FrameUs = DefaultFrameUs;
             Protocol = 0;
@@ -131,6 +144,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x08: return Protocol;
             case 0x0C: return DshotValue;
             case 0x10: return Bidirectional ? 1u : 0u;
+            case 0x24: return PinReadSkip();
             default: return 0;
             }
         }
@@ -558,6 +572,68 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong SkipDelayTimerCnt { get; set; }
         public ulong SkipDelayElapsedVar { get; set; }
 
+        // The bootloader's serial wait loops poll the signal pin's IDR
+        // (and the utility timer) once per handful of instructions, the
+        // same native-to-managed burn as the delay loops. The generated
+        // target script redirects gpio_read's IDR load here: the read
+        // returns the real IDR content, and - only while nothing is on
+        // the wire and nothing is queued to go onto it - jumps virtual
+        // time forward a little, so an idle wait costs one iteration
+        // per SkipWaitUs of virtual time instead of one per ~200ns.
+        // The skip stays under half a 19200 baud bit so start-bit
+        // detection keeps its margin, and it is withheld whenever the
+        // generator is driving bits (the guest is then mid-byte,
+        // sampling at exact delayMicroseconds offsets).
+        public ulong SkipPinIdr { get; set; }
+        public uint SkipWaitUs { get; set; } = 15;
+
+        private uint PinReadSkip()
+        {
+            if(SkipPinIdr == 0)
+            {
+                return 0;
+            }
+            var now = NowNs();
+            if(machine.SystemBus.TryGetCurrentCPU(out var icpu)
+               && icpu is TranslationCPU tcpu)
+            {
+                ulong skip = 0;
+                if(!txDriving)
+                {
+                    bool pending;
+                    lock(serialSync)
+                    {
+                        pending = txBits.Count > 0;
+                    }
+                    if(!pending)
+                    {
+                        skip = SkipWaitUs;
+                    }
+                }
+                else if(now - lastDelayNs > 200000
+                        && txDeadlineNs > now + 1000)
+                {
+                    // Mid-transmission the guest is either sampling bits
+                    // (always within a delayMicroseconds or two of the
+                    // last one - do not disturb its timing) or spinning
+                    // in a start-bit wait across a level run, where time
+                    // can be skipped as long as no edge is crossed: the
+                    // level cannot change before the run's deadline.
+                    skip = System.Math.Min((ulong)SkipWaitUs,
+                                           (txDeadlineNs - now) / 1000);
+                }
+                if(skip > 0)
+                {
+                    // skip first, then sample: an edge landing inside
+                    // the skipped stretch is visible to this very read
+                    tcpu.SkipTime(TimeInterval.FromMicroseconds(skip));
+                    now = NowNs();
+                }
+            }
+            AdvanceWire(now);
+            return machine.SystemBus.ReadDoubleWord(SkipPinIdr);
+        }
+
         private void SkipDelay(uint us)
         {
             if(us == 0 || !machine.SystemBus.TryGetCurrentCPU(out var icpu)
@@ -566,6 +642,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             tcpu.SkipTime(TimeInterval.FromMicroseconds(us));
+            lastDelayNs = NowNs();
             if(SkipDelayTimerCnt != 0 && SkipDelayElapsedVar != 0)
             {
                 // the patched-out function stored the timer count in
@@ -673,13 +750,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             txDriving = true;
             txDeadlineNs = NowNs();
-            SerialStep();
+            AdvanceWire(txDeadlineNs, reschedule: true);
         }
 
         private ulong NowNs()
         {
-            return (ulong)(machine.ElapsedVirtualTime.TimeElapsed
-                           .TotalMicroseconds * 1000.0);
+            return clockTimer.Value;
         }
 
         private void SerialStep()
@@ -691,41 +767,82 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 SerialKick();
                 return;
             }
-            // One timer event per wire EDGE, not per bit: a run of equal
-            // bits is a single level held for run*bitNs. Serial framing
-            // makes runs common (start+zeros, data runs, stop+idle), so
-            // this roughly halves the host callbacks per byte - which is
-            // where an emulated flash spends its time. The next deadline
-            // is computed in virtual time so a late callback (they land
-            // on quantum boundaries) does not stretch the byte.
-            bool bit;
-            var run = 0;
+            AdvanceWire(NowNs(), reschedule: true);
+        }
+
+        // Drive the wire through every transition whose time has come.
+        // The timer only guarantees progress: timer events land on
+        // quantum boundaries, so a bootloader sampling at exact
+        // delayMicroseconds offsets would see edges up to a quantum
+        // late and misread bits near the boundary. The patched
+        // gpio_read calls in here too, so the level a sample returns is
+        // computed for the guest's precise virtual time. Deadlines are
+        // virtual, one per EDGE (a run of equal bits is one level held
+        // for run*bitNs), so lateness never accumulates into the byte.
+        private void AdvanceWire(ulong now, bool reschedule = false)
+        {
+            // dirty fast path: the guest calls this on every pin read,
+            // mostly finding nothing due yet
+            if(!txDriving || (!reschedule && now < txDeadlineNs))
+            {
+                return;
+            }
+            var edges = new System.Collections.Generic.List<bool>();
+            var drained = false;
             lock(serialSync)
             {
-                if(txBits.Count == 0)
+                if(!txDriving)
                 {
-                    txDriving = false;
-                    // everything queued has left the wire: tell the
-                    // serial client, whose echo pacing runs on our
-                    // virtual clock, not its own
-                    txDrainedEvent = true;
-                    // release: the ESC answers into the idle line
-                    DriveSerialIdle();
                     return;
                 }
-                bit = txBits.Dequeue();
-                run = 1;
-                while(txBits.Count > 0 && txBits.Peek() == bit)
+                while(now >= txDeadlineNs)
                 {
-                    txBits.Dequeue();
-                    run++;
+                    if(txBits.Count == 0)
+                    {
+                        txDriving = false;
+                        // everything queued has left the wire: tell the
+                        // serial client, whose echo pacing runs on our
+                        // virtual clock, not its own
+                        txDrainedEvent = true;
+                        drained = true;
+                        break;
+                    }
+                    var bit = txBits.Dequeue();
+                    var run = 1;
+                    while(txBits.Count > 0 && txBits.Peek() == bit)
+                    {
+                        txBits.Dequeue();
+                        run++;
+                    }
+                    edges.Add(bit);
+                    txDeadlineNs += (ulong)run * SerialBitNs();
                 }
             }
-            Connections[0].Set(bit);
-            txDeadlineNs += (ulong)run * SerialBitNs();
-            var now = NowNs();
-            serialTimer.Limit = txDeadlineNs > now ? txDeadlineNs - now : 1;
-            serialTimer.Enabled = true;
+            if(edges.Count > 2)
+            {
+                this.Log(LogLevel.Warning,
+                         "COLLAPSE {0} runs at now={1} dl={2}",
+                         edges.Count, now, txDeadlineNs);
+            }
+            foreach(var bit in edges)
+            {
+                Connections[0].Set(bit);
+            }
+            if(drained)
+            {
+                // release: the ESC answers into the idle line
+                DriveSerialIdle();
+                return;
+            }
+            // guest-context calls keep the wire advanced by themselves;
+            // re-arming the timer thousands of times per frame would
+            // only churn the clock source
+            if(reschedule || !serialTimer.Enabled)
+            {
+                serialTimer.Limit = txDeadlineNs > now ? txDeadlineNs - now
+                    : 1;
+                serialTimer.Enabled = true;
+            }
         }
 
         // Decode the ESC's reply from its own edges rather than by
@@ -739,6 +856,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void SerialRxEdge(bool level)
         {
             var now = NowNs();
+            if(txDriving)
+            {
+                // The guest samples our final stop bit mid-bit and can
+                // start its reply before that bit's period has formally
+                // ended; bring the drain bookkeeping up to its clock or
+                // the reply's start edge would be discarded as our own.
+                AdvanceWire(now);
+            }
             if(!rxActive)
             {
                 if(level || txDriving)
@@ -943,6 +1068,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly LimitTimer serialTimer;
         private readonly LimitTimer rxTimer;
         private readonly LimitTimer holdTimer;
+        private readonly LimitTimer clockTimer;
         private readonly object serialSync = new object();
         private readonly Queue<bool> txBits = new Queue<bool>();
         private readonly Queue<byte> serialRx = new Queue<byte>();
@@ -954,6 +1080,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool serialIdleHigh = true;
         private bool txDriving;
         private bool txDrainedEvent;
+        private ulong lastDelayNs;
         private bool rxActive;
         private ulong rxStartNs;
         private int rxFilled;
