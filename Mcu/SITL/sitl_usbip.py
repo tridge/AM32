@@ -610,11 +610,13 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
         return subprocess.run(cmd, check=False).returncode == 0
     sock, devid, speed = import_device(unix_path, host, port, busid)
     try:
-        vhci_port = attach_socket(sock, devid, speed)
+        attach_socket(sock, devid, speed)
     except OSError:
         sock.close()
         raise
-    return vhci_port
+    # True, not the port number: vhci port 0 is a perfectly good
+    # attachment, and callers test the return for truth
+    return True
 
 
 def detach(port=None):
@@ -691,11 +693,11 @@ def main():
         spec = args.attach_to
         if ':' in spec and not spec.startswith('@') and '/' not in spec:
             host, _, port = spec.rpartition(':')
-            vhci_port = attach(host=host, port=int(port))
+            ok = attach(host=host, port=int(port))
         else:
-            vhci_port = attach(unix_path=spec)
-        print('attached on vhci port %u' % vhci_port, file=sys.stderr)
-        return 0
+            ok = attach(unix_path=spec)
+        print('attached' if ok else 'attach failed', file=sys.stderr)
+        return 0 if ok else 1
 
     server = UsbipServer(unix_path=args.socket, host=args.host,
                          port=args.port, serial=args.serial, log=log)
