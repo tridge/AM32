@@ -85,6 +85,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                      workMode: WorkMode.OneShot,
                                      eventEnabled: true);
             rxTimer.LimitReached += SerialRxSample;
+            // Renode propagates only GPIO changes, and the guest's own
+            // writes to the pin overwrite the port's view of it, so the
+            // level an idle adapter holds has to be put back
+            // periodically or it quietly stops being there. Both edges of
+            // the refresh land in one host callback, so no guest
+            // instruction can observe the intermediate level.
+            holdTimer = new LimitTimer(machine.ClockSource, 1000000000, this,
+                                       "serialhold", HoldNs,
+                                       direction: Direction.Ascending,
+                                       enabled: false, autoUpdate: true,
+                                       workMode: WorkMode.Periodic,
+                                       eventEnabled: true);
+            holdTimer.LimitReached += HoldStep;
             PulseUs = 1000;
             FrameUs = DefaultFrameUs;
             Protocol = 0;
@@ -257,6 +270,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // too - a short delay, since peripheral reset order is
                 // not defined.
                 reassertPending = true;
+                escQuietTicks = 0;
+                holdTimer.Enabled = true;
                 serialTimer.Limit = ReassertNs;
                 serialTimer.Enabled = true;
                 return;
@@ -403,6 +418,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             escLevel = value;
             if(serialMode)
             {
+                if(value != serialIdleHigh)
+                {
+                    escQuietTicks = EscQuietTicks;
+                }
                 // the ESC's reply is decoded from its own pin rather than
                 // from the shared wire, so our idle drive cannot mask it
                 SerialRxEdge(value);
@@ -509,6 +528,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             high = false;
             serialIdleHigh = true;
             DriveSerialIdle();
+            holdTimer.Enabled = true;
         }
 
         public void LeaveSerialMode()
@@ -518,6 +538,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             serialMode = false;
+            holdTimer.Enabled = false;
             serialTimer.Enabled = false;
             rxTimer.Enabled = false;
             rxActive = false;
@@ -548,6 +569,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             Connections[0].Set(!level);
             Connections[0].Set(level);
+        }
+
+        private void HoldStep()
+        {
+            if(!serialMode || txDriving || rxActive)
+            {
+                return;
+            }
+            if(escQuietTicks > 0)
+            {
+                // the ESC is talking: the wire is its own until it stops
+                escQuietTicks--;
+                return;
+            }
+            ForceWire(serialIdleHigh);
         }
 
         private void SerialKick()
@@ -755,6 +791,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly LimitTimer frameTimer;
         private readonly LimitTimer serialTimer;
         private readonly LimitTimer rxTimer;
+        private readonly LimitTimer holdTimer;
         private readonly object serialSync = new object();
         private readonly Queue<bool> txBits = new Queue<bool>();
         private readonly Queue<byte> serialRx = new Queue<byte>();
@@ -768,6 +805,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool rxActive;
         private bool reassertPending;
         private const ulong ReassertNs = 20000;   // 20us after a reset
+        private const ulong HoldNs = 250000;      // idle level refresh
+        private const int EscQuietTicks = 8;      // refreshes to skip after
+        private int escQuietTicks;                // the ESC drove the wire
         private int rxBit;
         private byte rxByte;
         private bool high;

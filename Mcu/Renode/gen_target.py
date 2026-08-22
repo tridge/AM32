@@ -1715,6 +1715,12 @@ def bootloader_script(cfg, bootloader_elf, lma_segments=None):
         '"""',
         '    cpu VectorTableOffset 0x%08X' % boot_base,
         '"""',
+        '',
+        '# The bootloader bit bangs its serial by polling the signal pin',
+        '# from the CPU, so wire edges have to reach it inside a bit time.',
+        '# The default quantum is twice a 19200 baud bit, which mangles',
+        '# every frame; this is only paid on bootloader runs.',
+        'emulation SetGlobalQuantum "0.000005"',
     ]
     if cfg['family'] in ('f051', 'f031'):
         # These Cortex-M0 parts have no VTOR. On hardware initAfterJump()
