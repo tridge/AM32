@@ -2508,16 +2508,35 @@ def main():
             # keeps the original ubfx, so the pin number is untouched:
             #   mov.w r3, #<throttle> ; ldr r0, [r3, #0x24]
             #   ubfx  r0, r0, #pin, #1 ; bx lr
-            # The pin-poll skip (patching bl_pin_read to read through
-            # the throttle's skipping register) is deliberately NOT
-            # applied: it lifts the idle bootloader from ~0.07x to
-            # ~1.1x realtime, but under host load the skipped wait
-            # loops make transfers shed ACKs - a flash goes from zero
-            # retried chunks to ~150 recovered ones - and on the AT32s
-            # a SkipTime from the pin poll deadlocks Renode's time
-            # framework outright after a guest flash write. Transfers
-            # matter more than idle. gpio_read_idr() and the
-            # generator's SkipPinIdr register remain for revisiting.
+            # Patch the pin poll (bl_pin_read, or older bootloaders'
+            # out-of-line gpio_read) to read through the throttle's
+            # skipping register: an idle bootloader then runs at ~1.1x
+            # realtime instead of ~0.07x, and with the wire input
+            # applied from the Tick the transfers stay at zero retried
+            # chunks. Only on the families where that is demonstrated -
+            # on the AT32s the same patch still breaks the write path,
+            # and they are already fast enough on the delay skip alone.
+            gr = None
+            for name in ('bl_pin_read', 'bl_pin_read.constprop.0',
+                         'gpio_read.constprop.0', 'gpio_read'):
+                if name in addrs:
+                    gr = addrs[name]
+                    break
+            magic = FAMILY[cfg['family']]['throttle']
+            if (gr is not None and magic == 0x60000000
+                    and cfg['family'] in ('l431', 'g431')):
+                gr &= ~1
+                decoded = gpio_read_idr(args.bootloader_elf, gr)
+                if decoded is not None:
+                    idr, ubfx2, _form = decoded
+                    setup += '; throttle SkipPinIdr 0x%08X' % idr
+                    half = (0xF04F, 0x43C0,   # mov.w r3, #0x60000000
+                            0x6A58,           # ldr r0, [r3, #0x24]
+                            0xF3C0, ubfx2,    # the original ubfx
+                            0x4770)           # bx lr
+                    for i, h in enumerate(half):
+                        setup += ('; sysbus WriteWord 0x%08X 0x%04X'
+                                  % (gr + i * 2, h))
 
     # without the physics the bridge never starts and the motor cannot
     # turn, so a bare --run would boot and then look broken
