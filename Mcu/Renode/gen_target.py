@@ -2158,9 +2158,12 @@ def decode_delay(img, tail):
     if b is None:
         return None
     uxth, strh, ldr3 = struct.unpack('<3H', b)
-    # uxth r2 ; strh r2, [r3] ; ldr r3, [r1, #off]
-    if uxth != 0xB292 or strh != 0x801A or (ldr3 & 0xF83F) != 0x680B:
+    # uxth r2 ; strh r2, [r3, #n] ; ldr r3, [r1, #off] - older
+    # bootloaders keep us_start inside a struct, hence the strh offset
+    if uxth != 0xB292 or (strh & 0xF83F) != 0x801A \
+            or (ldr3 & 0xF83F) != 0x680B:
         return None
+    strh_off = ((strh >> 6) & 0x1F) * 2
     off = ((ldr3 >> 6) & 0x1F) * 4
     ldr2 = 0x680A | (ldr3 & 0x07C0)   # the matching ldr r2, [r1, #off]
     base = fn = us_start = None
@@ -2196,6 +2199,7 @@ def decode_delay(img, tail):
         addr -= 2
     if base is None or us_start is None or not saw_ldr2:
         return None
+    us_start += strh_off
     cnt = base + off
     # a peripheral register and a RAM word, or this is something else
     if not 0x40000000 <= cnt < 0x51000000:
