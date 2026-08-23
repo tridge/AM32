@@ -736,15 +736,21 @@ def main():
 
     grid.addWidget(QLabel('CAN bus'), 4, 0)
     can_spin = QSpinBox()
-    can_spin.setRange(0, 9)
+    can_spin.setRange(-1, 9)
     can_spin.setValue(8)
+    # -1 leaves the mcast socket closed entirely, like a bench ESC with
+    # no CAN cable: any traffic on a shared bus - even another rig's -
+    # carries RawCommands that boot the app out from under a config
+    # session
+    can_spin.setSpecialValueText('off')
     can_spin.setToolTip('mcast bus number for DroneCAN targets '
                         '(239.65.82.N, as the SITL and dronecan_gui_tool '
                         'use); disabled for targets with no CAN.\n'
                         'Defaults off bus 0: CAN traffic from anything '
                         'else - an ArduPilot SITL, another bench rig - '
                         'makes the CAN bootloader boot the app instead '
-                        'of waiting for the configurator.')
+                        'of waiting for the configurator. "off" leaves '
+                        'the CAN unconnected entirely.')
     can_spin.setEnabled(False)
     grid.addWidget(can_spin, 4, 1)
 

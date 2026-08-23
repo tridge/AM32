@@ -62,6 +62,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // in the platform file because re-opening a peripheral block
             // in a repl does not add connections; Connect() appends an
             // endpoint alongside the port's existing EXTI wiring.
+            escPinNumber = escPin < 0 ? 0 : escPin;
             if(escPort != null && escPin >= 0)
             {
                 escPort.Connections[escPin].Connect(this, 1);
@@ -296,6 +297,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // this pin, so push it again once the ports have reset
                 // too - a short delay, since peripheral reset order is
                 // not defined.
+                rxBlankUntilNs = NowNs() + RxBlankNs;
+                // once now, in case the GPIO port reset before us and
+                // is ready to hear it...
+                ForceWire(serialIdleHigh);
+                // ...and once shortly after resume, in case it resets
+                // after us and wipes the level again. The CAN bootloader
+                // samples the pin within its first millisecond to decide
+                // whether a signal is present, and a stale LOW there
+                // reads as one - which waives its raw-command boot gate
+                // and boots the app out from under the config session.
                 reassertPending = true;
                 escQuietTicks = 0;
                 holdTimer.Enabled = true;
@@ -636,6 +647,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
             AdvanceWire(now);
+            if(serialMode && !txDriving && !rxActive)
+            {
+                // an idle wire always sits at the held level; a mismatch
+                // means a machine reset wiped the port's view of it, so
+                // re-drive before the guest samples a stale LOW
+                var idr = machine.SystemBus.ReadDoubleWord(SkipPinIdr);
+                var bit = (idr >> escPinNumber) & 1;
+                if((bit != 0) != serialIdleHigh)
+                {
+                    bool pending;
+                    lock(serialSync)
+                    {
+                        pending = txBits.Count > 0;
+                    }
+                    if(!pending)
+                    {
+                        ForceWire(serialIdleHigh);
+                    }
+                }
+            }
             return machine.SystemBus.ReadDoubleWord(SkipPinIdr);
         }
 
@@ -861,6 +892,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void SerialRxEdge(bool level)
         {
             var now = NowNs();
+            if(now < rxBlankUntilNs)
+            {
+                // A machine reset makes the GPIO port emit its cleared
+                // pin state, which looks exactly like the ESC pulling
+                // the line for a start bit; treating it as one wedges
+                // the receiver (no further edges ever come) with the
+                // wire released low. A real MCU's pin goes high-Z
+                // through reset and the adapter keeps the line at idle,
+                // so ignore esc-side edges for the first moments after
+                // a reset.
+                return;
+            }
             if(txDriving)
             {
                 // The guest samples our final stop bit mid-bit and can
@@ -1085,6 +1128,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool serialIdleHigh = true;
         private bool txDriving;
         private bool txDrainedEvent;
+        private readonly int escPinNumber;
+        private ulong rxBlankUntilNs;
+        // well past every reset-time GPIO emission, well short of the
+        // earliest possible real reply (the guest is still in clock
+        // init): 200us
+        private const ulong RxBlankNs = 200000;
         private ulong lastDelayNs;
         private bool rxActive;
         private ulong rxStartNs;
