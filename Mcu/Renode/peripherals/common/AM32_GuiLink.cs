@@ -27,6 +27,7 @@
 // newest setpoint is the only one that matters) and a bounded queue for
 // state commands.
 //
+using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
@@ -293,8 +294,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     {
                         replyTo = from;
                         serialFrom = from;
+                        // latched, not applied: driving the wire (GPIO
+                        // sets, timers) from a socket thread races the
+                        // CPU thread's own peripheral accesses - on the
+                        // F1-style ports it deadlocks the machine
+                        // outright. Tick applies it in machine context.
+                        pendingSerial.Enqueue(new KeyValuePair<byte[], bool>(
+                            payload, (sflags & FlagGap) != 0));
                     }
-                    generator.QueueSerial(payload, (sflags & FlagGap) != 0);
                     Volatile.Write(ref lastInputMs, Environment.TickCount);
                     continue;
                 }
@@ -383,9 +390,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             case TypeLine:
                 // an adapter holding the wire, which is how the bootloader
-                // is told to stay put at boot; no throttle meaning
-                generator.SetLineLevel((flags & FlagIdleHigh) != 0,
-                                       (flags & FlagFloating) != 0);
+                // is told to stay put at boot; no throttle meaning.
+                // Latched for Tick, like the serial bytes.
+                lock(sync)
+                {
+                    pendingLine = ((flags & FlagIdleHigh) != 0 ? 1 : 0)
+                        | ((flags & FlagFloating) != 0 ? 2 : 0) | 4;
+                }
                 return;
             default:
                 return;
@@ -1106,6 +1117,37 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return;
                 }
             }
+            while(true)
+            {
+                KeyValuePair<byte[], bool> item;
+                int line;
+                lock(sync)
+                {
+                    line = pendingLine;
+                    pendingLine = 0;
+                    if(pendingSerial.Count == 0)
+                    {
+                        if(line == 0)
+                        {
+                            break;
+                        }
+                        item = new KeyValuePair<byte[], bool>(null, false);
+                    }
+                    else
+                    {
+                        item = pendingSerial.Dequeue();
+                    }
+                }
+                if(line != 0)
+                {
+                    generator.SetLineLevel((line & 1) != 0, (line & 2) != 0);
+                }
+                if(item.Key == null)
+                {
+                    break;
+                }
+                generator.QueueSerial(item.Key, item.Value);
+            }
             if(ownsWire && !driving && !silenced)
             {
                 generator.Enabled = false;
@@ -1284,6 +1326,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ushort setData;
         private EndPoint replyTo;
         private EndPoint serialFrom;
+        private readonly Queue<KeyValuePair<byte[], bool>> pendingSerial =
+            new Queue<KeyValuePair<byte[], bool>>();
+        private int pendingLine;   // bit0 level, bit1 floating, bit2 set
 
         private bool ownsWire;
         private bool silenced;
