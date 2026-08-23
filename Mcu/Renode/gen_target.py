@@ -446,6 +446,7 @@ FAMILY = {
         'exti_base': 0x40010400,
         'exti_rtsr': 0x08,
         'exti_ftsr': 0x0C,
+        'exti_pr': (0x14,),
     },
     'g031': {
         'macro': 'MCU_G031',
@@ -474,6 +475,8 @@ FAMILY = {
         'exti_base': 0x40021800,
         'exti_rtsr': 0x00,
         'exti_ftsr': 0x04,
+        # rising and falling pendings live in separate registers here
+        'exti_pr': (0x0C, 0x10),
     },
     'f415': {
         'macro': 'MCU_AT415',
@@ -1189,6 +1192,9 @@ def bemf_block(cfg, spec):
         '    extiBase: 0x%08X' % spec['exti_base'],
         '    rtsrOffset: 0x%02X' % spec['exti_rtsr'],
         '    ftsrOffset: 0x%02X' % spec['exti_ftsr'],
+    ] + [
+        '    pr%sOffset: 0x%02X' % ('' if i == 0 else '2', off)
+        for i, off in enumerate(spec.get('exti_pr', ()))
     ] + [
         '    phase%sLine: %d' % (ph, lines[ph]) for ph in 'ABC'
     ] + ([

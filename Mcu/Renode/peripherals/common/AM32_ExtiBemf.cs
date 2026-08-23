@@ -47,8 +47,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public AM32_ExtiBemf(IMachine machine, ulong extiBase,
                              long rtsrOffset, long ftsrOffset,
                              int phaseALine, int phaseBLine, int phaseCLine,
-                             bool inverted = false)
+                             bool inverted = false,
+                             long prOffset = -1, long pr2Offset = -1)
         {
+            this.prOffset = prOffset;
+            this.pr2Offset = pr2Offset;
             this.inverted = inverted;
             this.machine = machine;
             this.extiBase = extiBase;
@@ -100,10 +103,75 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         count++;
                     }
                 }
+                if(!selectionSeen)
+                {
+                    // Until the firmware has picked a phase, any pending
+                    // on a phase line is a modeling artifact: the pins
+                    // idle at a fixed level, so no real edge can have
+                    // happened - but a guest-initiated reset can leave
+                    // one latched across the EXTI re-init, and the
+                    // F031's interruptRoutine() cannot clear it while
+                    // its commutation globals are still zero, which
+                    // storms the interrupt forever. A real external
+                    // comparator sits quietly on its rail; power-up
+                    // leaves nothing pending. Sweep them, as the bridge
+                    // polls this getter every physics tick.
+                    var mask = 0u;
+                    for(var i = 0; i < 3; i++)
+                    {
+                        mask |= 1u << lines[i];
+                    }
+                    foreach(var off in new[] { prOffset, pr2Offset })
+                    {
+                        if(off < 0)
+                        {
+                            continue;
+                        }
+                        var pend = e.ReadDoubleWord(off) & mask;
+                        if(pend != 0)
+                        {
+                            e.WriteDoubleWord(off, pend);
+                        }
+                    }
+                }
                 if(count == 1)
                 {
-                    lastPhase = phase;
-                    selectionSeen = true;
+                    if(selectionSeen)
+                    {
+                        lastPhase = phase;
+                    }
+                    else
+                    {
+                        // The FIRST selection must be a stable state, not
+                        // a snapshot of the boot-time EXTI init, which
+                        // arms the three lines one write apart: a poll
+                        // landing between those writes sees exactly one
+                        // line armed and would start driving that phase
+                        // pin against its own armed trigger - an
+                        // interrupt storm interruptRoutine() cannot
+                        // clear while its commutation globals are still
+                        // zero. A real changeCompInput() state persists
+                        // for a whole commutation step, so requiring it
+                        // to hold for 100us of virtual time separates
+                        // the two. Once selected, track changes
+                        // instantly, as commutation timing needs.
+                        var now = machine.ElapsedVirtualTime.TimeElapsed
+                            .TotalMicroseconds;
+                        if(pendingPhase != phase)
+                        {
+                            pendingPhase = phase;
+                            pendingSinceUs = now;
+                        }
+                        else if(now - pendingSinceUs >= SelectionStableUs)
+                        {
+                            lastPhase = phase;
+                            selectionSeen = true;
+                        }
+                    }
+                }
+                else
+                {
+                    pendingPhase = -1;
                 }
                 return lastPhase;
             }
@@ -127,6 +195,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             level = false;
             lastPhase = 2;
             selectionSeen = false;
+            pendingPhase = -1;
+            pendingSinceUs = 0;
             // settle the pins at their idle-high level NOW, before the
             // firmware arms the rising triggers: driving them later
             // would make a boot-time rising edge on every phase line,
@@ -145,6 +215,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
             case 0x0: return (uint)SensedPhase;
             case 0x4: return level ? 1u : 0u;
+            case 0x8: return selectionSeen ? 1u : 0u;
+            case 0xC: return (uint)(pendingPhase + 1);
             default: return 0;
             }
         }
@@ -214,6 +286,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             }
         }
+
+        private const double SelectionStableUs = 100;
+
+        private int pendingPhase = -1;
+        private double pendingSinceUs;
+        private readonly long prOffset;
+        private readonly long pr2Offset;
 
         private readonly IMachine machine;
         private readonly ulong extiBase;
