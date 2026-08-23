@@ -1631,6 +1631,17 @@ def ws2812_block(cfg, spec, sigrok=False):
     ] + routes + ['']
 
 
+def image_kind(path):
+    '''elf, hex or bin, by content'''
+    with open(path, 'rb') as f:
+        head = f.read(4)
+    if head == b'\x7fELF':
+        return 'elf'
+    if head[:1] == b':':
+        return 'hex'
+    return 'bin'
+
+
 def bootloader_lma_segments(bootloader_elf, outdir, target):
     '''Extract initialized data whose ELF virtual address is RAM but whose
        physical/load address is flash. Renode's physical-address LoadELF
@@ -1676,8 +1687,41 @@ def bootloader_script(cfg, bootloader_elf, lma_segments=None):
     if bootloader_elf is None:
         return []
     elf = os.path.abspath(bootloader_elf)
+    kind = image_kind(elf)
     lma_loads = ['sysbus LoadBinary @%s 0x%08X' % item
                  for item in (lma_segments or [])]
+    if kind != 'elf':
+        if cfg['family'] == 'v203':
+            # its CPU reset reloads the ELF entry point; a hex or bin
+            # gives it nothing to reload
+            raise Unsupported('the v203 bootloader must be an ELF')
+        boot_base = 0 if cfg['family'] == 'a153' else 0x08000000
+        if kind == 'hex':
+            load = 'sysbus LoadHEX @%s' % elf
+        else:
+            load = 'sysbus LoadBinary @%s 0x%08X' % (elf, boot_base)
+        lines = [
+            '',
+            '# Boot from the supplied bootloader image.',
+            load,
+            'cpu VectorTableOffset 0x%08X' % boot_base,
+            'macro reset',
+            '"""',
+            '    cpu VectorTableOffset 0x%08X' % boot_base,
+            '"""',
+            '',
+            '# see the ELF branch below for why the quantum shrinks here',
+            'emulation SetGlobalQuantum "0.00002"',
+        ]
+        if cfg['family'] in ('f051', 'f031'):
+            # the hook resolves against the application ELF the family
+            # script loaded, so a hex/bin bootloader still gets it; see
+            # the comment on the ELF branch below
+            lines += [
+                'cpu AddSymbolHook "initAfterJump" '
+                '"cpu.VectorTableOffset = 0x%08X"' % cfg['app_base'],
+            ]
+        return lines + ['']
     if cfg['family'] == 'v203':
         # CH32V203 executes through the zero-based flash alias and has no
         # Cortex-M vector table. Its CPU reset does not reload an ELF entry
@@ -1826,7 +1870,7 @@ def generate(target, outdir, nm='arm-none-eabi-gcc', sigrok=False,
     resc = os.path.join(outdir, '%s.resc' % target)
     extra = []
     bootloader_lmas = []
-    if bootloader_elf is not None:
+    if bootloader_elf is not None and image_kind(bootloader_elf) == 'elf':
         bootloader_lmas = bootloader_lma_segments(
             bootloader_elf, outdir, target)
     blank = None
@@ -1982,24 +2026,224 @@ def symbol_addresses(elf, names, nm='arm-none-eabi-nm'):
     return found
 
 
-def elf_bytes_at(elf, vaddr, size):
-    '''the file bytes backing [vaddr, vaddr+size) in a little-endian
-       ELF32, or None when no load segment covers them'''
-    with open(elf, 'rb') as f:
-        data = f.read()
-    if len(data) < 52 or data[:4] != b'\x7fELF' or data[4] != 1:
-        return None
+def parse_ihex(data):
+    '''Intel HEX to a list of (address, bytes) chunks, adjacent records
+       merged'''
+    upper = 0
+    records = []
+    for line in data.decode('ascii', errors='replace').splitlines():
+        line = line.strip()
+        if not line.startswith(':'):
+            continue
+        try:
+            rec = bytes.fromhex(line[1:])
+        except ValueError:
+            raise Unsupported('bad Intel HEX record: %s' % line[:30])
+        if len(rec) < 5 or (sum(rec) & 0xFF) != 0:
+            raise Unsupported('bad Intel HEX checksum: %s' % line[:30])
+        count, rtype = rec[0], rec[3]
+        addr = rec[1] << 8 | rec[2]
+        payload = rec[4:4 + count]
+        if rtype == 0:
+            records.append((upper + addr, payload))
+        elif rtype == 4:
+            upper = (payload[0] << 8 | payload[1]) << 16
+        elif rtype == 2:
+            upper = (payload[0] << 8 | payload[1]) << 4
+        elif rtype == 1:
+            break
+    records.sort(key=lambda r: r[0])
+    chunks = []
+    for addr, payload in records:
+        if chunks and chunks[-1][0] + len(chunks[-1][1]) == addr:
+            chunks[-1] = (chunks[-1][0], chunks[-1][1] + payload)
+        else:
+            chunks.append((addr, payload))
+    return [(a, bytes(b)) for a, b in chunks]
+
+
+def elf_chunks(data):
+    '''the load segments of a little-endian ELF32 as (vaddr, bytes)'''
+    if len(data) < 52 or data[4] != 1:
+        raise Unsupported('not a little-endian ELF32 file')
     phoff = struct.unpack_from('<I', data, 28)[0]
     phentsize, phnum = struct.unpack_from('<HH', data, 42)
+    chunks = []
     for i in range(phnum):
         off = phoff + i * phentsize
         p_type, p_offset, p_vaddr, _pa, p_filesz, _ms = \
             struct.unpack_from('<IIIIII', data, off)
-        if p_type != 1:
-            continue
-        if p_vaddr <= vaddr and vaddr + size <= p_vaddr + p_filesz:
-            start = p_offset + (vaddr - p_vaddr)
-            return data[start:start + size]
+        if p_type == 1 and p_filesz > 0:
+            chunks.append((p_vaddr, data[p_offset:p_offset + p_filesz]))
+    return chunks
+
+
+class BootImage:
+    '''A bootloader image the patch locators can work on, from an ELF
+       (with its symbol table), an Intel HEX or a raw binary. The
+       chunks are what ends up in the machine's memory.'''
+
+    def __init__(self, path, nm='arm-none-eabi-nm', flash_base=0x08000000):
+        self.path = os.path.abspath(path)
+        self.nm = nm
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[:4] == b'\x7fELF':
+            self.kind = 'elf'
+            self.chunks = elf_chunks(data)
+        elif data[:1] == b':':
+            self.kind = 'hex'
+            self.chunks = parse_ihex(data)
+        else:
+            self.kind = 'bin'
+            self.chunks = [(flash_base, data)]
+
+    def symbol(self, names):
+        '''the first of names present in the symbol table, or None (a
+           hex or bin has no symbols at all)'''
+        if self.kind != 'elf':
+            return None
+        addrs = symbol_addresses(self.path, names, self.nm)
+        for name in names:
+            if name in addrs:
+                return addrs[name]
+        return None
+
+    def bytes_at(self, vaddr, size):
+        for base, blob in self.chunks:
+            if base <= vaddr and vaddr + size <= base + len(blob):
+                start = vaddr - base
+                return blob[start:start + size]
+        return None
+
+    def word_at(self, vaddr):
+        b = self.bytes_at(vaddr, 4)
+        return struct.unpack('<I', b)[0] if b is not None else None
+
+    def scan(self, pattern):
+        '''every address where pattern occurs, halfword aligned'''
+        hits = []
+        for base, blob in self.chunks:
+            off = 0
+            while True:
+                off = blob.find(pattern, off)
+                if off < 0:
+                    break
+                if (base + off) % 2 == 0:
+                    hits.append(base + off)
+                off += 2
+        return hits
+
+
+# delayMicroseconds' poll loop ends in the same five halfwords on every
+# Thumb family:
+#     subs r3, r2 ; uxth r3 ; cmp r0, r3 ; bhi <loop> ; bx lr
+# What varies is how the timer CNT and &us_start reach r1/r3: a Thumb-2
+# modified immediate, a movs+lsls pair, or pc literals, with the CNT
+# load offset differing per family. decode_delay() anchors on the tail
+# and walks backwards, recovering both addresses from the instructions.
+DELAY_TAIL = struct.pack('<5H', 0x1A9B, 0xB29B, 0x4298, 0xD8FA, 0x4770)
+
+
+def decode_delay(img, tail):
+    '''(fn, cnt_address, us_start_address) when tail is the subs of a
+       recognised delayMicroseconds loop, else None'''
+    b = img.bytes_at(tail - 6, 6)
+    if b is None:
+        return None
+    uxth, strh, ldr3 = struct.unpack('<3H', b)
+    # uxth r2 ; strh r2, [r3] ; ldr r3, [r1, #off]
+    if uxth != 0xB292 or strh != 0x801A or (ldr3 & 0xF83F) != 0x680B:
+        return None
+    off = ((ldr3 >> 6) & 0x1F) * 4
+    ldr2 = 0x680A | (ldr3 & 0x07C0)   # the matching ldr r2, [r1, #off]
+    base = fn = us_start = None
+    saw_ldr2 = False
+    addr = tail - 8
+    while addr >= tail - 22:
+        b = img.bytes_at(addr, 4)
+        if b is None:
+            break
+        h, h2 = struct.unpack('<2H', b)
+        if h == ldr2:
+            saw_ldr2 = True
+        elif (h & 0xFF00) == 0x4B00:
+            # ldr r3, [pc, #n]: the us_start literal
+            us_start = img.word_at(((addr + 4) & ~3) + (h & 0xFF) * 4)
+        elif (h & 0xFF00) == 0x4900:
+            # ldr r1, [pc, #n]
+            base = img.word_at(((addr + 4) & ~3) + (h & 0xFF) * 4)
+            fn = addr
+            break
+        elif (h & 0xFBEF) == 0xF04F and (h2 & 0x8F00) == 0x0100:
+            # mov.w r1, #imm
+            imm12 = (((h >> 10) & 1) << 11) | (((h2 >> 12) & 7) << 8) \
+                | (h2 & 0xFF)
+            base = thumb_expand_imm(imm12)
+            fn = addr
+            break
+        elif (h & 0xFF00) == 0x2100 and (h2 & 0xF83F) == 0x0009:
+            # movs r1, #imm8 ; lsls r1, r1, #n
+            base = (h & 0xFF) << ((h2 >> 6) & 0x1F)
+            fn = addr
+            break
+        addr -= 2
+    if base is None or us_start is None or not saw_ldr2:
+        return None
+    cnt = base + off
+    # a peripheral register and a RAM word, or this is something else
+    if not 0x40000000 <= cnt < 0x51000000:
+        return None
+    if not 0x20000000 <= us_start < 0x20040000:
+        return None
+    return fn, cnt, us_start
+
+
+def locate_delay(img):
+    '''find delayMicroseconds by its loop shape, checked against the
+       symbol table when there is one; decode_delay()'s tuple or None'''
+    sym = img.symbol(('delayMicroseconds',))
+    found = set()
+    for tail in img.scan(DELAY_TAIL):
+        d = decode_delay(img, tail)
+        if d is not None:
+            found.add(d)
+    if sym is not None:
+        for d in found:
+            if d[0] == sym & ~1:
+                return d
+        return None
+    if len(found) == 1:
+        return found.pop()
+    return None
+
+
+def locate_pin_read(img, pin):
+    '''find the out-of-line signal pin read (bl_pin_read, or an older
+       bootloader's surviving gpio_read) by symbol, else by shape,
+       validated against the target's pin number; returns
+       decode_pin_read()'s tuple or None'''
+    sym = img.symbol(('bl_pin_read', 'bl_pin_read.constprop.0',
+                      'gpio_read.constprop.0', 'gpio_read'))
+    if sym is not None:
+        d = decode_pin_read(img, sym & ~1)
+        return (d, sym & ~1) if d is not None else None
+    found = set()
+    # anchor on the ubfx r0, r0, #pin, #1 + bx lr tail (and.w for pin 0)
+    tails = [struct.pack('<3H', 0xF3C0,
+                         ((pin & 3) << 6) | ((pin >> 2) << 12), 0x4770)]
+    if pin == 0:
+        tails.append(struct.pack('<3H', 0xF000, 0x0001, 0x4770))
+    for tail in tails:
+        for hit in img.scan(tail):
+            for back in (6, 4):
+                fn = hit - back
+                d = decode_pin_read(img, fn)
+                if d is not None and 0x40000000 <= d[0] < 0x51000000:
+                    found.add(fn)
+    if len(found) == 1:
+        fn = found.pop()
+        return decode_pin_read(img, fn), fn
     return None
 
 
@@ -2014,42 +2258,44 @@ def thumb_expand_imm(imm12):
     return ((v >> rot) | (v << (32 - rot))) & 0xFFFFFFFF
 
 
-def gpio_read_idr(elf, fn):
-    '''Recognise the bootloader's gpio_read body and return (idr_addr,
-       ubfx_halfword2): the IDR address its load hits and the second
-       halfword of its ubfx (which carries the pin number). Two compiled
-       shapes exist, depending on whether the port base fits a Thumb
-       modified immediate:
+def decode_pin_read(img, fn):
+    '''Recognise the bootloader's pin-read body and return (idr_addr,
+       (extract_hw1, extract_hw2)): the IDR address its load hits and
+       the two halfwords of the bit extract, kept verbatim so the patch
+       preserves the pin. Two compiled shapes exist, depending on
+       whether the port base fits a Thumb modified immediate:
            mov.w r3, #<base>    ; ldr r0, [r3, #<idr>]   (12 bytes)
            ldr   r3, [pc, #n]   ; ldr r0, [r3, #<idr>]   (literal pool)
-       each followed by ubfx r0, r0, #pin, #1; bx lr. Returns None for
-       anything else (e.g. a build that inlined the function away).'''
-    code = elf_bytes_at(elf, fn, 12)
+       each followed by ubfx r0, r0, #pin, #1 (and.w r0, r0, #1 for pin
+       0) and bx lr. Returns None for anything else (e.g. a build that
+       inlined the function away).'''
+    code = img.bytes_at(fn, 12)
     if code is None:
         return None
     hw = struct.unpack('<6H', code)
 
-    def ubfx_ok(a, b):
-        # ubfx r0, r0, #lsb, #1: rd 0, width 1, any lsb (the pin)
-        return a == 0xF3C0 and b & 0x8F3F == 0
+    def extract_ok(a, b):
+        # ubfx r0, r0, #lsb, #1 (rd 0, width 1, any lsb) or, for pin
+        # 0, the and.w r0, r0, #1 gcc prefers there
+        return ((a == 0xF3C0 and b & 0x8F3F == 0)
+                or (a, b) == (0xF000, 0x0001))
 
     def ldr_r0_r3(h):
         return h & 0xF83F == 0x6818
 
     if (hw[0] == 0xF04F and (hw[1] >> 8) & 0xF == 3 and ldr_r0_r3(hw[2])
-            and ubfx_ok(hw[3], hw[4]) and hw[5] == 0x4770):
+            and extract_ok(hw[3], hw[4]) and hw[5] == 0x4770):
         imm12 = (((hw[0] >> 10) & 1) << 11) | (((hw[1] >> 12) & 7) << 8) \
             | (hw[1] & 0xFF)
         base = thumb_expand_imm(imm12)
-        return base + (((hw[2] >> 6) & 0x1F) << 2), hw[4], 'movw'
+        return base + (((hw[2] >> 6) & 0x1F) << 2), (hw[3], hw[4]), 'movw'
     if (hw[0] & 0xFF00 == 0x4B00 and ldr_r0_r3(hw[1])
-            and ubfx_ok(hw[2], hw[3]) and hw[4] == 0x4770):
+            and extract_ok(hw[2], hw[3]) and hw[4] == 0x4770):
         literal = ((fn + 4) & ~3) + (hw[0] & 0xFF) * 4
-        word = elf_bytes_at(elf, literal, 4)
-        if word is None:
+        base = img.word_at(literal)
+        if base is None:
             return None
-        base = struct.unpack('<I', word)[0]
-        return base + (((hw[1] >> 6) & 0x1F) << 2), hw[3], 'literal'
+        return base + (((hw[1] >> 6) & 0x1F) << 2), (hw[2], hw[3]), 'literal'
     return None
 
 
@@ -2315,7 +2561,8 @@ def main():
     ap.add_argument('--elf', default=None,
                     help='default: whatever obj/ holds for the target')
     ap.add_argument('--bootloader-elf', default=None,
-                    help='also load this bootloader ELF and start/reset the '
+                    help='also load this bootloader image (ELF, Intel HEX '
+                         'or raw bin at flash base) and start/reset the '
                          'MCU in it (default: no bootloader)')
     ap.add_argument('--no-firmware', action='store_true',
                     help='factory-fresh part: no application, the whole '
@@ -2371,7 +2618,7 @@ def main():
     outdir = args.outdir or os.path.join(REPO, 'obj', 'renode')
     if args.bootloader_elf is not None:
         if not os.path.isfile(args.bootloader_elf):
-            ap.error('no bootloader ELF at %s' % args.bootloader_elf)
+            ap.error('no bootloader image at %s' % args.bootloader_elf)
         args.bootloader_elf = os.path.abspath(args.bootloader_elf)
     if args.no_firmware and args.bootloader_elf is None:
         ap.error('--no-firmware needs --bootloader-elf: with neither an '
@@ -2400,6 +2647,16 @@ def main():
         # stands in, and the generated blank-flash fill wipes that load
         # before the bootloader section reloads it properly
         elf = args.bootloader_elf
+        if image_kind(elf) != 'elf':
+            # a hex/bin cannot stand in; the app ELF can, since the
+            # blank fill wipes its flash load anyway
+            elf = find_elf(args.target)
+            if elf is None:
+                print('--no-firmware with a %s bootloader needs an app '
+                      'ELF in obj/ to stand in for $elf; build the '
+                      'firmware or use an ELF bootloader'
+                      % image_kind(args.bootloader_elf))
+                return 1
     else:
         elf = args.elf
         if elf is None:
@@ -2467,76 +2724,56 @@ def main():
             # The bootloader's delayMicroseconds busy-polls the utility
             # timer, and its native-to-managed transition per read is
             # what makes bootloader serial run ~8x slower than its own
-            # wire; patch it (located in the bootloader ELF: the
-            # application defines the same symbol) to hand the wait to
-            # the throttle peripheral instead. See SkipDelay in
-            # AM32ThrottleGenerator.cs.
-            addrs = symbol_addresses(args.bootloader_elf,
-                                     ('delayMicroseconds', 'us_start',
-                                      'bl_pin_read', 'bl_pin_read.constprop.0',
-                                      'gpio_read', 'gpio_read.constprop.0'),
-                                     args.nm_bin)
-            # the bootloader's utility timer CNT register: TIM2 on the
-            # STM32s, TMR3 on the AT32s, TIMER16 on the GD32 (see each
-            # family's blutil.h BL_TIMER). Thumb only, so no v203.
-            bl_cnt = {'l431': 0x40000024, 'g431': 0x40000024,
-                      'g071': 0x40000024, 'f031': 0x40000024,
-                      'f051': 0x40000024,
-                      'f415': 0x40000424, 'f421': 0x40000424,
-                      'e230': 0x40014C24}.get(cfg['family'])
-            if ('delayMicroseconds' in addrs and 'us_start' in addrs
-                    and bl_cnt is not None):
-                # patch delayMicroseconds to hand its busy-wait to the
-                # throttle peripheral's skip register (base + 0x20):
-                #   movw r1, #lo ; movt r1, #hi ; str r0, [r1] ; bx lr
+            # wire; patch it to hand the wait to the throttle peripheral
+            # instead (see SkipDelay in AM32ThrottleGenerator.cs).
+            # Located by symbol in an ELF and by instruction shape in a
+            # hex/bin; the timer CNT and us_start addresses are decoded
+            # from the replaced instructions either way.
+            img = BootImage(args.bootloader_elf, nm=args.nm_bin,
+                            flash_base=flash_region(cfg['family'])[0])
+            d = locate_delay(img)
+            if d is None:
+                print('delayMicroseconds not recognised in %s; running '
+                      'the bootloader delay loops unskipped'
+                      % args.bootloader_elf)
+            else:
+                fn, cnt_addr, us_start = d
+                # ldr r1, [pc, #4] ; str r0, [r1] ; bx lr ; (pad) ;
+                # .word <throttle skip register>
+                # Thumb-1 only, so the one patch also fits the
+                # Cortex-M0 families.
                 magic = FAMILY[cfg['family']]['throttle'] + 0x20
-                lo, hi = magic & 0xFFFF, magic >> 16
-                movw = (0xF240 | ((lo >> 11) & 1) << 10 | (lo >> 12) & 0xF,
-                        0x0100 | ((lo >> 8) & 7) << 12 | (lo & 0xFF))
-                movt = (0xF2C0 | ((hi >> 11) & 1) << 10 | (hi >> 12) & 0xF,
-                        0x0100 | ((hi >> 8) & 7) << 12 | (hi & 0xFF))
-                half = movw + movt + (0x6008, 0x4770)
-                fn = addrs['delayMicroseconds'] & ~1
+                half = [0x4901, 0x6008, 0x4770]
+                if fn % 4 == 0:
+                    half.append(0xBF00)   # nop, aligning the literal
+                half += [magic & 0xFFFF, magic >> 16]
                 setup += ('; throttle SkipDelayTimerCnt 0x%08X'
                           '; throttle SkipDelayElapsedVar 0x%08X'
-                          % (bl_cnt, addrs['us_start']))
+                          % (cnt_addr, us_start))
                 for i, h in enumerate(half):
                     setup += ('; sysbus WriteWord 0x%08X 0x%04X'
                               % (fn + i * 2, h))
             # The serial WAIT loops burn the same way the delay loops
-            # did, polling the signal pin's IDR. Patch gpio_read so its
-            # load goes through the throttle peripheral (base + 0x24),
-            # which returns the real IDR content and, only while the
-            # wire is idle, jumps virtual time forward a little (see
-            # PinReadSkip in AM32ThrottleGenerator.cs). The replacement
-            # keeps the original ubfx, so the pin number is untouched:
-            #   mov.w r3, #<throttle> ; ldr r0, [r3, #0x24]
-            #   ubfx  r0, r0, #pin, #1 ; bx lr
-            # Patch the pin poll (bl_pin_read, or older bootloaders'
-            # out-of-line gpio_read) to read through the throttle's
-            # skipping register: an idle bootloader then runs at ~1.1x
-            # realtime instead of ~0.07x, and with the wire input
-            # applied from the Tick the transfers stay at zero retried
-            # chunks. Only on the families where that is demonstrated -
-            # on the AT32s the same patch still breaks the write path,
-            # and they are already fast enough on the delay skip alone.
-            gr = None
-            for name in ('bl_pin_read', 'bl_pin_read.constprop.0',
-                         'gpio_read.constprop.0', 'gpio_read'):
-                if name in addrs:
-                    gr = addrs[name]
-                    break
+            # did, polling the signal pin's IDR. Patch the pin poll
+            # (bl_pin_read, or older bootloaders' out-of-line gpio_read)
+            # to read through the throttle's skipping register (base +
+            # 0x24), which returns the real IDR content and, only while
+            # the wire is idle, jumps virtual time forward a little (see
+            # PinReadSkip in AM32ThrottleGenerator.cs). An idle
+            # bootloader then runs at ~0.8x realtime instead of ~0.07x.
+            # Only on the families where that is demonstrated - on the
+            # AT32s the same patch still breaks the write path, and they
+            # are already fast enough on the delay skip alone.
             magic = FAMILY[cfg['family']]['throttle']
-            if (gr is not None and magic == 0x60000000
-                    and cfg['family'] in ('l431', 'g431')):
-                gr &= ~1
-                decoded = gpio_read_idr(args.bootloader_elf, gr)
-                if decoded is not None:
-                    idr, ubfx2, _form = decoded
+            if magic == 0x60000000 and cfg['family'] in ('l431', 'g431'):
+                pr = locate_pin_read(img, int(cfg['throttle_pin'][2:]))
+                if pr is not None:
+                    (idr, extract, _form), gr = pr
                     setup += '; throttle SkipPinIdr 0x%08X' % idr
                     half = (0xF04F, 0x43C0,   # mov.w r3, #0x60000000
                             0x6A58,           # ldr r0, [r3, #0x24]
-                            0xF3C0, ubfx2,    # the original ubfx
+                            extract[0],       # the original pin
+                            extract[1],       # extract, verbatim
                             0x4770)           # bx lr
                     for i, h in enumerate(half):
                         setup += ('; sysbus WriteWord 0x%08X 0x%04X'
