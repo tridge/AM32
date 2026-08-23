@@ -1033,6 +1033,10 @@ def a153_config(target, m, dronecan):
         'comps': comps,
         'input_gpio': int(port[4:]),
         'input_pin': number('INPUT_PIN'),
+        # numbered MCX ports, spelt with letters as the bootloader
+        # target names do (GPIO1 pin 2 -> PB2)
+        'throttle_pin': 'P%c%u' % (ord('A') + int(port[4:]),
+                                   number('INPUT_PIN')),
         'dead_time': m.get('DEAD_TIME', '?'),
         'loop_hz': int(m.get('LOOP_FREQUENCY_HZ', 20000)),
         'eeprom_addr': eeprom_addr,
