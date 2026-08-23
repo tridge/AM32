@@ -20,10 +20,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public class AM32_RegisterFile : IDoubleWordPeripheral, IKnownSize
     {
         public AM32_RegisterFile(IMachine machine, int size = 0x400,
-            bool preserveOnReset = false)
+            bool preserveOnReset = false, long readAsZero = -1)
         {
             this.size = size;
             this.preserveOnReset = preserveOnReset;
+            // a status register the firmware polls and write-1-clears:
+            // storing the written flags would make a busy bit stick
+            // (real hardware treats those bits as read-only or W1C),
+            // so the offset always reads idle and drops writes
+            this.readAsZero = readAsZero;
             regs = new uint[size / 4];
         }
 
@@ -43,12 +48,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint ReadDoubleWord(long offset)
         {
+            if(offset == readAsZero)
+            {
+                return 0;
+            }
             var i = offset / 4;
             return (i >= 0 && i < regs.Length) ? regs[i] : 0;
         }
 
         public void WriteDoubleWord(long offset, uint value)
         {
+            if(offset == readAsZero)
+            {
+                return;
+            }
             var i = offset / 4;
             if(i >= 0 && i < regs.Length)
             {
@@ -58,6 +71,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly int size;
         private readonly bool preserveOnReset;
+        private readonly long readAsZero;
         private readonly uint[] regs;
     }
 }

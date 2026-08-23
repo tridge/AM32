@@ -152,6 +152,10 @@ elif request.IsRead:
 // which MappedMemory accepts, and sector erase is a no-op
 // save_flash_nolib() tolerates by rewriting the whole page
 fmc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+    // STS always reads idle: the bootloader's flag_clear writes
+    // status enum values into it, and a stored bit 0 would read
+    // back as flash-busy forever (on hardware OBF is read-only)
+    readAsZero: 0xC
 
 // WDT: same register file as the STM32 IWDG; ours rather than a real
 // watchdog, as everywhere
