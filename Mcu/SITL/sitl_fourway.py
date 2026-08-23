@@ -139,7 +139,7 @@ class FourWay(object):
         self.port.send_serial(frame)
         return self._ack(timeout, 'set_address') == ACK_OK
 
-    def set_buffer(self, payload, timeout=2.0):
+    def set_buffer(self, payload, timeout=8.0):
         '''CMD_SET_BUFFER + payload upload (no ack after the command
         itself, one ack after the payload)'''
         size = len(payload)
@@ -154,13 +154,17 @@ class FourWay(object):
         self.port.send_serial(with_crc(payload), gap=True)
         return self._ack(timeout, 'set_buffer') == ACK_OK
 
-    def prog_flash(self, timeout=4.0):
+    def prog_flash(self, timeout=8.0):
         self.port.flush_serial()
         self.port.send_serial(with_crc(bytes([CMD_PROG_FLASH, 0])))
         return self._ack(timeout, 'prog_flash') == ACK_OK
 
-    def write(self, addr16, payload, timeout=4.0):
-        '''write payload at the (16 bit, shifted) protocol address'''
+    def write(self, addr16, payload, timeout=8.0):
+        '''write payload at the (16 bit, shifted) protocol address. The
+        timeouts allow for an emulated wire running well under real
+        time: a 256 byte upload is ~140ms of 19200 baud wire, and a
+        bootloader family without the wait-loop skip runs it at a
+        fraction of that speed.'''
         if not self.set_address(addr16):
             return False
         if not self.set_buffer(payload):

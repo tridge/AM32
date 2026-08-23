@@ -2037,7 +2037,7 @@ def gpio_read_idr(elf, fn):
         imm12 = (((hw[0] >> 10) & 1) << 11) | (((hw[1] >> 12) & 7) << 8) \
             | (hw[1] & 0xFF)
         base = thumb_expand_imm(imm12)
-        return base + (((hw[2] >> 6) & 0x1F) << 2), hw[4]
+        return base + (((hw[2] >> 6) & 0x1F) << 2), hw[4], 'movw'
     if (hw[0] & 0xFF00 == 0x4B00 and ldr_r0_r3(hw[1])
             and ubfx_ok(hw[2], hw[3]) and hw[4] == 0x4770):
         literal = ((fn + 4) & ~3) + (hw[0] & 0xFF) * 4
@@ -2045,7 +2045,7 @@ def gpio_read_idr(elf, fn):
         if word is None:
             return None
         base = struct.unpack('<I', word)[0]
-        return base + (((hw[1] >> 6) & 0x1F) << 2), hw[3]
+        return base + (((hw[1] >> 6) & 0x1F) << 2), hw[3], 'literal'
     return None
 
 
@@ -2469,6 +2469,7 @@ def main():
             # AM32ThrottleGenerator.cs.
             addrs = symbol_addresses(args.bootloader_elf,
                                      ('delayMicroseconds', 'us_start',
+                                      'bl_pin_read', 'bl_pin_read.constprop.0',
                                       'gpio_read', 'gpio_read.constprop.0'),
                                      args.nm_bin)
             # the bootloader's utility timer CNT register: TIM2 on the
@@ -2495,9 +2496,9 @@ def main():
                 setup += ('; throttle SkipDelayTimerCnt 0x%08X'
                           '; throttle SkipDelayElapsedVar 0x%08X'
                           % (bl_cnt, addrs['us_start']))
-                for i in range(0, len(half), 2):
-                    setup += ('; sysbus WriteDoubleWord 0x%08X 0x%08X'
-                              % (fn + i * 2, half[i] | half[i + 1] << 16))
+                for i, h in enumerate(half):
+                    setup += ('; sysbus WriteWord 0x%08X 0x%04X'
+                              % (fn + i * 2, h))
             # The serial WAIT loops burn the same way the delay loops
             # did, polling the signal pin's IDR. Patch gpio_read so its
             # load goes through the throttle peripheral (base + 0x24),
@@ -2507,22 +2508,16 @@ def main():
             # keeps the original ubfx, so the pin number is untouched:
             #   mov.w r3, #<throttle> ; ldr r0, [r3, #0x24]
             #   ubfx  r0, r0, #pin, #1 ; bx lr
-            gr = addrs.get('gpio_read.constprop.0', addrs.get('gpio_read'))
-            magic = FAMILY[cfg['family']]['throttle']
-            if gr is not None and magic == 0x60000000:
-                gr &= ~1
-                decoded = gpio_read_idr(args.bootloader_elf, gr)
-                if decoded is not None:
-                    idr, ubfx2 = decoded
-                    setup += '; throttle SkipPinIdr 0x%08X' % idr
-                    half = (0xF04F, 0x43C0,   # mov.w r3, #0x60000000
-                            0x6A58,           # ldr r0, [r3, #0x24]
-                            0xF3C0, ubfx2,    # the original ubfx
-                            0x4770)           # bx lr
-                    for i in range(0, len(half), 2):
-                        setup += ('; sysbus WriteDoubleWord 0x%08X 0x%08X'
-                                  % (gr + i * 2,
-                                     half[i] | half[i + 1] << 16))
+            # The pin-poll skip (patching bl_pin_read to read through
+            # the throttle's skipping register) is deliberately NOT
+            # applied: it lifts the idle bootloader from ~0.07x to
+            # ~1.1x realtime, but under host load the skipped wait
+            # loops make transfers shed ACKs - a flash goes from zero
+            # retried chunks to ~150 recovered ones - and on the AT32s
+            # a SkipTime from the pin poll deadlocks Renode's time
+            # framework outright after a guest flash write. Transfers
+            # matter more than idle. gpio_read_idr() and the
+            # generator's SkipPinIdr register remain for revisiting.
 
     # without the physics the bridge never starts and the motor cannot
     # turn, so a bare --run would boot and then look broken
