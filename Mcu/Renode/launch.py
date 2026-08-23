@@ -171,7 +171,7 @@ def bootloader_dirs(explicit=None):
 
 
 def find_bootloaders(family, pin, dirs, dronecan=False):
-    '''bootloader ELFs built for this target's MCU and signal pin.
+    '''bootloader images built for this target's MCU and signal pin.
 
     Ordered so the first entry is the right default: the CAN build for a
     DroneCAN target, the plain default-flash build otherwise. Loading a
@@ -184,12 +184,15 @@ def find_bootloaders(family, pin, dirs, dronecan=False):
         return []
     hits = []
     for d in dirs:
-        pat = os.path.join(d, 'AM32_%s_BOOTLOADER_%s*_V*.elf' % (mcu, pin))
-        hits += glob.glob(pat)
-    # newest version of each variant only
+        for ext in ('elf', 'hex'):
+            pat = os.path.join(d, 'AM32_%s_BOOTLOADER_%s*_V*.%s'
+                               % (mcu, pin, ext))
+            hits += glob.glob(pat)
+    # newest version of each variant only, an ELF (which carries the
+    # symbols and debug info) beating the hex built beside it
     byvar = {}
-    for h in sorted(hits):
-        var = re.sub(r'_V\d+\.elf$', '', os.path.basename(h))
+    for h in sorted(hits, key=lambda h: (h[:-4], h.endswith('.elf'))):
+        var = re.sub(r'_V\d+\.(elf|hex)$', '', os.path.basename(h))
         byvar[var] = h
 
     def rank(path):
@@ -703,8 +706,9 @@ def main():
 
     def browse_bl():
         path, _ = QFileDialog.getOpenFileName(
-            win, 'Bootloader ELF',
-            lab.bl_dirs[0] if lab.bl_dirs else REPO, 'ELF (*.elf)')
+            win, 'Bootloader image',
+            lab.bl_dirs[0] if lab.bl_dirs else REPO,
+            'Bootloader (*.elf *.hex *.bin);;All files (*)')
         if path:
             bl_combo.insertItem(0, os.path.basename(path), path)
             bl_combo.setCurrentIndex(0)
