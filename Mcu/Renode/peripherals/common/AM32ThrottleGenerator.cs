@@ -580,12 +580,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // the wire and nothing is queued to go onto it - jumps virtual
         // time forward a little, so an idle wait costs one iteration
         // per SkipWaitUs of virtual time instead of one per ~200ns.
-        // The skip stays under half a 19200 baud bit so start-bit
-        // detection keeps its margin, and it is withheld whenever the
-        // generator is driving bits (the guest is then mid-byte,
-        // sampling at exact delayMicroseconds offsets).
+        // The budget for the skip: the guest samples each bit half a
+        // bit (26us) after the start edge it detected, and detection
+        // can already be late by the skip plus up to one global quantum
+        // (20us) of scheduling skew, so skip + 26 + 20 must stay inside
+        // the 52us bit. 15us failed exactly that bound in practice
+        // (reads corrupted, connects flaky); 5us holds it with margin.
+        // The skip is withheld whenever the generator is driving bits
+        // (the guest is then mid-byte, sampling at exact
+        // delayMicroseconds offsets).
         public ulong SkipPinIdr { get; set; }
-        public uint SkipWaitUs { get; set; } = 15;
+        public uint SkipWaitUs { get; set; } = 5;
 
         private uint PinReadSkip()
         {
