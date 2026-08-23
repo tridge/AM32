@@ -152,8 +152,11 @@ elif request.IsRead:
 // FMC: fmc_ready_wait() polls a BUSY that always reads clear; the
 // programming stores go straight to the flash addresses, which
 // MappedMemory accepts, and page erase is a no-op save_flash_nolib()
-// tolerates by rewriting the whole page
+// tolerates by rewriting the whole page. STAT (0x0C) must read as
+// zero: fmc_flag_clear() writes the W1C error bits there, and a
+// stored WPERR makes fmc_word_program() skip every later store.
 fmc: Miscellaneous.AM32_RegisterFile @ sysbus <0x40022000, +0x400>
+    readAsZero: 0xC
 
 // FWDGT: same register file as the STM32 IWDG (plus a window register
 // our model ignores); ours rather than a real watchdog, as everywhere
