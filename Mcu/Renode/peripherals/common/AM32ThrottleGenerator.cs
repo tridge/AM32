@@ -263,7 +263,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     frameTimer.Enabled = false;
                     CancelBatchedFrame();
                     transmitting = false;
-                    DriveIdle();
+                    // in serial mode the wire is the adapter's hold, not a
+                    // throttle train: a SetLineLevel and the link's
+                    // no-throttle silencing can land in the same pump pass,
+                    // and driving throttle idle here would yank away the
+                    // level the bootloader is about to read
+                    if(!serialMode)
+                    {
+                        DriveIdle();
+                    }
                     high = false;
                     return;
                 }
