@@ -28,14 +28,17 @@ with --control-port N the UI can be driven over a localhost TCP
 connection (one command per line), for scripted tests:
   target NAME, bootloader auto|none|PATH, firmware auto|none|PATH,
   eeprom defaults|blank, conf off|serial|usb, protocol 4way|direct,
-  canbus N, start, stop, status, quit
+  canbus N, download-renode, start, stop, status, quit
 replies are prefixed OK/ERR/STATUS.
 '''
 
 import argparse
+import errno
 import glob
+import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import signal
@@ -43,8 +46,15 @@ import socket
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
+import zipfile
+
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -71,6 +81,275 @@ METRICS_COMMAND = (
     'cpu PC; cpu PerformanceInMips; cpu ExecutedInstructions; '
     'emulation GetTimeSourceInfo'
 )
+
+RENODE_DOWNLOAD_BASE = 'https://firmware.ardupilot.org/Tools/Renode/'
+RENODE_LATEST_URL = urllib.parse.urljoin(RENODE_DOWNLOAD_BASE, 'latest.json')
+RENODE_SELECTION = 'selected.json'
+
+
+def default_renode_cache():
+    root = os.environ.get('XDG_CACHE_HOME')
+    if root:
+        return Path(root).expanduser() / 'ardupilot' / 'renode'
+    return Path.home() / '.cache' / 'ardupilot' / 'renode'
+
+
+def host_target(system=None, machine=None):
+    '''platform and architecture names used by the download manifest'''
+    system = (system or platform.system()).lower()
+    machine = (machine or platform.machine()).lower()
+    platforms = {'linux': 'linux', 'darwin': 'macos', 'windows': 'windows'}
+    architectures = {
+        'amd64': 'x86_64',
+        'x64': 'x86_64',
+        'x86_64': 'x86_64',
+        'aarch64': 'aarch64' if system == 'linux' else 'arm64',
+        'arm64': 'aarch64' if system == 'linux' else 'arm64',
+    }
+    if system not in platforms or machine not in architectures:
+        raise RuntimeError('no ArduPilot Renode download for %s/%s' %
+                           (system, machine))
+    return platforms[system], architectures[machine]
+
+
+def select_renode_package(latest, system=None, machine=None):
+    '''select the portable package for this host from latest.json'''
+    wanted_platform, wanted_architecture = host_target(system, machine)
+    for artifact in latest.get('artifacts', []):
+        target = artifact.get('target', {})
+        if (target.get('platform') != wanted_platform or
+                target.get('architecture') != wanted_architecture):
+            continue
+        packages = artifact.get('packages', [])
+        if wanted_platform == 'windows':
+            packages = [package for package in packages
+                        if package.get('filename', '').endswith('.zip')]
+        elif wanted_platform == 'linux':
+            packages = [package for package in packages
+                        if package.get('filename', '').endswith('.tar.gz')]
+        else:
+            raise RuntimeError(
+                'automatic Renode installation is not yet supported on macOS')
+        if len(packages) != 1:
+            raise RuntimeError(
+                'latest.json has no unique portable package for %s/%s' %
+                (wanted_platform, wanted_architecture))
+        package = dict(packages[0])
+        filename = package.get('filename')
+        digest = package.get('sha256')
+        size = package.get('size')
+        if (not isinstance(filename, str) or Path(filename).name != filename or
+                not isinstance(digest, str) or
+                not re.fullmatch(r'[0-9a-fA-F]{64}', digest) or
+                not isinstance(size, int) or size <= 0):
+            raise RuntimeError(
+                'latest.json has invalid portable package metadata')
+        runtime_identifier = target.get('runtime_identifier')
+        if (not isinstance(runtime_identifier, str) or
+                not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*',
+                                 runtime_identifier)):
+            raise RuntimeError('latest.json has no valid runtime identifier')
+        package['runtime_identifier'] = runtime_identifier
+        package['platform'] = wanted_platform
+        package['architecture'] = wanted_architecture
+        return package
+    raise RuntimeError('latest.json has no package for %s/%s' %
+                       (wanted_platform, wanted_architecture))
+
+
+def fetch_renode_latest(opener=None):
+    '''fetch uncached current-version metadata from firmware.ardupilot.org'''
+    opener = opener or urllib.request.urlopen
+    separator = '&' if '?' in RENODE_LATEST_URL else '?'
+    url = '%s%st=%u' % (RENODE_LATEST_URL, separator, time.time_ns())
+    request = urllib.request.Request(
+        url, headers={'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
+    with opener(request, timeout=30) as response:
+        data = response.read()
+    latest = json.loads(data.decode('utf-8'))
+    if latest.get('schema_version') != 1:
+        raise RuntimeError('unsupported Renode latest.json schema')
+    revision = latest.get('source', {}).get('revision')
+    if not revision or not re.fullmatch(r'[0-9a-fA-F]{7,64}', revision):
+        raise RuntimeError('latest.json has no valid source revision')
+    return latest
+
+
+def renode_cache_key(latest, package):
+    revision = latest['source']['revision']
+    runtime = package['runtime_identifier']
+    digest = package['sha256'][:12]
+    return '%s-%s-%s' % (runtime, revision[:12], digest)
+
+
+def verified_renode_install(cache, install_name, executable_name,
+                            expected=None):
+    '''executable from one valid, contained cache install, or None'''
+    try:
+        cache = Path(cache).expanduser().resolve()
+        if (not isinstance(install_name, str) or
+                not isinstance(executable_name, str)):
+            return None
+        install = (cache / install_name).resolve()
+        executable = (install / executable_name).resolve()
+        if (not install.is_relative_to(cache.resolve()) or
+                not executable.is_relative_to(install) or
+                not executable.is_file()):
+            return None
+        manifest = json.loads((install / 'ardupilot-renode.json').read_text())
+        if (not isinstance(manifest, dict) or
+                manifest.get('executable') != executable_name):
+            return None
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return None
+    if expected is not None:
+        if any(manifest.get(key) != value
+               for key, value in expected.items()):
+            return None
+    return executable
+
+
+def cached_renode(cache, latest=None, package=None):
+    '''a verified cache executable, optionally requiring the latest build'''
+    cache = Path(cache).expanduser()
+    try:
+        selection = json.loads((cache / RENODE_SELECTION).read_text())
+        if not isinstance(selection, dict):
+            return None
+        install_name = selection.get('install')
+        executable_name = selection.get('executable')
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    expected = None
+    if latest is not None and package is not None:
+        expected = {
+            'revision': latest['source']['revision'],
+            'filename': package['filename'],
+            'sha256': package['sha256'],
+            'runtime_identifier': package['runtime_identifier'],
+        }
+    return verified_renode_install(cache, install_name, executable_name,
+                                   expected)
+
+
+def download_file(url, destination, size, sha256, progress=None, opener=None):
+    opener = opener or urllib.request.urlopen
+    request = urllib.request.Request(
+        url, headers={'Cache-Control': 'no-cache'})
+    digest = hashlib.sha256()
+    received = 0
+    with (opener(request, timeout=60) as response,
+          destination.open('wb') as output):
+        while True:
+            block = response.read(1024 * 1024)
+            if not block:
+                break
+            output.write(block)
+            digest.update(block)
+            received += len(block)
+            if progress:
+                progress(received, size)
+    if received != size:
+        raise RuntimeError('Renode download is %u bytes; expected %u' %
+                           (received, size))
+    if digest.hexdigest().lower() != sha256.lower():
+        raise RuntimeError(
+            'Renode download SHA-256 does not match latest.json')
+
+
+def extract_renode(archive, destination, package):
+    destination.mkdir()
+    if package['filename'].endswith('.tar.gz'):
+        with tarfile.open(archive, 'r:gz') as bundle:
+            bundle.extractall(destination, filter='data')
+        executable_name = 'renode'
+    elif package['filename'].endswith('.zip'):
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                target = (destination / member.filename).resolve()
+                if not target.is_relative_to(destination.resolve()):
+                    raise RuntimeError('unsafe path in Renode zip package')
+            bundle.extractall(destination)
+        executable_name = 'renode.exe'
+    else:
+        raise RuntimeError(
+            'unsupported Renode package %s' % package['filename'])
+    candidates = [path for path in destination.rglob(executable_name)
+                  if path.is_file()]
+    if len(candidates) != 1:
+        raise RuntimeError('downloaded package has %u %s executables' %
+                           (len(candidates), executable_name))
+    executable = candidates[0]
+    if package['platform'] != 'windows':
+        executable.chmod(executable.stat().st_mode | 0o111)
+    return executable
+
+
+def install_current_renode(cache, latest=None, progress=None, opener=None):
+    '''ensure the cache holds the freshly queried current Renode package'''
+    cache = Path(cache).expanduser().resolve()
+    latest = latest or fetch_renode_latest(opener)
+    package = select_renode_package(latest)
+    executable = cached_renode(cache, latest, package)
+    if executable is not None:
+        return executable, latest, False
+
+    cache.mkdir(parents=True, exist_ok=True)
+    install_name = renode_cache_key(latest, package)
+    install = cache / install_name
+    with tempfile.TemporaryDirectory(
+            prefix='.download-', dir=cache) as temporary:
+        temporary = Path(temporary)
+        archive = temporary / package['filename']
+        filename = package['filename']
+        if Path(filename).name != filename:
+            raise RuntimeError('invalid Renode package filename')
+        url = urllib.parse.urljoin(RENODE_DOWNLOAD_BASE,
+                                   urllib.parse.quote(filename))
+        download_file(url, archive, package['size'], package['sha256'],
+                      progress, opener)
+        payload = temporary / 'payload'
+        executable = extract_renode(archive, payload, package)
+        manifest = {
+            'revision': latest['source']['revision'],
+            'renode_version': latest.get('renode_version'),
+            'filename': filename,
+            'sha256': package['sha256'],
+            'runtime_identifier': package['runtime_identifier'],
+            'executable': str(executable.relative_to(payload)),
+        }
+        (payload / 'ardupilot-renode.json').write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + '\n')
+        expected = {
+            key: manifest[key] for key in (
+                'revision', 'filename', 'sha256', 'runtime_identifier')
+        }
+        while True:
+            try:
+                payload.rename(install)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                    raise
+                existing = verified_renode_install(
+                    cache, install_name, manifest['executable'], expected)
+                if existing is not None:
+                    break
+                # Preserve an unexpected/corrupt directory for diagnosis and
+                # install atomically beside it. This also avoids collisions
+                # between launchers downloading the same build concurrently.
+                install_name = '%s-%u' % (
+                    renode_cache_key(latest, package), time.time_ns())
+                install = cache / install_name
+
+    selection = {
+        'install': install_name,
+        'executable': manifest['executable'],
+    }
+    selection_tmp = cache / (RENODE_SELECTION + '.tmp')
+    selection_tmp.write_text(json.dumps(selection, indent=2) + '\n')
+    selection_tmp.replace(cache / RENODE_SELECTION)
+    return install / manifest['executable'], latest, True
 
 
 def parse_elapsed(value):
@@ -625,6 +904,8 @@ def main():
                          '$AM32_BOOTLOADER_OBJ)')
     ap.add_argument('--renode', default=None,
                     help='renode binary, passed through to gen_target')
+    ap.add_argument('--renode-cache',
+                    help='download cache (default: ~/.cache/ardupilot/renode)')
     ap.add_argument('--control-port', type=int, default=0,
                     help='TCP port for scripted UI control (default off)')
     args = ap.parse_args()
@@ -634,6 +915,9 @@ def main():
                                    QGridLayout, QLabel, QLineEdit,
                                    QPlainTextEdit, QPushButton, QSpinBox,
                                    QWidget)
+
+    renode_cache = (Path(args.renode_cache).expanduser()
+                    if args.renode_cache else default_renode_cache())
 
     app = QApplication(sys.argv)
     lab = Lab(args)
@@ -765,8 +1049,17 @@ def main():
         'configurator sees before the first save.')
     grid.addWidget(ee_combo, 5, 1, 1, 2)
 
+    # -- Renode download -----------------------------------------------
+    grid.addWidget(QLabel('Renode'), 6, 0)
+    renode_path = QLineEdit(args.renode or 'not selected')
+    renode_path.setReadOnly(True)
+    renode_path.setToolTip('Managed downloads are stored in %s' % renode_cache)
+    grid.addWidget(renode_path, 6, 1, 1, 2)
+    download_renode = QPushButton('Download Renode')
+    grid.addWidget(download_renode, 6, 3)
+
     # -- configurator port ---------------------------------------------
-    grid.addWidget(QLabel('Configurator'), 6, 0)
+    grid.addWidget(QLabel('Configurator'), 7, 0)
     conf_combo = QComboBox()
     conf_combo.addItem('Serial port (pty)', 'serial')
     if sys.platform.startswith('linux'):
@@ -778,10 +1071,10 @@ def main():
         '/dev/ttyACM* Chrome can open, so am32.tridgell.net works.\n'
         'Attaching the USB device asks for root unless the udev rule\n'
         'from sitl_usbip.py --install-rules is in place.')
-    grid.addWidget(conf_combo, 6, 1, 1, 2)
+    grid.addWidget(conf_combo, 7, 1, 1, 2)
 
     # -- protocol: what sits on that port ------------------------------
-    grid.addWidget(QLabel('Protocol'), 7, 0)
+    grid.addWidget(QLabel('Protocol'), 8, 0)
     proto_combo = QComboBox()
     proto_combo.addItem('FC with 4-way passthrough', '4way')
     proto_combo.addItem('Direct 1-wire adapter', 'direct')
@@ -795,17 +1088,17 @@ def main():
         'FC-vs-adapter by USB vendor id, so the USB device enumerates\n'
         'accordingly; the Offline-Configurator uses its direct/1-wire\n'
         'checkbox on the pty or tty.')
-    grid.addWidget(proto_combo, 7, 1, 1, 2)
+    grid.addWidget(proto_combo, 8, 1, 1, 2)
 
     # -- start/stop, status, log ---------------------------------------
     start_btn = QPushButton('Start')
     stop_btn = QPushButton('Stop')
     stop_btn.setEnabled(False)
-    grid.addWidget(start_btn, 8, 2)
-    grid.addWidget(stop_btn, 8, 3)
+    grid.addWidget(start_btn, 9, 2)
+    grid.addWidget(stop_btn, 9, 3)
     status_label = QLabel('stopped')
     status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    grid.addWidget(status_label, 8, 0, 1, 2)
+    grid.addWidget(status_label, 9, 0, 1, 2)
     metrics_label = QLabel('')
     metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
     metrics_label.setToolTip(
@@ -813,12 +1106,55 @@ def main():
         'executing the bootloader), emulation speed against real time,\n'
         'instructions actually retired per wall second against the\n'
         "configured PerformanceInMips, and the machine's virtual time.")
-    grid.addWidget(metrics_label, 9, 0, 1, 4)
+    grid.addWidget(metrics_label, 10, 0, 1, 4)
     log_view = QPlainTextEdit()
     log_view.setReadOnly(True)
     log_view.setMaximumBlockCount(2000)
     log_view.setMinimumSize(640, 240)
-    grid.addWidget(log_view, 10, 0, 1, 4)
+    grid.addWidget(log_view, 11, 0, 1, 4)
+
+    download_active = False
+
+    def renode_version(latest):
+        return '%s (%s)' % (latest.get('renode_version', '?'),
+                            latest['source']['revision'][:9])
+
+    def check_renode_download():
+        try:
+            latest = fetch_renode_latest()
+            package = select_renode_package(latest)
+            current = cached_renode(renode_cache, latest, package)
+            lab.log_q.put(('__renode_check__', current, latest))
+        except (OSError, RuntimeError, ValueError,
+                json.JSONDecodeError) as error:
+            lab.log_q.put(('__renode_download_error__',
+                           'update check failed: %s' % error))
+
+    def start_renode_download():
+        nonlocal download_active
+        if download_active:
+            return False
+        download_active = True
+        download_renode.setEnabled(False)
+        download_renode.setText('Checking...')
+
+        def progress(received, total):
+            lab.log_q.put(('__renode_download_progress__', received, total))
+
+        def worker():
+            try:
+                executable, latest, downloaded = install_current_renode(
+                    renode_cache, progress=progress)
+                lab.log_q.put(('__renode_download_done__',
+                               executable, latest, downloaded))
+            except (OSError, RuntimeError, ValueError, tarfile.TarError,
+                    zipfile.BadZipFile, json.JSONDecodeError) as error:
+                lab.log_q.put(('__renode_download_error__', str(error)))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    download_renode.clicked.connect(start_renode_download)
 
     def do_start():
         lab.firmware = fw_combo.currentData() or 'auto'
@@ -845,12 +1181,55 @@ def main():
     stop_btn.clicked.connect(do_stop)
 
     def drain_log():
+        nonlocal download_active
         lines = []
         while True:
             try:
                 item = lab.log_q.get_nowait()
             except queue.Empty:
                 break
+            if (isinstance(item, tuple) and
+                    item[0].startswith('__renode_download')):
+                tag = item[0]
+                if tag == '__renode_download_progress__':
+                    _tag, received, total = item
+                    percent = min(100, received * 100 // max(total, 1))
+                    download_renode.setText('Downloading %u%%' % percent)
+                elif tag == '__renode_download_done__':
+                    _tag, executable, latest, downloaded = item
+                    download_active = False
+                    args.renode = str(executable)
+                    renode_path.setText(args.renode)
+                    download_renode.setText('Renode current')
+                    download_renode.setEnabled(True)
+                    action = 'downloaded' if downloaded else 'using cached'
+                    lines.append('[renode] %s %s: %s' %
+                                 (action, renode_version(latest), executable))
+                elif tag == '__renode_download_error__':
+                    download_active = False
+                    download_renode.setText('Retry Renode download')
+                    download_renode.setEnabled(True)
+                    lines.append('[renode] %s' % item[1])
+                continue
+            if isinstance(item, tuple) and item[0] == '__renode_check__':
+                _tag, current, latest = item
+                if current is None:
+                    label = ('Update Renode' if cached_renode(renode_cache)
+                             else 'Download Renode')
+                    download_renode.setText(label)
+                    download_renode.setToolTip(
+                        'Current server version: %s' % renode_version(latest))
+                else:
+                    if args.renode is None:
+                        args.renode = str(current)
+                        renode_path.setText(args.renode)
+                    selected = (args.renode and
+                                Path(args.renode).expanduser() == current)
+                    download_renode.setText(
+                        'Renode current' if selected else 'Use cached current')
+                    download_renode.setToolTip(
+                        'Cached server version: %s' % renode_version(latest))
+                continue
             if isinstance(item, tuple) and item[0] == '__metrics__':
                 if item[1] == lab.generation:
                     lab.metrics = item[2]
@@ -950,6 +1329,9 @@ def main():
         if cmd == 'canbus':
             can_spin.setValue(int(rest))
             return 'OK'
+        if cmd == 'download-renode':
+            return ('OK' if start_renode_download()
+                    else 'ERR download in progress')
         if cmd == 'start':
             do_start()
             return 'OK' if not start_btn.isEnabled() else ('ERR ' + lab.status)
@@ -981,6 +1363,7 @@ def main():
         # applying the filter must run on the Qt thread
         QTimer.singleShot(0, apply_filter)
     threading.Thread(target=targets_thread, daemon=True).start()
+    threading.Thread(target=check_renode_download, daemon=True).start()
 
     signal.signal(signal.SIGINT, lambda *a: app.quit())
     signal.signal(signal.SIGTERM, lambda *a: app.quit())

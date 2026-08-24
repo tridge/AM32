@@ -2414,10 +2414,15 @@ def renode_env():
     - about 3GB per simulated second while the motor spins - so the
     default collects ~800 times a simulated second and spends roughly a
     third of the run suspending threads for the collector. A 64MB nursery
-    measured 1.58x faster on the spin test, results bit-identical. An
-    explicit MONO_GC_PARAMS in the caller's environment wins.'''
+    measured 1.58x faster on the spin test, results bit-identical. Explicit
+    GC and ReadyToRun settings in the caller's environment win.'''
     env = dict(os.environ)
     env.setdefault('MONO_GC_PARAMS', 'nursery-size=64m')
+    # The self-contained .NET package from firmware.ardupilot.org ships
+    # ReadyToRun images. Let the current runtime JIT them for this long-lived,
+    # CPU-bound workload: it matches the source-tree build's performance and
+    # measured about 1.4x faster than using the packaged precompiled code.
+    env.setdefault('DOTNET_ReadyToRun', '0')
     # for a CoreCLR renode: DllImport("am32sim") does not consult the
     # RTLD_GLOBAL namespace there, so the library has to be findable by
     # name. Harmless under the bundled mono.

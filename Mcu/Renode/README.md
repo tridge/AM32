@@ -865,6 +865,14 @@ preferred on DroneCAN targets. Firmware and eeprom default to the
 newest build in `obj/`; a CAN bus number can be set for DroneCAN
 targets.
 
+The **Renode** row uses ArduPilot's current portable build from
+`firmware.ardupilot.org`. The launcher selects the host package from the
+published manifest, verifies its size and SHA-256 digest, and keeps it in the
+same `~/.cache/ardupilot/renode` cache as ArduPilot's launcher. A cached current
+build is selected automatically; the button downloads an update when needed.
+`--renode PATH` remains available as an explicit override and `--renode-cache`
+changes the managed cache location.
+
 The **Configurator** selector is the point of the tool: it puts
 Mcu/SITL's fake flight controller - MSP with BLHeli 4-way passthrough
 to the emulated bootloader - in front of the ESC, on a pty for desktop
@@ -876,8 +884,8 @@ status line shows the serial port to hand to the configurator.
 
 `--control-port N` drives the same UI over a localhost TCP connection
 (`target NAME`, `bootloader auto|none|PATH`, `conf off|serial|usb`,
-`start`, `stop`, `status`, `quit`), which is how the scripted tests use
-it.
+`download-renode`, `start`, `stop`, `status`, `quit`), which is how the
+scripted tests use it.
 
 ### Driving it from the SITL GUI
 
