@@ -41,6 +41,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -141,17 +142,22 @@ def find_tty(serial=DEFAULT_SERIAL, timeout=10.0):
 
 
 def default_socket_name():
-    '''an abstract socket by default: it lives in the kernel's namespace
-    rather than the filesystem, so a killed run leaves nothing behind
-    and there is no stale socket to clear out. Per uid, since the
-    abstract namespace is shared by everyone in the network namespace'''
+    '''an abstract socket by default on Linux, with a temporary filesystem
+    socket fallback on systems which do not support the abstract namespace.
+    Per uid, since the Linux namespace is shared by everyone in the network
+    namespace.'''
     return '@am32-sitl-usbip.%u' % os.getuid()
 
 
 def socket_address(name):
     '''bind/connect address for a socket name; a leading @ selects the
-    abstract namespace (the kernel's own notation is a leading NUL)'''
-    return '\0' + name[1:] if name.startswith('@') else name
+    Linux abstract namespace (the kernel's own notation is a leading NUL),
+    or a temporary filesystem socket on systems without that namespace'''
+    if not name.startswith('@'):
+        return name
+    if sys.platform.startswith('linux'):
+        return '\0' + name[1:]
+    return os.path.join(tempfile.gettempdir(), name[1:])
 
 
 class UsbipServer(object):
@@ -186,22 +192,23 @@ class UsbipServer(object):
         self.port = port
         if self.unix_path is not None:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            if not self.unix_path.startswith('@'):
-                if os.path.exists(self.unix_path):
+            self.socket_path = socket_address(self.unix_path)
+            if not self.socket_path.startswith('\0'):
+                if os.path.exists(self.socket_path):
                     # a leftover from a killed run; a live one would
                     # have failed the bind below anyway
-                    os.unlink(self.unix_path)
+                    os.unlink(self.socket_path)
             try:
-                self.sock.bind(socket_address(self.unix_path))
+                self.sock.bind(self.socket_path)
             except OSError as ex:
                 raise OSError('cannot export USB/IP on %s (%s), another '
                               'instance is probably running'
                               % (self.unix_path, ex))
-            if not self.unix_path.startswith('@'):
+            if not self.socket_path.startswith('\0'):
                 # a filesystem socket can be locked down to us; an
                 # abstract one is reachable by anyone in the network
                 # namespace, like the SITL's own udp ports
-                os.chmod(self.unix_path, 0o600)
+                os.chmod(self.socket_path, 0o600)
         else:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -266,9 +273,10 @@ class UsbipServer(object):
             self.sock.close()
         except OSError:
             pass
-        if self.unix_path is not None and not self.unix_path.startswith('@'):
+        if (self.unix_path is not None
+                and not self.socket_path.startswith('\0')):
             try:
-                os.unlink(self.unix_path)
+                os.unlink(self.socket_path)
             except OSError:
                 pass
         with self.send_lock:
@@ -631,17 +639,25 @@ def main():
             print('usbip: %s' % msg, file=sys.stderr, flush=True)
 
     if args.detach is not None:
-        return 0 if detach(None if args.detach < 0 else args.detach) else 1
+        try:
+            return 0 if detach(None if args.detach < 0 else args.detach) else 1
+        except OSError as ex:
+            print('detach failed: %s' % ex, file=sys.stderr)
+            return 1
 
     if args.attach_to is not None:
         # the privileged half of attach(): import and hand the socket to
         # the kernel, which keeps it after we exit
         spec = args.attach_to
-        if ':' in spec and not spec.startswith('@') and '/' not in spec:
-            host, _, port = spec.rpartition(':')
-            vhci_port = attach(host=host, port=int(port))
-        else:
-            vhci_port = attach(unix_path=spec)
+        try:
+            if ':' in spec and not spec.startswith('@') and '/' not in spec:
+                host, _, port = spec.rpartition(':')
+                vhci_port = attach(host=host, port=int(port))
+            else:
+                vhci_port = attach(unix_path=spec)
+        except OSError as ex:
+            print('attach failed: %s' % ex, file=sys.stderr)
+            return 1
         print('attached on vhci port %u' % vhci_port, file=sys.stderr)
         return 0
 
@@ -650,8 +666,8 @@ def main():
     print('exporting %s on %s' % (BUSID, server.endpoint), file=sys.stderr,
           flush=True)
     if args.attach:
-        if not attach(unix_path=server.unix_path, host=args.host,
-                      port=server.port):
+        if attach(unix_path=server.unix_path, host=args.host,
+                  port=server.port) is False:
             print('attach failed', file=sys.stderr)
             server.close()
             return 1

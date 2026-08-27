@@ -395,8 +395,8 @@ def main():
         print('virtual FC exported on %s' % endpoint.endpoint,
               file=sys.stderr, flush=True)
         if args.attach:
-            if not sitl_usbip.attach(unix_path=endpoint.unix_path,
-                                     port=endpoint.port):
+            if sitl_usbip.attach(unix_path=endpoint.unix_path,
+                                 port=endpoint.port) is False:
                 print('attach failed', file=sys.stderr)
                 stub.close()
                 return 1

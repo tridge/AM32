@@ -1896,7 +1896,8 @@ def main():
     # the virtual USB serial device and the fake FC behind it. Bringing
     # it up attaches to the kernel and waits for the tty, so it runs off
     # the UI thread and reports back through a queue
-    usb = {'stub': None, 'port': None, 'q': queue.Queue()}
+    usb = {'stub': None, 'attached': False, 'port': None,
+           'q': queue.Queue()}
     usb_serial = 'SITL' if args.port == 57733 else 'SITL-%u' % args.port
 
     def usb_start():
@@ -1914,8 +1915,9 @@ def main():
                 serial=usb_serial))
         usb['stub'] = stub
         vhci_port = sitl_usbip.attach(unix_path=stub.ep.unix_path)
-        if not vhci_port:
+        if vhci_port is False:
             raise RuntimeError('attach refused (is vhci_hcd loaded?)')
+        usb['attached'] = True
         usb['port'] = None if vhci_port is True else vhci_port
         tty = sitl_usbip.find_tty(usb_serial, timeout=10)
         if tty is None:
@@ -1927,7 +1929,9 @@ def main():
         if usb['stub'] is not None:
             usb['stub'].close()
             usb['stub'] = None
-        sitl_usbip.detach(usb['port'])
+        if usb['attached']:
+            sitl_usbip.detach(usb['port'])
+            usb['attached'] = False
         usb['port'] = None
 
     def usb_toggled():
@@ -1968,8 +1972,12 @@ def main():
         if kind == 'ok':
             usb_status.setText(detail)
         else:
-            usb_status.setText('failed: %s' % detail)
+            # The worker has already cleaned up. Uncheck without running
+            # usb_stop() a second time, and retain the useful failure text.
+            usb_check.blockSignals(True)
             usb_check.setChecked(False)
+            usb_check.blockSignals(False)
+            usb_status.setText('failed: %s' % detail)
 
     if sys.platform.startswith('linux'):
         usb_check.toggled.connect(usb_toggled)
