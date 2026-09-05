@@ -27,7 +27,7 @@
 @@ -202,6 +210,8 @@
          }
      }
-
+ 
 +#endif
 +
      // after the self test, which may have rebound fd_out
@@ -40,7 +40,7 @@
  #define EEPROM_OFFSET 0x1F800
  #define APP_OFFSET 0x4000 // FIRMWARE_RELATIVE_START for CAN builds
 +#define SEEDED_APP_SIZE (8 * 1024)
-
+ 
  static uint8_t* flash;
  static int flash_fd = -1;
 @@ -53,16 +54,21 @@
@@ -67,13 +67,13 @@
 +    if (!legacy) {
 +        memcpy(app + 512, fwname, sizeof(fwname));
 +    }
-
+ 
      // app_signature at an aligned offset near the end of the image,
      // layout from bootloader/DroneCAN/DroneCAN.c
 @@ -83,13 +89,28 @@
      sig.crc2 = bl_crc32(app + sig_ofs + sizeof(sig), app_len - (sig_ofs + sizeof(sig)));
      memcpy(app + sig_ofs, &sig, sizeof(sig));
-
+ 
 -    // firmware name, at the CAN layout's .file_name location: just
 -    // after the vector-table region at the start of the app, matching
 -    // what devinfo.filename_start now advertises. Without it the
@@ -104,7 +104,7 @@
 +        fprintf(stderr, "SITL: repaired legacy seeded application CRC\n");
 +    }
  }
-
+ 
  void sitl_bl_flash_init(void)
 @@ -132,6 +153,8 @@
      if (fresh) {
@@ -113,5 +113,5 @@
 +    } else {
 +        repair_legacy_seed();
      }
-
+ 
      // mirror the shared eeprom file into the eeprom page: the app may

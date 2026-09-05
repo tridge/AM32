@@ -2324,7 +2324,7 @@ def create_esc_panel(args, app, fleet, esc_index):
         usb_mode.currentIndexChanged.connect(usb_changed)
     elif esc_index == 0:
         usb_mode.setEnabled(False)
-        usb_status.setText('Linux only (needs vhci_hcd)')
+        usb_status.setText('USB requires Linux or Windows')
     usb_timer = QTimer(win)
     usb_timer.timeout.connect(usb_poll)
     usb_timer.start(200)

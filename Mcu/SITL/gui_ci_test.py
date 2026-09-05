@@ -141,9 +141,14 @@ def test_launcher(args, env):
               'simulator exited with status' not in log,
               log[-300:] or 'clean')
         usb = [r for r in responses if r.startswith('STATUS usb:')]
-        check('GUI usb needs a bootloader',
-              bool(usb) and 'no bootloader' in usb[-1],
-              usb[-1] if usb else 'no status')
+        if sys.platform.startswith(('linux', 'win')):
+            check('GUI usb needs a bootloader',
+                  bool(usb) and 'no bootloader' in usb[-1],
+                  usb[-1] if usb else 'no status')
+        else:
+            check('GUI reports unsupported USB platform',
+                  bool(usb) and 'USB requires Linux or Windows' in usb[-1],
+                  usb[-1] if usb else 'no status')
         out = gui.stdout.read() if gui.stdout else ''
         check('launcher GUI no tracebacks', 'Traceback' not in out,
               out[-300:] if 'Traceback' in out else 'clean')
