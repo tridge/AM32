@@ -143,10 +143,14 @@ wire; `sitl_serial_bridge.py` is that linker. Either way an unmodified
 configurator reads and writes the settings and flash of a simulated ESC.
 
 The GUI does all of this for you: give the **SITL process** panel a
-bootloader as well as a binary, start it, and tick **USB configurator
-port**. The status next to it becomes the serial port to hand to the
-configurator, and unticking gives it back. The rest of this section is
-what that tick does, for running it by hand.
+bootloader as well as a binary, start it, and pick **USB 4-way** or
+**USB serial** from the mode box. The status next to it becomes the
+serial port to hand to the configurator, and **No USB device** gives it
+back. Picking a mode for a simulator this GUI started without a
+bootloader is refused rather than left to fail silently - both modes
+end up at the ESC bootloader, and the application answers neither
+protocol. The rest of this section is what that does, for running it by
+hand.
 
 Run the SITL chained with the bootloader, then the stub:
 
@@ -258,12 +262,13 @@ Tools in `Mcu/SITL/`:
   on the ports this GUI drives, instead of starting it separately: pick
   the binary (one is bundled with the packaged build, or Browse), an
   eeprom and an optional bootloader, and Start; leave it stopped to
-  drive a simulator you ran yourself. **USB configurator port** in the
-  same panel presents the running ESC to configurators as a virtual USB
-  serial device (see above); it stops the DShot input while it is on,
-  since a configurator session and a DShot stream cannot share one
-  signal wire. The simulation panel also has
-  optional high rate views, both default off:
+  drive a simulator you ran yourself. The USB mode box in the same panel
+  presents the running ESC to configurators as a virtual USB serial
+  device (see above), either as **USB 4-way** through the fake flight
+  controller or as **USB serial** straight onto the signal wire; it
+  stops the DShot input while either is on, since a configurator
+  session and a DShot stream cannot share one signal wire. The
+  simulation panel also has optional high rate views, both default off:
   pyqtgraph scopes of the phase currents and the phase terminal
   voltages, each in its own window (sample period down to the 500ns
   physics step and adjustable window; the sample rate is automatically

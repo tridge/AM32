@@ -111,6 +111,10 @@ def test_launcher(args, env):
             send('ds_bidir 1', 0.1)
             send('ds_enable 1', 4.0)
             send('sim_status')
+            # no bootloader in the panel, so a USB mode has nothing to
+            # configure: it must say so rather than come up dead
+            send('usb 1', 1.0)
+            send('usb_status', 1.0)
             send('sim_log')
             send('sim_stop')
             send('quit')
@@ -136,16 +140,22 @@ def test_launcher(args, env):
         check('GUI-launched SITL stays alive',
               'simulator exited with status' not in log,
               log[-300:] or 'clean')
+        usb = [r for r in responses if r.startswith('STATUS usb:')]
+        check('GUI usb needs a bootloader',
+              bool(usb) and 'no bootloader' in usb[-1],
+              usb[-1] if usb else 'no status')
         out = gui.stdout.read() if gui.stdout else ''
         check('launcher GUI no tracebacks', 'Traceback' not in out,
               out[-300:] if 'Traceback' in out else 'clean')
 
 
 def test_usb(args, env):
-    """tick the USB configurator port in the GUI: the virtual device and
-    the fake FC behind it have to come up (or fail cleanly, since the
-    attach wants vhci_hcd and root) without hanging the UI, and unticking
-    has to give the port back"""
+    """pick each USB mode in the GUI: the virtual device and whatever
+    sits behind it (the fake FC for 4-way, the linker bridge for direct
+    serial) has to come up (or fail cleanly, since the attach wants
+    vhci_hcd and root) without hanging the UI, switching between the two
+    has to swap the device, and going back to none has to give the port
+    back"""
     if not sys.platform.startswith('linux'):
         print('SKIP: gui usb, linux only')
         return
@@ -192,12 +202,19 @@ def test_usb(args, env):
                     break
             return state
 
-        send('usb 1', 1.0)
+        send('usb fourway', 1.0)
         state = usb_state()
         up = state.startswith('/dev')
         check('GUI usb settles', up or state.startswith('failed:'),
               'status=%r' % state)
         if up:
+            # straight from one mode to the other: the old device has to
+            # go away and the new one come up on the same status line
+            del responses[:]
+            send('usb serial', 1.0)
+            state = usb_state()
+            check('GUI usb serial mode', state.startswith('/dev'),
+                  'status=%r' % state)
             del responses[:]
             send('usb 0', 2.0)
             check('GUI usb releases the port', usb_state(10) == 'off',

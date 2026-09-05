@@ -23,7 +23,8 @@ actual UI paths:
   can_value X, can_rate N, param NAME VALUE, rpm_graph 0|1,
   rpm_window SECONDS, i_window MS, v_window MS,
   wave sine|square FREQ AMP BASE [dshot|can], wave off,
-  usb 0|1, usb_status, snap FILE [rpm], status, quit
+  usb 0|1|2 (or none|fourway|serial), usb_status,
+  snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
 --log FILE records every UI action with a timestamp; --replay FILE plays
@@ -521,6 +522,15 @@ class EditModelDialog(QDialog):
         self.saved_path = path
         self.status.setText(('overwrote ' if name == self.orig_name
                              else 'saved new model ') + path)
+
+
+# what sits behind the virtual USB serial device, in combo box order
+USB_OFF = 0
+USB_FOURWAY = 1
+USB_SERIAL = 2
+USB_MODE_NAMES = {'none': USB_OFF, 'off': USB_OFF,
+                  'fourway': USB_FOURWAY, '4way': USB_FOURWAY,
+                  'serial': USB_SERIAL, 'direct': USB_SERIAL}
 
 
 def main():
@@ -1836,19 +1846,24 @@ def main():
     gl.addWidget(sim_stop_btn, 4, 3)
     sim_launch_status = QLabel('not launched from here')
     gl.addWidget(sim_launch_status, 4, 0, 1, 2)
-    usb_check = QCheckBox('USB configurator port')
-    usb_check.setToolTip(
+    usb_mode = QComboBox()
+    usb_mode.addItems(['No USB device', 'USB 4-way (fake FC)',
+                       'USB serial (direct)'])
+    usb_mode.setToolTip(
         'Present the simulated ESC to configurators the way hardware\n'
-        'does: a virtual USB serial device that answers MSP as a flight\n'
-        'controller and passes BLHeli 4-way through to the ESC\n'
-        'bootloader. The AM32 configurator, a browser included, can then\n'
-        'read settings and flash firmware with no hardware and no\n'
-        'changes.\n\n'
+        'does, as a virtual USB serial device, so the AM32 configurator\n'
+        '(a browser included) and the Offline-Configurator can read\n'
+        'settings and flash firmware with no hardware and no changes.\n\n'
+        'USB 4-way: the device answers MSP as a flight controller and\n'
+        'passes BLHeli 4-way through to the ESC, the way a configurator\n'
+        'reaches an ESC that is wired to an FC.\n'
+        'USB serial: the device is the 1-wire USB linker soldered onto\n'
+        'the signal wire, which is the configurator\'s direct mode.\n\n'
         'Needs the SITL to be running with a bootloader (the field\n'
         'above) and, for the attach, root - which it asks for.\n'
-        'The DShot input is stopped while this is on: the configurator\n'
-        'session and the DShot stream share one signal wire.')
-    gl.addWidget(usb_check, 5, 0)
+        'The DShot input is stopped while either is on: the\n'
+        'configurator session and the DShot stream share one signal wire.')
+    gl.addWidget(usb_mode, 5, 0)
     usb_status = QLabel('off')
     usb_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
     usb_status.setToolTip('The serial port to give the configurator.')
@@ -1893,28 +1908,35 @@ def main():
     sim_stop_btn.clicked.connect(sim_halt)
     top.addWidget(fl, 5, 0, 1, 2)
 
-    # the virtual USB serial device and the fake FC behind it. Bringing
-    # it up attaches to the kernel and waits for the tty, so it runs off
-    # the UI thread and reports back through a queue
+    # the virtual USB serial device and whatever sits behind it: the
+    # fake FC for 4-way, or the 1-wire linker bridge for direct serial.
+    # Bringing it up attaches to the kernel and waits for the tty, so it
+    # runs off the UI thread and reports back through a queue
     usb = {'stub': None, 'attached': False, 'port': None,
            'q': queue.Queue()}
     usb_serial = 'SITL' if args.port == 57733 else 'SITL-%u' % args.port
 
-    def usb_start():
-        import msp_stub_fc
+    def usb_start(mode):
         import sitl_usbip
         # per process socket and, off the default port, a per port usb
         # serial number, so a second GUI gets its own device and its own
         # /dev/serial/by-id link rather than colliding with this one
-        stub = msp_stub_fc.MspStubFC(
-            sitl_host=args.host, sitl_port=args.port,
-            state_port=args.state_port, motor=False, poles=args.poles,
-            endpoint=sitl_usbip.UsbipServer(
-                unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(),
-                                                      os.getpid()),
-                serial=usb_serial))
+        endpoint = sitl_usbip.UsbipServer(
+            unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(), os.getpid()),
+            serial=usb_serial)
+        if mode == USB_FOURWAY:
+            import msp_stub_fc
+            stub = msp_stub_fc.MspStubFC(
+                sitl_host=args.host, sitl_port=args.port,
+                state_port=args.state_port, motor=False, poles=args.poles,
+                endpoint=endpoint)
+        else:
+            import sitl_serial_bridge
+            stub = sitl_serial_bridge.SerialBridge(
+                sitl_host=args.host, sitl_port=args.port,
+                state_port=args.state_port, endpoint=endpoint)
         usb['stub'] = stub
-        vhci_port = sitl_usbip.attach(unix_path=stub.ep.unix_path)
+        vhci_port = sitl_usbip.attach(unix_path=endpoint.unix_path)
         if vhci_port is False:
             raise RuntimeError('attach refused (is vhci_hcd loaded?)')
         usb['attached'] = True
@@ -1934,55 +1956,68 @@ def main():
             usb['attached'] = False
         usb['port'] = None
 
-    def usb_toggled():
-        if usb_check.isChecked():
-            log_action('usb 1')
-            if ds_enable.isChecked():
-                # one signal wire: DShot frames would collide with the
-                # configurator's traffic
-                ds_enable.setChecked(False)
-            usb_check.setEnabled(False)
-            usb_status.setText('starting...')
-
-            def go():
-                try:
-                    usb['q'].put(('ok', usb_start()))
-                except Exception as ex:
-                    try:
-                        usb_stop()
-                    except Exception:
-                        pass
-                    usb['q'].put(('fail', str(ex)))
-            threading.Thread(target=go, daemon=True).start()
-        else:
-            log_action('usb 0')
-            try:
-                usb_stop()
-            except Exception as ex:
-                usb_status.setText('stop failed: %s' % ex)
-                return
+    def usb_changed():
+        mode = usb_mode.currentIndex()
+        log_action('usb %u' % mode)
+        # a mode change swaps the device, so the old one goes away first
+        try:
+            usb_stop()
+        except Exception as ex:
+            usb_status.setText('stop failed: %s' % ex)
+            return
+        if mode == USB_OFF:
             usb_status.setText('off')
+            return
+        if runner.is_running() and not sim_bl_edit.text().strip():
+            # both modes end up at the ESC bootloader, and the
+            # application answers neither protocol. Only worth refusing
+            # for a simulator this GUI started: one running elsewhere
+            # may well have been given a bootloader we cannot see
+            usb_status.setText('no bootloader: set one above, then '
+                               'restart the simulator')
+            usb_mode.blockSignals(True)
+            usb_mode.setCurrentIndex(USB_OFF)
+            usb_mode.blockSignals(False)
+            return
+        if ds_enable.isChecked():
+            # one signal wire: DShot frames would collide with the
+            # configurator's traffic
+            ds_enable.setChecked(False)
+        usb_mode.setEnabled(False)
+        usb_status.setText('starting...')
+
+        def go():
+            try:
+                usb['q'].put(('ok', usb_start(mode)))
+            except Exception as ex:
+                try:
+                    usb_stop()
+                except Exception:
+                    pass
+                usb['q'].put(('fail', str(ex)))
+        threading.Thread(target=go, daemon=True).start()
 
     def usb_poll():
         try:
             kind, detail = usb['q'].get_nowait()
         except queue.Empty:
             return
-        usb_check.setEnabled(True)
+        usb_mode.setEnabled(True)
         if kind == 'ok':
             usb_status.setText(detail)
         else:
-            # The worker has already cleaned up. Uncheck without running
-            # usb_stop() a second time, and retain the useful failure text.
-            usb_check.blockSignals(True)
-            usb_check.setChecked(False)
-            usb_check.blockSignals(False)
+            # The worker has already cleaned up. Go back to off without
+            # running usb_stop() a second time, and retain the useful
+            # failure text.
+            usb_mode.blockSignals(True)
+            usb_mode.setCurrentIndex(USB_OFF)
+            usb_mode.blockSignals(False)
             usb_status.setText('failed: %s' % detail)
 
     if sys.platform.startswith('linux'):
-        usb_check.toggled.connect(usb_toggled)
+        usb_mode.currentIndexChanged.connect(usb_changed)
     else:
-        usb_check.setEnabled(False)
+        usb_mode.setEnabled(False)
         usb_status.setText('Linux only (needs vhci_hcd)')
     usb_timer = QTimer()
     usb_timer.timeout.connect(usb_poll)
@@ -2172,7 +2207,10 @@ def main():
             reply('STATUS sim_process: %s'
                   % ('running' if runner.is_running() else 'stopped'))
         elif cmd == 'usb':
-            usb_check.setChecked(bool(int(cargs[0])))
+            # 0/1/2 or a name: 'usb 1' still selects 4-way
+            a = cargs[0].lower()
+            usb_mode.setCurrentIndex(USB_MODE_NAMES[a] if a in USB_MODE_NAMES
+                                     else int(a))
         elif cmd == 'usb_status':
             reply('STATUS usb: %s' % usb_status.text())
         elif cmd == 'sim_log':
