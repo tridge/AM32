@@ -13,17 +13,38 @@ import sitl_usbip as usb
 
 
 class WindowsPackageTests(unittest.TestCase):
+    def test_closing_unattached_exporter_releases_listener(self):
+        server = usb.UsbipServer(port=0)
+        port = server.port
+        server.close()
+        self.assertFalse(server.thread.is_alive())
+        replacement = usb.UsbipServer(port=port)
+        replacement.close()
+
+    @unittest.skipUnless(hasattr(os, 'geteuid'), 'Linux privilege helper')
+    def test_linux_attach_retains_owned_port(self):
+        result = Mock(returncode=0, stdout='3\n')
+        with patch.object(usb, 'IS_WINDOWS', False), patch.object(os, 'geteuid', return_value=1000), patch.object(usb, 'privilege_prefix', return_value=['sudo']), patch.object(usb.subprocess, 'run', return_value=result):
+            self.assertEqual(usb.attach(port=3299), 3)
+            result.stdout = '0\n'
+            self.assertIs(type(usb.attach(port=3299)), int)
+            result.returncode = 1
+            self.assertIs(usb.attach(port=3299), False)
+
     def test_usb_identity_matches_enumeration_and_device_list(self):
-        # Both identities must coexist without changing another exporter's
-        # descriptors. The FC identity passes Betaflight's serial chooser.
+        # All identities must coexist without changing another exporter's
+        # descriptors. Direct mode also selects AM32's raw linker protocol.
         with_id = usb.UsbipServer(port=0, vid=usb.BETAFLIGHT_VENDOR_ID,
                                    pid=usb.BETAFLIGHT_PRODUCT_ID)
         default = usb.UsbipServer(port=0)
+        direct = usb.UsbipServer(port=0, vid=usb.DIRECT_VENDOR_ID,
+                                pid=usb.DIRECT_PRODUCT_ID)
         try:
             setup = struct.pack('<BBHHH', 0x80, usb.REQ_GET_DESCRIPTOR,
                                 0x0100, 0, 18)
             for server, expected in ((with_id, (0x0483, 0x5740)),
-                                     (default, (0x1209, 0x0001))):
+                                     (default, (0x1209, 0x0001)),
+                                     (direct, (0x1a86, 0x0001))):
                 status, descriptor = server._control(setup, b'', 18)
                 self.assertEqual(status, usb.ST_OK)
                 self.assertEqual(struct.unpack_from('<HH', descriptor, 8), expected)
@@ -32,6 +53,7 @@ class WindowsPackageTests(unittest.TestCase):
         finally:
             with_id.close()
             default.close()
+            direct.close()
 
     def test_out_completion_reports_bytes_without_returning_payload(self):
         server = usb.UsbipServer.__new__(usb.UsbipServer)

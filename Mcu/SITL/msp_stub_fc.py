@@ -1,6 +1,6 @@
 '''
-fake Betaflight FC: a minimal MSP server bridged to the SITL's UDP
-DShot input, with BLHeli 4-way passthrough to the simulated ESC
+fake Betaflight FC: a minimal MSP server bridged to up to eight SITL UDP
+DShot inputs, with BLHeli 4-way passthrough to each simulated ESC
 
 Lets scripts/esc_capture_fc.py run against the SITL binary with no
 hardware: the stub answers the MSP preflight queries, streams
@@ -90,13 +90,38 @@ class PtyEndpoint(object):
             pass
 
 
+class MotorOutput:
+    """One independent signal wire, command queue and decoded telemetry cache."""
+
+    def __init__(self, host, port):
+        self.port = sd.InputPort(host, port)
+        self.motor_value = 1000
+        self.commands = collections.deque()
+        self.ready_at = 0.0
+        self.clear_telemetry()
+
+    def clear_telemetry(self):
+        self.rpm = self.temp = self.volt_raw = self.curr_raw = 0
+        self.invalid = 100.0
+        self.edt_seen = False
+        self.edt_override = self.edt_commanded = None
+        self.last_reply = self.last_edt_cmd = 0.0
+
+    def stop(self):
+        self.motor_value = 1000
+        self.commands.clear()
+
+
 class MspStubFC(object):
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
                  poles=14, rate=500.0, esc_ports=None, state_port=57734,
                  esc_reset=True, motor=True, verbose=False, endpoint=None,
-                 trace=False, config_path=None, on_reboot=None):
+                 trace=False, config_path=None, on_reboot=None, state_ports=None):
         self.on_reboot = on_reboot
-        self.config = msp_betaflight.Configuration(poles, config_path)
+        ports = list(esc_ports or [sitl_port])
+        if not 1 <= len(ports) <= 8 or len(set(ports)) != len(ports):
+            raise ValueError('expected 1..8 distinct ESC signal ports')
+        self.config = msp_betaflight.Configuration(poles, config_path, len(ports))
         self.output_protocol = self.config.protocol
         self.output_bidir = self.config.values['bidir']
         self.output_lock = threading.RLock()
@@ -104,13 +129,9 @@ class MspStubFC(object):
         self.cli = False
         self.cli_line = bytearray()
         self.parser = msp_framing.Parser()
-        self.commands = collections.deque()
         self.motor_enabled = motor
         self.last_request = time.monotonic()
         self.ready_at = time.monotonic() + 2.0
-        self.edt_override = None
-        self.edt_commanded = None
-        self.last_reply = 0.0
         self.poles = poles
         self.rate = rate
         self.verbose = verbose
@@ -118,24 +139,15 @@ class MspStubFC(object):
         # the ESCs reachable over 4-way passthrough: one SITL input port
         # each, defaulting to the one we drive with DShot
         self.fourway = sitl_fourway_server.FourWayServer(
-            esc_ports=esc_ports or [sitl_port], host=sitl_host,
-            state_port=state_port, esc_reset=esc_reset, log=self._log)
+            esc_ports=ports, host=sitl_host,
+            state_port=state_port, esc_reset=esc_reset, log=self._log,
+            state_ports=state_ports)
         self.in_fourway = False
         # set to stop updating the telemetry while still answering MSP,
         # reproducing Betaflight serving its cached values after the
         # BDShot replies stop arriving (it never marks them stale)
         self.freeze = False
-        self.port = sd.InputPort(sitl_host, sitl_port)
-        self.motor_value = 1000        # latest MSP_SET_MOTOR, motor 1
-        self.rpm = 0
-        # raw EDT bytes as Betaflight caches them: voltage in 0.25V
-        # steps, current in the ESC's own units (AM32: 0.5A), temp in C
-        self.volt_raw = 0
-        self.curr_raw = 0
-        self.temp = 0
-        self.invalid = 100.0           # no telemetry until frames arrive
-        self.edt_seen = False
-        self.last_edt_cmd = 0.0
+        self.motors = [MotorOutput(sitl_host, port) for port in ports]
         self.running = True
         self.ep = endpoint if endpoint is not None else PtyEndpoint()
         # driving DShot at the ESC would fight the 4-way session for the
@@ -147,6 +159,34 @@ class MspStubFC(object):
             self.dshot_thread.start()
         self.msp_thread = threading.Thread(target=self._msp_loop, daemon=True)
         self.msp_thread.start()
+
+    # Existing single-ESC capture tools address the first motor directly.
+    port = property(lambda self: self.motors[0].port,
+                      lambda self, value: setattr(self.motors[0], "port", value))
+    motor_value = property(lambda self: self.motors[0].motor_value,
+                      lambda self, value: setattr(self.motors[0], "motor_value", value))
+    commands = property(lambda self: self.motors[0].commands,
+                      lambda self, value: setattr(self.motors[0], "commands", value))
+    rpm = property(lambda self: self.motors[0].rpm,
+                      lambda self, value: setattr(self.motors[0], "rpm", value))
+    temp = property(lambda self: self.motors[0].temp,
+                      lambda self, value: setattr(self.motors[0], "temp", value))
+    volt_raw = property(lambda self: self.motors[0].volt_raw,
+                      lambda self, value: setattr(self.motors[0], "volt_raw", value))
+    curr_raw = property(lambda self: self.motors[0].curr_raw,
+                      lambda self, value: setattr(self.motors[0], "curr_raw", value))
+    invalid = property(lambda self: self.motors[0].invalid,
+                      lambda self, value: setattr(self.motors[0], "invalid", value))
+    edt_seen = property(lambda self: self.motors[0].edt_seen,
+                      lambda self, value: setattr(self.motors[0], "edt_seen", value))
+    edt_override = property(lambda self: self.motors[0].edt_override,
+                      lambda self, value: setattr(self.motors[0], "edt_override", value))
+    edt_commanded = property(lambda self: self.motors[0].edt_commanded,
+                      lambda self, value: setattr(self.motors[0], "edt_commanded", value))
+    last_reply = property(lambda self: self.motors[0].last_reply,
+                      lambda self, value: setattr(self.motors[0], "last_reply", value))
+    last_edt_cmd = property(lambda self: self.motors[0].last_edt_cmd,
+                      lambda self, value: setattr(self.motors[0], "last_edt_cmd", value))
 
     @property
     def slave_path(self):
@@ -179,13 +219,15 @@ class MspStubFC(object):
             self.dshot_thread.join(0.5)
         self.fourway.close()
         self.ep.close()
-        self.port.close()
+        for motor in self.motors:
+            motor.port.close()
 
     # -- DShot side ----------------------------------------------------
 
-    def _dshot_value(self):
-        '''BF motor value 1000..2000 -> 11 bit DShot throttle'''
-        v = self.motor_value
+    @staticmethod
+    def _dshot_value(motor):
+        """BF motor value 1000..2000 -> 11 bit DShot throttle."""
+        v = motor.motor_value
         if v <= 1000:
             return 0
         return 48 + int((min(v, 2000) - 1000) * (2047 - 48) / 1000)
@@ -198,68 +240,71 @@ class MspStubFC(object):
                 if self.in_fourway or self.cli or self.output_protocol == 9:
                     nxt = now
                 elif now >= nxt:
-                    # One writer owns the signal wire, including DShot commands.
-                    # Stop after loss of MSP polling (e.g. browser disconnected).
+                    # One writer per wire, including targeted DShot commands.
                     if now - self.last_request > 2.0:
-                        self.motor_value = 1000
-                    cfg = self.config.values
-                    self.poles = cfg['poles']
-                    bidir = self.output_bidir
-                    ptype = {5: sd.TYPE_DSHOT150, 6: sd.TYPE_DSHOT300,
-                             7: sd.TYPE_DSHOT600}[self.output_protocol]
-                    value = self._dshot_value() if now >= self.ready_at else 0
-                    edt = self.edt_override if self.edt_override is not None else cfg['edt'] != 'OFF'
-                    if (bidir and (self.edt_commanded != edt or (edt and not self.edt_seen))
-                            and value == 0
-                            and now >= self.ready_at and not self.commands
-                            and now - self.last_edt_cmd > 0.5):
-                        self.commands.append([13 if edt else 14, 20])
-                        self.edt_commanded = edt
-                        self.last_edt_cmd = now
-                    telem = False
-                    if self.commands and now >= self.ready_at:
-                        value, count = self.commands[0]
-                        telem = True
-                        self.commands[0][1] -= 1
-                        if count == 1:
-                            self.commands.popleft()
-                            # EEPROM save/beeps need time before the next command.
-                            if value == 12:
-                                self.ready_at = now + 0.04
-                            elif 1 <= value <= 5:
-                                self.ready_at = now + 0.3
-                    self.port.send_dshot(value, ptype=ptype, bidir=bidir, telem=telem)
+                        for motor in self.motors:
+                            motor.stop()
+                    self.poles = self.config.values['poles']
+                    for motor in self.motors:
+                        self._send_motor(motor, now)
                     nxt = max(nxt + 1.0 / self.rate, now)
-                self._drain_replies()
-                if now - self.last_reply > 1 and not self.freeze:
-                    self.rpm = 0
-                    self.invalid = 100.0
+                for motor in self.motors:
+                    self._drain_replies(motor)
+                    if now - motor.last_reply > 1 and not self.freeze:
+                        motor.rpm = 0
+                        motor.invalid = 100.0
             time.sleep(0.0005)
 
-    def _drain_replies(self):
+    def _send_motor(self, motor, now):
+        bidir = self.output_bidir
+        ptype = {5: sd.TYPE_DSHOT150, 6: sd.TYPE_DSHOT300,
+                 7: sd.TYPE_DSHOT600}[self.output_protocol]
+        ready = now >= max(self.ready_at, motor.ready_at)
+        value = self._dshot_value(motor) if ready else 0
+        edt = motor.edt_override if motor.edt_override is not None else self.config.values['edt'] != 'OFF'
+        if (bidir and (motor.edt_commanded != edt or (edt and not motor.edt_seen))
+                and value == 0 and ready and not motor.commands
+                and now - motor.last_edt_cmd > 0.5):
+            motor.commands.append([13 if edt else 14, 20])
+            motor.edt_commanded = edt
+            motor.last_edt_cmd = now
+        telem = False
+        if motor.commands and ready:
+            value, count = motor.commands[0]
+            telem = True
+            motor.commands[0][1] -= 1
+            if count == 1:
+                motor.commands.popleft()
+                if value == 12:
+                    motor.ready_at = now + 0.04
+                elif 1 <= value <= 5:
+                    motor.ready_at = now + 0.3
+        motor.port.send_dshot(value, ptype=ptype, bidir=bidir, telem=telem)
+
+    def _drain_replies(self, motor):
         if self.freeze:
-            self.port.get_replies()      # discard, keep the cached values
+            motor.port.get_replies()
             return
-        for r in self.port.get_replies():
+        for r in motor.port.get_replies():
             kind, val = sd.decode_reply(r[3], edt_expected=True)
             if kind != 'badcrc':
-                self.last_reply = time.monotonic()
+                motor.last_reply = time.monotonic()
             if kind == 'erpm':
-                self.rpm = int(sd.erpm_period_to_rpm(val, self.poles))
-                self.invalid = max(0.0, self.invalid - 1.0)
+                motor.rpm = int(sd.erpm_period_to_rpm(val, self.poles))
+                motor.invalid = max(0.0, motor.invalid - 1.0)
             elif kind == 'temp':
-                self.temp = val
-                self.edt_seen = True
+                motor.temp = val
+                motor.edt_seen = True
             elif kind == 'volt':
-                self.volt_raw = int(round(val / 0.25))
-                self.edt_seen = True
+                motor.volt_raw = int(round(val / 0.25))
+                motor.edt_seen = True
             elif kind == 'current':
-                self.curr_raw = int(round(val / 0.5))
-                self.edt_seen = True
+                motor.curr_raw = int(round(val / 0.5))
+                motor.edt_seen = True
             elif kind == 'edt':
-                self.edt_seen = True
+                motor.edt_seen = True
             elif kind == 'badcrc':
-                self.invalid = min(100.0, self.invalid + 0.1)
+                motor.invalid = min(100.0, motor.invalid + 0.1)
 
     # -- MSP side ------------------------------------------------------
 
@@ -270,8 +315,8 @@ class MspStubFC(object):
         self.ep.write(out)
 
     def _stop_motor(self):
-        self.motor_value = 1000
-        self.commands.clear()
+        for motor in self.motors:
+            motor.stop()
 
     def _reboot(self, notify=False):
         self._stop_motor()
@@ -282,13 +327,13 @@ class MspStubFC(object):
             # AM32 detects the signal rate/polarity at startup. Apply FC
             # settings on reboot, and restart the simulated ESC to detect
             # the new wire format without a manual power cycle.
-            self.fourway._reset_esc(0)
+            for target in range(len(self.motors)):
+                self.fourway._reset_esc(target)
         self.output_protocol = self.config.protocol
         self.output_bidir = self.config.values['bidir']
-        self.edt_seen = False
-        self.edt_override = None
-        self.edt_commanded = None
-        self.rpm = self.temp = self.volt_raw = self.curr_raw = 0
+        for motor in self.motors:
+            motor.clear_telemetry()
+            motor.ready_at = 0.0
         self.ready_at = time.monotonic() + 2.0
         self.cli = False
         self.cli_line.clear()
@@ -313,18 +358,24 @@ class MspStubFC(object):
         elif cmd == MSP_SET_MOTOR:
             if len(payload) < 2 or len(payload) > 16 or len(payload) % 2:
                 raise ValueError('invalid motor values')
-            value = struct.unpack_from('<H', payload)[0]
-            if not 1000 <= value <= 2000:
+            count = len(self.motors)
+            if len(payload) < count * 2:
+                raise ValueError('missing motor values')
+            values = struct.unpack('<%uH' % (len(payload) // 2), payload)[:count]
+            if any(not 1000 <= value <= 2000 for value in values):
                 raise ValueError('invalid motor throttle')
-            self.motor_value = value
+            for motor, value in zip(self.motors, values):
+                motor.motor_value = value
             self._reply(cmd)
-        elif cmd == 104:  # MSP_MOTOR: one active output, seven unused
-            self._reply(cmd, struct.pack('<8H', self.motor_value, *([0] * 7)))
+        elif cmd == 104:  # MSP_MOTOR always has eight slots
+            values = [motor.motor_value for motor in self.motors]
+            self._reply(cmd, struct.pack('<8H', *(values + [0] * (8 - len(values)))))
         elif cmd == MSP_MOTOR_TELEMETRY:
             # Match BF's EDT wire units, including its integer voltage shift.
-            self._reply(cmd, bytes([1]) + struct.pack('<IHBHHH', self.rpm,
-                int(self.invalid * 100), int(self.temp), self.volt_raw >> 2,
-                self.curr_raw, 0))
+            self._reply(cmd, bytes([len(self.motors)]) + b''.join(
+                struct.pack('<IHBHHH', motor.rpm, int(motor.invalid * 100),
+                            int(motor.temp), motor.volt_raw >> 2, motor.curr_raw, 0)
+                for motor in self.motors))
         elif cmd == 222:
             self._stop_motor()
             self.config.set_motor(payload)
@@ -351,32 +402,35 @@ class MspStubFC(object):
             self._reply(cmd)
         elif cmd == 0x3003:
             if (len(payload) < 4 or payload[0] not in (0, 1)
-                    or payload[1] not in (0, 255) or payload[2] != len(payload) - 3
+                    or (payload[1] != 255 and payload[1] >= len(self.motors))
+                    or payload[2] != len(payload) - 3
                     or any(c > 47 for c in payload[3:]) or self.config.protocol == 9):
                 raise ValueError('invalid DShot command')
-            if self.motor_value > 1000 and any(c != 0 for c in payload[3:]):
-                raise ValueError('stop motor before DShot commands')
-            for command in payload[3:]:
-                if command == 0:
-                    self._stop_motor()
-                else:
-                    if command in (13, 14):
-                        self.edt_override = command == 13
-                        self.edt_commanded = self.edt_override
-                        self.edt_seen = False
-                        self.temp = self.volt_raw = self.curr_raw = 0
-                    if len(self.commands) >= 32:
-                        raise ValueError('DShot command queue full')
-                    self.commands.append([command, 20])
+            targets = self.motors if payload[1] == 255 else [self.motors[payload[1]]]
+            if any(m.motor_value > 1000 for m in targets) and any(payload[3:]):
+                raise ValueError('stop selected motors before DShot commands')
+            if any(len(m.commands) + len(payload[3:]) > 32 for m in targets):
+                raise ValueError('DShot command queue full')
+            for motor in targets:
+                for command in payload[3:]:
+                    if command == 0:
+                        motor.stop()
+                    else:
+                        if command in (13, 14):
+                            motor.edt_override = command == 13
+                            motor.edt_commanded = motor.edt_override
+                            motor.edt_seen = False
+                            motor.temp = motor.volt_raw = motor.curr_raw = 0
+                        motor.commands.append([command, 20])
             self._reply(cmd)
         elif cmd == 0x3002:
-            if payload != bytes([1, 0]):
-                raise ValueError('only motor output 1 exists')
+            if payload != bytes([len(self.motors)]) + bytes(range(len(self.motors))):
+                raise ValueError('outputs are fixed in ESC tab order')
             self._reply(cmd)
         else:
             data = self.config.read(cmd, payload,
                                     voltage=self.volt_raw * 0.25 if self.volt_raw else 12.6,
-                                    current=self.curr_raw * 0.5)
+                                    current=sum(m.curr_raw for m in self.motors) * 0.5)
             if data is None:
                 self._log('unsupported MSP %u' % cmd)
             self._reply(cmd, data or b'', error=data is None)
@@ -427,7 +481,7 @@ class MspStubFC(object):
             elif line == 'version':
                 result = '# Betaflight / AM32_SITL 4.6.0 - simulated FC, MSP API: 1.46'
             elif line == 'status':
-                result = 'AM32 SITL: stationary ACC/GYRO, disarmed, one motor'
+                result = 'AM32 SITL: stationary ACC/GYRO, disarmed, %u motor(s)' % len(self.motors)
             elif line == 'help':
                 result = 'get\r\nset\r\nsave\r\nexit\r\nversion\r\nstatus\r\ndump\r\ndiff\r\nhelp'
             elif line == 'mixer list':
@@ -457,8 +511,9 @@ class MspStubFC(object):
             self._log('4-way interface exited')
             with self.output_lock:
                 # Reload ESC settings when returning to motor testing.
-                if self.motor_enabled and self.fourway.connected:
-                    self.fourway._reset_esc(0)
+                if self.motor_enabled:
+                    for target in self.fourway.connected:
+                        self.fourway._reset_esc(target)
                 self._reboot()
                 self.in_fourway = False
 

@@ -142,7 +142,14 @@ class DshotPanel(object):
         self.poles = 14
         self.status = ''
         self.running = True
-        threading.Thread(target=self._sender, daemon=True).start()
+        self.thread = threading.Thread(target=self._sender, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.enabled = False
+        self.running = False
+        self.thread.join(2.0)
+        self.port.close()
 
     def _sender(self):
         next_send = time.time()
@@ -483,6 +490,48 @@ class EepromClient(object):
             return False, 'no reply from the simulator'
         finally:
             s.close()
+
+
+class EepromPoller:
+    """At most one background EEPROM read, with results consumed by the UI.
+
+    A missing ESC takes the client's full timeout. Neither polling nor
+    discarding a tab may wait for that timeout on the Qt thread. Workers
+    hold only this backend object, never a widget, and finish after the
+    bounded fetch even when their tab has been removed.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self.results = queue.Queue(maxsize=1)
+        self.pending = False
+        self.closed = threading.Event()
+
+    def request(self):
+        if self.pending or self.closed.is_set():
+            return False
+        self.pending = True
+        threading.Thread(target=self._read, daemon=True).start()
+        return True
+
+    def _read(self):
+        try:
+            result = self.client.fetch()
+        except (OSError, ValueError):
+            result = (None, None)
+        if not self.closed.is_set():
+            self.results.put_nowait(result)
+
+    def take(self):
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            return None
+        self.pending = False
+        return result
+
+    def close(self):
+        self.closed.set()
 
 
 class SimStream(object):

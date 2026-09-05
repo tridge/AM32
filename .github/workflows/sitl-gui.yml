@@ -32,6 +32,12 @@ jobs:
       - name: Betaflight motor integration
         run: python3 Mcu/SITL/betaflight_sitl_test.py
 
+      - name: Eight ESC motor integration
+        run: python3 Mcu/SITL/multi_esc_sitl_test.py
+
+      - name: Multiple ESC tabs and USB routing
+        run: python3 Mcu/SITL/multi_esc_gui_test.py
+
       - name: Headless GUI test
         env:
           QT_QPA_PLATFORM: offscreen

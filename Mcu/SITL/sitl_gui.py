@@ -24,6 +24,8 @@ actual UI paths:
   rpm_window SECONDS, i_window MS, v_window MS,
   wave sine|square FREQ AMP BASE [dshot|can], wave off,
   usb 0|1|2|3 (or none|fourway|serial|betaflight), usb_status,
+  esc_count 1..8, esc N COMMAND, esc_select N, esc_status,
+  sim_start_all, sim_stop_all, usb_target N (direct USB only),
   snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
@@ -36,13 +38,15 @@ import json
 import os
 import queue
 import signal
+import copy
+from types import SimpleNamespace
 import socket
 import sys
 import threading
 import time
 
 try:
-    from PySide6.QtCore import Qt, QTimer, QRectF, QLineF
+    from PySide6.QtCore import Qt, QTimer, QRectF, QLineF, QSignalBlocker
     from PySide6.QtGui import (QFontDatabase, QPen, QBrush, QColor, QPainter,
                                QIcon)
     from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
@@ -52,7 +56,7 @@ try:
                                    QSlider, QSpinBox, QVBoxLayout, QWidget,
                                    QLineEdit, QPlainTextEdit, QFileDialog,
                                    QDialog, QFormLayout, QDialogButtonBox,
-                                   QScrollArea)
+                                   QScrollArea, QTabWidget)
 except ImportError:
     _here = os.path.dirname(os.path.abspath(__file__))
     if sys.platform == 'win32':
@@ -93,7 +97,7 @@ import sitl_dshot as sd
 import sitl_tones
 import sim_runner
 import model_builder
-from sitl_gui_backend import (DshotPanel, CanPanel, CanFrameCounter, EepromClient,
+from sitl_gui_backend import (DshotPanel, CanPanel, CanFrameCounter, EepromClient, EepromPoller,
                               SimStream, ToneStream, AudioStream,
                               HAVE_DRONECAN)
 from sitl_wave_dialog import wave_pixmap
@@ -535,6 +539,228 @@ USB_MODE_NAMES = {'none': USB_OFF, 'off': USB_OFF,
                   'betaflight': USB_BETAFLIGHT}
 
 
+class EscFleet:
+    """Own the ESC tabs and the single configurator-facing USB connection."""
+
+    def __init__(self, args, app):
+        self.args, self.app = args, app
+        self.panels = []
+        self.t0 = time.time()
+        self.logf = open(args.log, 'w') if args.log else None
+        self.win = QWidget()
+        self.win.setWindowTitle('AM32 SITL control')
+        layout = QVBoxLayout(self.win)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel('ESCs:'))
+        self.count = QSpinBox()
+        self.count.setRange(1, 8)
+        self.count.setToolTip('Independent ESC simulations. Stop all simulations and USB before changing the count.')
+        bar.addWidget(self.count)
+        start = QPushButton('Start all')
+        stop = QPushButton('Stop all')
+        start.clicked.connect(lambda: self.run_all(True))
+        stop.clicked.connect(lambda: self.run_all(False))
+        bar.addWidget(start)
+        bar.addWidget(stop)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+        usb_bar = QHBoxLayout()
+        layout.addLayout(usb_bar)
+        self.direct = QComboBox()
+        self.direct.setToolTip('The single ESC reached by USB serial (direct) mode.')
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        self.status = QLabel('')
+        layout.addWidget(self.status)
+        self.set_count(args.esc_count)
+        # These controls belong to the whole bench, including when ESC 1's
+        # tab is hidden. Only its panel owns the USB worker and control socket.
+        usb_bar.addWidget(self.panels[0].usb_mode)
+        usb_bar.addWidget(QLabel('Direct ESC:'))
+        usb_bar.addWidget(self.direct)
+        usb_bar.addWidget(self.panels[0].usb_status, 1)
+        self.count.valueChanged.connect(self.change_count)
+        self.timer = QTimer(self.win)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(100)
+        self.refresh()
+
+    def log_action(self, index, cmd):
+        if self.logf is not None:
+            prefix = 'esc %u ' % (index + 1) if index else ''
+            self.logf.write('%.3f %s%s\n' % (time.time() - self.t0, prefix, cmd))
+            self.logf.flush()
+
+    def panel_args(self, index):
+        args = copy.copy(self.args)
+        args.port += 10 * index
+        args.state_port += 10 * index
+        if not 1 <= args.port <= 65535 or not 1 <= args.state_port <= 65535:
+            raise ValueError('ESC ports exceed the UDP port range')
+        if args.can_uri.startswith('mcast:'):
+            bus = int(args.can_uri.split(':')[1]) + index
+            if not 0 <= bus <= 255:
+                raise ValueError('ESC CAN multicast bus must be 0..255')
+            args.can_uri = 'mcast:%u' % bus
+        elif index and args.can_uri != 'none':
+            raise ValueError('multiple ESC tabs require --can-uri mcast:N or none')
+        if index:
+            args.control_port = 0
+            args.replay = None
+        return args
+
+    def require_stopped(self):
+        if self.panels and (self.panels[0].usb_mode.currentIndex() != USB_OFF
+                            or not self.panels[0].usb_mode.isEnabled()
+                            or any(p.runner.is_running() for p in self.panels)):
+            raise ValueError('stop all simulations and USB before changing ESC count')
+
+    def set_count(self, count):
+        if not 1 <= count <= 8:
+            raise ValueError('ESC count must be 1..8')
+        self.require_stopped()
+        settings = [self.panel_args(i) for i in range(count)]
+        ports = [port for args in settings for port in (args.port, args.state_port)]
+        if len(set(ports)) != len(ports):
+            raise ValueError('ESC signal and state ports overlap')
+        while len(self.panels) > count:
+            index = len(self.panels) - 1
+            panel = self.panels.pop()
+            panel.close()
+            self.tabs.removeTab(index)
+            panel.widget.deleteLater()
+        while len(self.panels) < count:
+            index = len(self.panels)
+            panel = create_esc_panel(settings[index], self.app, self, index)
+            if self.panels:
+                first = self.panels[0]
+                for name in ('binary', 'bootloader'):
+                    getattr(panel, name).setText(getattr(first, name).text())
+                panel.input_mode.setCurrentIndex(first.input_mode.currentIndex())
+                panel.accurate.setChecked(first.accurate.isChecked())
+                panel.verbose.setChecked(first.verbose.isChecked())
+            self.panels.append(panel)
+            for name in ('binary', 'bootloader'):
+                getattr(panel, name).textChanged.connect(
+                    lambda path, field=name: self.set_shared_path(field, path))
+            self.tabs.addTab(panel.widget, 'ESC %u' % (index + 1))
+            self.tabs.setTabToolTip(index, 'Signal UDP %u, state UDP %u, CAN %s' % (
+                panel.args.port, panel.args.state_port, panel.args.can_uri))
+        selected = self.direct.currentIndex()
+        self.direct.clear()
+        self.direct.addItems(['ESC %u' % (i + 1) for i in range(count)])
+        self.direct.setCurrentIndex(max(0, min(selected, count - 1)))
+        self.count.blockSignals(True)
+        self.count.setValue(count)
+        self.count.blockSignals(False)
+
+    def set_shared_path(self, field, path):
+        for panel in self.panels:
+            edit = getattr(panel, field)
+            with QSignalBlocker(edit):
+                edit.setText(path)
+
+    def change_count(self, count):
+        try:
+            self.set_count(count)
+            self.log_action(0, 'esc_count %u' % count)
+            self.status.setText('')
+        except Exception as ex:
+            self.status.setText(str(ex))
+            self.count.blockSignals(True)
+            self.count.setValue(len(self.panels))
+            self.count.blockSignals(False)
+
+    def refresh(self):
+        usb = self.panels[0].usb_mode
+        self.count.setEnabled(usb.currentIndex() == USB_OFF and usb.isEnabled()
+                              and not any(p.runner.is_running() for p in self.panels))
+        self.direct.setEnabled(usb.currentIndex() == USB_OFF and usb.isEnabled())
+
+    def validate_eeproms(self):
+        paths = [os.path.normcase(os.path.realpath(p.eeprom.text().strip())) for p in self.panels]
+        if len(set(paths)) != len(paths):
+            raise ValueError('each ESC needs its own EEPROM file')
+
+    def run_all(self, start):
+        try:
+            if start:
+                self.validate_eeproms()
+            for panel in self.panels:
+                if start:
+                    if not panel.runner.is_running():
+                        if not panel.start():
+                            raise RuntimeError('ESC %u failed to start; see its launch status' % (self.panels.index(panel) + 1))
+                else:
+                    panel.stop()
+            self.status.setText('')
+        except Exception as ex:
+            self.status.setText(str(ex))
+
+    def usb_targets(self, mode):
+        if mode == USB_SERIAL:
+            return [self.panels[self.direct.currentIndex()]]
+        return list(self.panels)
+
+    def set_usb_ownership(self, mode):
+        for panel in self.panels:
+            panel.set_usb_ownership(mode)
+        self.refresh()
+
+    def handle_command(self, index, line, reply):
+        parts = line.split()
+        if not parts:
+            return False
+        cmd = parts[0]
+        if cmd == 'esc_count':
+            self.set_count(int(parts[1]))
+            self.log_action(0, line.strip())
+        elif cmd == 'esc':
+            target = int(parts[1]) - 1
+            if not 0 <= target < len(self.panels):
+                raise ValueError('ESC number outside configured range')
+            self.panels[target].command(' '.join(parts[2:]), reply)
+            return True
+        elif cmd == 'esc_select':
+            target = int(parts[1]) - 1
+            if not 0 <= target < len(self.panels):
+                raise ValueError('ESC number outside configured range')
+            self.tabs.setCurrentIndex(target)
+        elif cmd == 'esc_status':
+            for i, panel in enumerate(self.panels):
+                reply('STATUS esc %u: input=%u state=%u can=%s running=%u eeprom=%s' % (
+                    i + 1, panel.args.port, panel.args.state_port, panel.args.can_uri,
+                    panel.runner.is_running(), panel.eeprom.text()))
+            return True
+        elif cmd == 'usb_target':
+            if self.panels[0].usb_mode.currentIndex() != USB_OFF:
+                raise ValueError('stop USB before selecting a direct ESC')
+            target = int(parts[1]) - 1
+            if not 0 <= target < len(self.panels):
+                raise ValueError('ESC number outside configured range')
+            self.direct.setCurrentIndex(target)
+        elif cmd in ('sim_start_all', 'sim_stop_all'):
+            self.run_all(cmd == 'sim_start_all')
+            if self.status.text():
+                raise ValueError(self.status.text())
+        elif index and cmd in ('usb', 'usb_status'):
+            self.panels[0].command(line, reply)
+            return True
+        else:
+            return False
+        reply('OK ' + line.strip())
+        return True
+
+    def close(self):
+        self.timer.stop()
+        # USB must release every wire before tearing down any ESC runner.
+        self.panels[0].usb_stop()
+        for panel in reversed(self.panels):
+            panel.close()
+        if self.logf is not None:
+            self.logf.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--host', default='127.0.0.1')
@@ -549,15 +775,25 @@ def main():
                     help='log all UI actions with timestamps, for later --replay')
     ap.add_argument('--replay', metavar='FILE',
                     help='replay a --log action file with its original timing')
+    ap.add_argument('--esc-count', type=int, choices=range(1, 9), default=1,
+                    help='number of independent ESCs (default 1)')
     args = ap.parse_args()
 
-    t0 = time.time()
-    logf = open(args.log, 'w') if args.log else None
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    fleet = EscFleet(args, app)
+    signal.signal(signal.SIGINT, lambda *a: app.quit())
+    signal.signal(signal.SIGTERM, lambda *a: app.quit())
+    fleet.win.show()
+    try:
+        app.exec()
+    finally:
+        fleet.close()
 
+
+def create_esc_panel(args, app, fleet, esc_index):
     def log_action(cmd):
-        if logf is not None:
-            logf.write('%.3f %s\n' % (time.time() - t0, cmd))
-            logf.flush()
+        fleet.log_action(esc_index, cmd)
 
     ds = DshotPanel(args.host, args.port)
     ds.poles = args.poles
@@ -594,15 +830,14 @@ def main():
     # child inherits the kernel-level SIG_IGN disposition, so a terminal
     # Ctrl-C only interrupts this process and the child is shut down
     # through node.close() instead of dying with a traceback
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    old_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
     can = CanPanel(args.can_uri) if HAVE_DRONECAN and args.can_uri != 'none' else None
     if can is not None:
         can.started.wait(5.0)
 
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    signal.signal(signal.SIGINT, old_sigint)
     win = QWidget()
-    win.setWindowTitle('AM32 SITL control')
+    win.setWindowTitle('AM32 SITL ESC %u' % (esc_index + 1))
     top = QGridLayout(win)
 
     # ---- PWM/DShot input panel
@@ -853,7 +1088,8 @@ def main():
                                          throttle_frac(), time.monotonic()))
             time.sleep(0.005)
 
-    threading.Thread(target=wave_loop, daemon=True).start()
+    wave_thread = threading.Thread(target=wave_loop, daemon=True)
+    wave_thread.start()
 
     WAVE_ACTIVE_STYLE = 'background-color: #cfe8ff; font-weight: bold'
 
@@ -1710,7 +1946,7 @@ def main():
                 rpm_graph['p1'].setXRange(float(ts[0]), 0, padding=0)
                 rg.refresh_readout()
 
-    sim_view_timer = QTimer()
+    sim_view_timer = QTimer(win)
     sim_view_timer.timeout.connect(update_sim_views)
     # 20fps: the repaints run on the Qt thread, so a lower rate leaves the
     # event loop more time to service the audio pull between frames
@@ -1738,6 +1974,7 @@ def main():
         '(no 4-way or DroneCAN parameter protocol involved).')
     gs.addWidget(param_btn, 0, 1)
     eeprom_client = EepromClient(args.host, args.state_port)
+    eeprom_poll = EepromPoller(eeprom_client)
     param_state = {'dialog': None, 'mismatch': None, 'next_check': 0.0,
                    'input_hint': None}
 
@@ -1798,8 +2035,10 @@ def main():
         'stopped to drive a simulator you started separately.')
     gl = QGridLayout(fl)
     sim_bin_edit = QLineEdit(sim_runner.bundled_sitl() or '')
-    sim_ee_edit = QLineEdit(sim_runner.bundled_eeprom() or '')
+    sim_ee_edit = QLineEdit(sim_runner.bundled_eeprom(esc_index) or '')
     sim_bl_edit = QLineEdit(sim_runner.bundled_bootloader() or '')
+    for edit in (sim_bin_edit, sim_bl_edit):
+        edit.setToolTip('Shared by all ESCs. Changes apply when each simulator is next started.')
 
     def _browse(edit, title, filt='All files (*)'):
         def go():
@@ -1821,6 +2060,7 @@ def main():
     gl.addWidget(QLabel('Input'), 3, 0)
     sim_input = QComboBox()
     sim_input.addItems(['Auto (from eeprom)', 'DShot', 'DroneCAN'])
+    sim_input.setCurrentIndex(1)
     sim_input.setToolTip(
         'Force the ESC firmware input mode. A DroneCAN-configured eeprom '
         '(like the bundled one) ignores DShot input, so pick DShot here to '
@@ -1848,15 +2088,18 @@ def main():
     gl.addWidget(sim_stop_btn, 4, 3)
     sim_launch_status = QLabel('not launched from here')
     gl.addWidget(sim_launch_status, 4, 0, 1, 2)
-    usb_mode = QComboBox()
-    usb_mode.addItems(['No USB device', 'USB 4-way (fake FC)',
-                       'USB serial (direct)', 'USB Betaflight (motor control)'])
+    if esc_index == 0:
+        usb_mode = QComboBox()
+        usb_mode.addItems(['No USB device', 'USB 4-way (fake FC)',
+                           'USB serial (direct)', 'USB Betaflight (motor control)'])
+    else:
+        usb_mode = fleet.panels[0].usb_mode
     usb_mode.setToolTip(
         'Present the simulated ESC to configurators the way hardware\n'
         'does, as a virtual USB serial device, so the AM32 configurator\n'
         '(a browser included) and the Offline-Configurator can read\n'
         'settings and flash firmware with no hardware and no changes.\n\n'
-        'USB Betaflight: connect app.betaflight.com to control motor 1,\n'
+        'USB Betaflight: connect app.betaflight.com to control the ESCs,\n'
         'set DShot/BDShot/EDT, and read telemetry. GUI motor controls\n'
         'are disabled while the app owns the output.\n\n'
         'USB 4-way: the device answers MSP as a flight controller and\n'
@@ -1869,11 +2112,13 @@ def main():
         'On Linux attaching needs root permission.\n'
         'The GUI DShot input is stopped while USB is on: the\n'
         'configurator session and the DShot stream share one signal wire.')
-    gl.addWidget(usb_mode, 5, 0)
+    if esc_index == 0:
+        gl.addWidget(usb_mode, 5, 0)
     usb_status = QLabel('off')
     usb_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
     usb_status.setToolTip('The serial port to give the configurator.')
-    gl.addWidget(usb_status, 5, 1, 1, 2)
+    if esc_index == 0:
+        gl.addWidget(usb_status, 5, 1, 1, 2)
     sim_pause_check = QCheckBox('pause scroll')
     sim_pause_check.setToolTip('Stop the output pane from following new '
                                'lines, so you can read back through it.')
@@ -1887,6 +2132,7 @@ def main():
     def sim_launch():
         itype = {0: None, 1: 1, 2: 5}[sim_input.currentIndex()]
         try:
+            fleet.validate_eeproms()
             runner.start(
                 sim_bin_edit.text().strip() or None,
                 sim_ee_edit.text().strip() or None,
@@ -1898,11 +2144,12 @@ def main():
                 high_accuracy=sim_accurate.isChecked())
         except Exception as ex:
             sim_launch_status.setText('failed: %s' % ex)
-            return
+            return False
         sim_start_btn.setEnabled(False)
         sim_stop_btn.setEnabled(True)
         sim_launch_status.setText('running on udp %u / %s'
                                   % (args.port, args.can_uri))
+        return True
 
     def sim_halt():
         runner.stop()
@@ -1918,16 +2165,20 @@ def main():
     # fake FC for 4-way, or the 1-wire linker bridge for direct serial.
     # Bringing it up attaches to the kernel and waits for the tty, so it
     # runs off the UI thread and reports back through a queue
-    usb = {'stub': None, 'attached': False, 'port': None,
+    usb = {'stub': None, 'attached': False, 'port': None, 'worker': None,
            'q': queue.Queue()}
     usb_serial = 'SITL' if args.port == 57733 else 'SITL-%u' % args.port
 
     def usb_start(mode):
         import sitl_usbip
+        targets = fleet.usb_targets(mode)
+        first = targets[0]
         vid, pid = sitl_usbip.VENDOR_ID, sitl_usbip.PRODUCT_ID
         if mode == USB_BETAFLIGHT:
             vid, pid = (sitl_usbip.BETAFLIGHT_VENDOR_ID,
                         sitl_usbip.BETAFLIGHT_PRODUCT_ID)
+        elif mode == USB_SERIAL:
+            vid, pid = sitl_usbip.DIRECT_VENDOR_ID, sitl_usbip.DIRECT_PRODUCT_ID
         # per process socket and, off the default port, a per port usb
         # serial number, so a second GUI gets its own device and its own
         # /dev/serial/by-id link rather than colliding with this one
@@ -1938,20 +2189,26 @@ def main():
             endpoint = sitl_usbip.UsbipServer(
                 unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(), os.getpid()),
                 serial=usb_serial, vid=vid, pid=pid)
-        if mode in (USB_FOURWAY, USB_BETAFLIGHT):
-            import msp_stub_fc
-            stub = msp_stub_fc.MspStubFC(
-                sitl_host=args.host, sitl_port=args.port,
-                state_port=args.state_port, motor=mode == USB_BETAFLIGHT,
-                poles=args.poles, endpoint=endpoint,
-                config_path=(sim_ee_edit.text().strip() + '.fc.json')
-                if mode == USB_BETAFLIGHT and sim_ee_edit.text().strip() else None,
-                on_reboot=lambda fc: usb['q'].put(('reboot', fc)))
-        else:
-            import sitl_serial_bridge
-            stub = sitl_serial_bridge.SerialBridge(
-                sitl_host=args.host, sitl_port=args.port,
-                state_port=args.state_port, endpoint=endpoint)
+        try:
+            if mode in (USB_FOURWAY, USB_BETAFLIGHT):
+                import msp_stub_fc
+                stub = msp_stub_fc.MspStubFC(
+                    sitl_host=args.host, sitl_port=args.port,
+                    state_port=first.args.state_port, motor=mode == USB_BETAFLIGHT,
+                    esc_ports=[panel.args.port for panel in targets],
+                    state_ports=[panel.args.state_port for panel in targets],
+                    poles=args.poles, endpoint=endpoint,
+                    config_path=(sim_ee_edit.text().strip() + '.fc.json')
+                    if mode == USB_BETAFLIGHT and sim_ee_edit.text().strip() else None,
+                    on_reboot=lambda fc: usb['q'].put(('reboot', fc)))
+            else:
+                import sitl_serial_bridge
+                stub = sitl_serial_bridge.SerialBridge(
+                    sitl_host=first.args.host, sitl_port=first.args.port,
+                    state_port=first.args.state_port, endpoint=endpoint)
+        except Exception:
+            endpoint.close()
+            raise
         usb['stub'] = stub
         vhci_port = sitl_usbip.attach(unix_path=endpoint.unix_path,
                                      host=endpoint.host, port=endpoint.port)
@@ -1966,6 +2223,9 @@ def main():
 
     def usb_stop():
         import sitl_usbip
+        worker = usb['worker']
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
         # Detach while the exporter still exists. With usbip-win2 --once,
         # closing it first removes the device and makes detach fail.
         if usb['attached']:
@@ -1976,6 +2236,17 @@ def main():
             usb['stub'].close()
             usb['stub'] = None
 
+    def set_usb_ownership(mode):
+        ds_enable.setEnabled(mode == USB_OFF)
+        if can is not None:
+            can_enable.setEnabled(mode != USB_BETAFLIGHT)
+            can_dna.setEnabled(mode != USB_BETAFLIGHT)
+            if mode == USB_BETAFLIGHT:
+                can_enable.setChecked(False)
+                can_dna.setChecked(False)
+        if mode != USB_OFF and ds_enable.isChecked():
+            ds_enable.setChecked(False)
+
     def usb_changed():
         mode = usb_mode.currentIndex()
         log_action('usb %u' % mode)
@@ -1985,18 +2256,13 @@ def main():
         except Exception as ex:
             usb_status.setText('stop failed: %s' % ex)
             return
-        ds_enable.setEnabled(mode == USB_OFF)
-        if can is not None:
-            can_enable.setEnabled(mode != USB_BETAFLIGHT)
-            can_dna.setEnabled(mode != USB_BETAFLIGHT)
-            if mode == USB_BETAFLIGHT:
-                can_enable.setChecked(False)
-                can_dna.setChecked(False)
+        fleet.set_usb_ownership(mode)
         if mode == USB_OFF:
             usb_status.setText('off')
             return
-        if (mode != USB_BETAFLIGHT and runner.is_running()
-                and not sim_bl_edit.text().strip()):
+        if (mode != USB_BETAFLIGHT and any(
+                panel.runner.is_running() and not panel.bootloader.text().strip()
+                for panel in fleet.usb_targets(mode))):
             # both modes end up at the ESC bootloader, and the
             # application answers neither protocol. Only worth refusing
             # for a simulator this GUI started: one running elsewhere
@@ -2006,7 +2272,7 @@ def main():
             usb_mode.blockSignals(True)
             usb_mode.setCurrentIndex(USB_OFF)
             usb_mode.blockSignals(False)
-            ds_enable.setEnabled(True)
+            fleet.set_usb_ownership(USB_OFF)
             return
         if ds_enable.isChecked():
             # one signal wire: DShot frames would collide with the
@@ -2024,7 +2290,8 @@ def main():
                 except Exception:
                     pass
                 usb['q'].put(('fail', str(ex)))
-        threading.Thread(target=go, daemon=True).start()
+        usb['worker'] = threading.Thread(target=go, daemon=True)
+        usb['worker'].start()
 
     def usb_poll():
         try:
@@ -2050,18 +2317,15 @@ def main():
             usb_mode.blockSignals(True)
             usb_mode.setCurrentIndex(USB_OFF)
             usb_mode.blockSignals(False)
-            ds_enable.setEnabled(True)
-            if can is not None:
-                can_enable.setEnabled(True)
-                can_dna.setEnabled(True)
+            fleet.set_usb_ownership(USB_OFF)
             usb_status.setText('failed: %s' % detail)
 
-    if sys.platform.startswith(('linux', 'win')):
+    if esc_index == 0 and sys.platform.startswith(('linux', 'win')):
         usb_mode.currentIndexChanged.connect(usb_changed)
-    else:
+    elif esc_index == 0:
         usb_mode.setEnabled(False)
         usb_status.setText('Linux only (needs vhci_hcd)')
-    usb_timer = QTimer()
+    usb_timer = QTimer(win)
     usb_timer.timeout.connect(usb_poll)
     usb_timer.start(200)
 
@@ -2089,7 +2353,7 @@ def main():
             bar.setValue(min(keep, bar.maximum()) if paused else bar.maximum())
             if not runner.is_running() and sim_stop_btn.isEnabled():
                 sim_halt()
-    sim_out_timer = QTimer()
+    sim_out_timer = QTimer(win)
     sim_out_timer.timeout.connect(drain_sim_out)
     sim_out_timer.start(200)
 
@@ -2099,6 +2363,7 @@ def main():
     # issuing client. A client disconnect leaves the GUI running; the
     # quit command closes it
     cmd_queue = queue.Queue()   # (line, reply function)
+    control_sockets = []
 
     def emit(msg):
         print(msg)
@@ -2126,11 +2391,21 @@ def main():
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(('127.0.0.1', args.control_port))
         srv.listen(4)
-        while True:
-            conn, _ = srv.accept()
+        srv.settimeout(0.2)
+        control_sockets.append(srv)
+        while wave['run']:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            control_sockets.append(conn)
             threading.Thread(target=control_client, args=(conn,), daemon=True).start()
 
     def handle_command(line, reply):
+        if fleet.handle_command(esc_index, line, reply):
+            return
         parts = line.split()
         if not parts:
             return
@@ -2231,7 +2506,7 @@ def main():
             audio_slider.setValue(int(cargs[0]))
         elif cmd == 'snap':
             # screenshot a window to a file, for scripted visual checks
-            tgt = win
+            tgt = fleet.win
             if len(cargs) > 1 and cargs[1] == 'rpm' and 'win' in rpm_graph:
                 tgt = rpm_graph['win']
             tgt.grab().save(cargs[0])
@@ -2348,7 +2623,7 @@ def main():
             cmd_queue.put((cmd + '\n', emit))
         emit('REPLAY done (%u actions)' % len(entries))
 
-    cmd_timer = QTimer()
+    cmd_timer = QTimer(win)
     cmd_timer.timeout.connect(cmd_poll)
     if args.control_port > 0:
         threading.Thread(target=control_server, daemon=True).start()
@@ -2373,9 +2648,11 @@ def main():
         # with the simulated motor: silent mismatches (a stale MOTOR_KV
         # especially) look like physics faults, not configuration
         now = time.time()
-        if now >= param_state['next_check']:
+        if now >= param_state['next_check'] and eeprom_poll.request():
             param_state['next_check'] = now + 3.0
-            image, model = eeprom_client.fetch()
+        result = eeprom_poll.take()
+        if result is not None:
+            image, model = result
             if image is not None:
                 import sitl_params
                 bad = sitl_params.mismatches(image, model)
@@ -2465,33 +2742,54 @@ def main():
         if can_fps.available:
             can_fps_label.setText('FPS: %.0f' % can_fps.rate.hz())
 
-    update_timer = QTimer()
+    update_timer = QTimer(win)
     update_timer.timeout.connect(update)
     update_timer.start(100)
 
-    # graceful Ctrl-C / SIGTERM: quit the event loop. The handler runs
-    # from the 100ms update timer, the next time python bytecode executes
-    signal.signal(signal.SIGINT, lambda *a: app.quit())
-    signal.signal(signal.SIGTERM, lambda *a: app.quit())
+    closed = False
 
-    win.show()
-    try:
-        app.exec()
-    finally:
+    def cleanup():
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        eeprom_poll.close()
+        for timer in (sim_view_timer, usb_timer, sim_out_timer, cmd_timer, update_timer):
+            timer.stop()
         wave['run'] = False
-        if tone_synth is not None:      # stop the audio threads cleanly
+        wave_thread.join(1.0)
+        for sock in control_sockets:
+            sock.close()
+        if tone_synth is not None:
             tone_synth.stop()
         if phys_player is not None:
             phys_player.stop()
-        ds.running = False
+        if tones is not None:
+            tones.close()
+        if phys_stream is not None:
+            phys_stream.close()
+        ds.close()
         if usb['stub'] is not None:
             usb_stop()
         runner.stop()
         sim.close()
+        can_fps.close()
+        for graph in list(graph_windows.values()):
+            graph[0].close()
+        if 'win' in rpm_graph:
+            rpm_graph['win'].close()
         if can is not None:
             can.running = False
-            # let the CAN thread close the node and its IO child
             can.thread.join(2.0)
+
+    return SimpleNamespace(
+        widget=win, args=args, runner=runner, close=cleanup,
+        command=handle_command, set_usb_ownership=set_usb_ownership,
+        usb_mode=usb_mode, usb_status=usb_status, usb_stop=usb_stop,
+        binary=sim_bin_edit, eeprom=sim_ee_edit, bootloader=sim_bl_edit,
+        input_mode=sim_input, accurate=sim_accurate, verbose=sim_verbose,
+        start=sim_launch, stop=sim_halt,
+    )
 
 
 def _ensure_stdio():

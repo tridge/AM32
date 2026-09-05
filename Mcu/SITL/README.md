@@ -152,6 +152,11 @@ end up at the ESC bootloader, and the application answers neither
 protocol. The rest of this section is what that does, for running it by
 hand.
 
+**USB serial (direct)** uses a separate linker USB identity so am32.ca
+automatically chooses its direct protocol at 19200 baud. After changing
+USB modes, use the browser's **Port select** to select the newly attached
+device before connecting. Direct mode reaches only the **Direct ESC** target.
+
 Run the SITL chained with the bootloader, then the stub:
 
 ```
@@ -470,6 +475,33 @@ that prerequisite and reboot to enable the GUI's Windows COM port support.
 
 ### Betaflight App
 
+Use the **ESCs** selector above the tabs to choose 1–8 independent ESCs;
+the default is one. Each **ESC N** tab has its own motor controls, plots,
+model and persistent EEPROM. Choosing or editing the SITL binary or bootloader
+in any tab selects it for all ESCs, including tabs added later. These changes
+apply when the simulators are next started. New tabs inherit ESC 1's input
+options. **Start all** and **Stop all** operate the whole
+bench; each tab also retains its individual Start/Stop buttons. DShot is
+the default launch input. Stop all simulations and select **No USB device**
+before changing the ESC count.
+
+The shared **USB 4-way** and **USB Betaflight** connections advertise the
+configured count to am32.ca and Betaflight. Motor/ESC numbers match the tab
+numbers. Direct USB wiring reaches only the ESC chosen in **Direct ESC**;
+select that target while USB is off. Disconnect the browser before changing
+USB modes. After editing ESC settings, use **Stop all**, then **Start all**
+to reload them.
+
+Extra EEPROM files use `.esc2.bin` through `.esc8.bin` beside the first
+default EEPROM and survive tab removal and recreation. Each ESC must use a
+different EEPROM file. Signal/state ports increase by 10 per ESC (default
+ESC 2: 57743/57744). CAN controls use separate multicast buses, starting at
+`--can-uri mcast:N` and increasing by one per tab, to avoid cross-control or
+node-ID collisions. Multiple tabs support multicast CAN or `--can-uri none`.
+Use `--esc-count 8` to start the GUI with eight tabs. The control socket
+accepts `esc 8 ds_value 500` to address a tab; unprefixed commands address
+ESC 1, while `esc_count`, `sim_start_all` and `sim_stop_all` address the bench.
+
 Betaflight USB mode uses the emulated STM32 VCP ID `0483:5740`, which
 Betaflight's default serial-port chooser accepts. The USB product remains
 `AM32 SITL serial`. After updating the Python sources, restart the GUI and
@@ -478,7 +510,7 @@ select this mode again to re-enumerate the device with the new ID.
 Select **USB Betaflight (motor control)** in the GUI, start the simulator
 with **Input: DShot**, and connect [Betaflight App](https://app.betaflight.com)
 to the displayed serial port. The Setup tab reports a stationary, level
-accelerometer and gyro. In Motors, enable motor testing and use motor 1 or
+accelerometer and gyro. In Motors, enable motor testing and use each motor's or
 the master slider. Leave throttle at zero for two seconds after startup.
 RPM, temperature, voltage and current are decoded from the simulated ESC's
 actual bidirectional DShot/EDT replies.
@@ -501,8 +533,10 @@ configuration and flashing without a motor command stream.
 
 FC settings persist in `<selected EEPROM>.fc.json`, separately from the
 AM32 EEPROM. Standalone `msp_stub_fc.py --config FILE` provides the same
-persistence. Only one motor is driven/reported, even if `--esc-ports` exposes
-additional ESCs for 4-way access. PID/filter fields are retained for Motors
+persistence. `--esc-ports` drives and reports up to eight ESCs; each state
+port defaults to the corresponding signal port plus the first ESC's
+state/signal port offset. Motor ordering is fixed in ESC tab order.
+PID/filter fields are retained for Motors
 tab compatibility; there is no flight dynamics or PID loop emulation.
 GPS/barometer/magnetometer, full CLI/configurator coverage, and Betaflight FC
 flashing are unsupported. A bootloader is needed for ESC passthrough, but
@@ -512,4 +546,11 @@ Run the protocol regressions with:
 
 ```sh
 python3 -m unittest discover -s Mcu/SITL -p test_msp_betaflight.py -v
+python3 Mcu/SITL/multi_esc_gui_test.py
+python3 Mcu/SITL/multi_esc_sitl_test.py
 ```
+
+Pass `--bootloader PATH` to the multi-ESC integration test to also exercise
+4-way discovery and independent settings writes. On Linux, `--usb` tests
+the same traffic over a real USB/IP serial device (requires passwordless
+sudo for attach/detach).

@@ -238,7 +238,9 @@ def main():
     if args.usbip:
         endpoint = sitl_usbip.UsbipServer(unix_path=args.usbip_socket,
                                           port=args.usbip_port,
-                                          serial=args.usbip_serial, log=log)
+                                          serial=args.usbip_serial, log=log,
+                                          vid=sitl_usbip.DIRECT_VENDOR_ID,
+                                          pid=sitl_usbip.DIRECT_PRODUCT_ID)
 
     bridge = SerialBridge(sitl_host=args.host, sitl_port=args.sitl_port,
                           state_port=args.state_port,
@@ -261,7 +263,8 @@ def main():
                                                       endpoint.port)),
                   file=sys.stderr, flush=True)
         if sitl_usbip.find_tty(args.usbip_serial,
-                               timeout=10 if args.attach else 60) is None:
+                               timeout=10 if args.attach else 60,
+                               vid=endpoint.vid, pid=endpoint.pid) is None:
             print('no tty appeared, is vhci_hcd loaded?', file=sys.stderr)
     print(bridge.slave_path, flush=True)
     try:

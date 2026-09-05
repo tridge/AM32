@@ -45,7 +45,7 @@ def bundled_sitl():
     return None
 
 
-def bundled_eeprom():
+def bundled_eeprom(esc_index=0):
     '''a default eeprom image to seed the simulated ESC.
 
     The packaged build ships one generated at build time. From a
@@ -53,6 +53,19 @@ def bundled_eeprom():
     file into build/ - the simulator opens its eeprom read/write, and
     handing it a file in the source tree corrupts the tree.
     '''
+    if not 0 <= esc_index < 8:
+        raise ValueError('ESC index must be 0..7')
+    if esc_index:
+        import shutil
+        from pathlib import Path
+        seed = bundled_eeprom()
+        if seed is None:
+            return None
+        seed = Path(seed)
+        out = seed.with_name('%s.esc%u%s' % (seed.stem, esc_index + 1, seed.suffix))
+        if not out.exists():
+            shutil.copyfile(seed, out)
+        return str(out)
     base = _resource_dir()
     packaged = os.path.join(base, 'sitl', 'default_eeprom.bin')
     if os.path.isfile(packaged):

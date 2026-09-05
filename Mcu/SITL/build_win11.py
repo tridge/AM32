@@ -60,8 +60,8 @@ def local_build(args):
     if sys.platform != 'cygwin':
         raise RuntimeError('--local must run under Cygwin Python')
     bootloader = bootloader_source(args.bootloader_source)
-    # The pinned upstream bootloader predates the firmware's Cygwin CAN
-    # fixes. Apply the same fix in a disposable copy, never the user's repo.
+    # The pinned bootloader needs the Cygwin CAN and seeded flash CRC
+    # fixes. Apply them in a disposable copy, never the user's repo.
     prepared = ROOT / 'build' / 'windows-bootloader-src'
     if prepared.exists():
         shutil.rmtree(prepared)
@@ -95,6 +95,8 @@ def local_build(args):
         run(native + ['-m', 'venv', winpath(venv)])
     python = str(venv / 'Scripts/python.exe')
     run([python, '-m', 'pip', 'install', '-r', winpath(HERE / 'windows/requirements-build.txt')])
+    run([python, winpath(HERE / 'bootloader_seed_test.py'),
+         '--bootloader', winpath(bl[0])])
     run([python, winpath(HERE / 'package_windows.py'),
          '--sitl', winpath(fw[0]), '--bootloader', winpath(bl[0]),
          '--runtime', winpath('/bin/cygwin1.dll')])

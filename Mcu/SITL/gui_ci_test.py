@@ -249,6 +249,7 @@ def main():
 
     env = dict(os.environ)
     env['QT_QPA_PLATFORM'] = 'offscreen'
+    env['PYTHONFAULTHANDLER'] = '1'
     control_port = free_control_port()
 
     with Sitl(args.sitl, ['--can-uri', 'none', '--input-type', '1']):
@@ -290,7 +291,17 @@ def main():
         threading.Thread(target=reader, daemon=True).start()
 
         def send(cmd):
-            s.sendall((cmd + '\n').encode())
+            try:
+                s.sendall((cmd + '\n').encode())
+            except OSError:
+                print('GUI connection failed sending %r (exit=%s)' % (cmd, gui.poll()))
+                if gui.stdout:
+                    os.set_blocking(gui.stdout.fileno(), False)
+                    try:
+                        print(os.read(gui.stdout.fileno(), 65536).decode(errors='replace'))
+                    except BlockingIOError:
+                        pass
+                raise
 
         for delay, cmd in [
                 (0.1, 'ds_type dshot600'), (0.1, 'ds_bidir 1'),

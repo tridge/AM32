@@ -98,6 +98,11 @@ PRODUCT_ID = 0x0001
 # Betaflight's default Web Serial filters include the STM32 virtual COM port.
 BETAFLIGHT_VENDOR_ID = 0x0483
 BETAFLIGHT_PRODUCT_ID = 0x5740
+# AM32 Configurator selects its raw linker protocol by vendor ID. Use
+# its WCH-compatible vendor with a test PID, keeping CDC descriptors so
+# the OS uses its standard serial driver instead of a chip-specific one.
+DIRECT_VENDOR_ID = 0x1a86
+DIRECT_PRODUCT_ID = 0x0001
 BUSID = '1-1'
 BUSNUM = 1
 DEVNUM = 1
@@ -286,6 +291,7 @@ class UsbipServer(object):
                               'another port' % (host, port, ex))
             self.port = self.sock.getsockname()[1]
         self.sock.listen(1)
+        self.sock.settimeout(0.2)
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
@@ -347,9 +353,15 @@ class UsbipServer(object):
         with self.send_lock:
             if self.conn is not None:
                 try:
+                    self.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
                     self.conn.close()
                 except OSError:
                     pass
+        if self.thread is not threading.current_thread():
+            self.thread.join(1.0)
 
     # -- USB/IP --------------------------------------------------------
 
@@ -357,10 +369,16 @@ class UsbipServer(object):
         while self.running:
             try:
                 conn, addr = self.sock.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             self.log('connection from %s' % (addr or self.endpoint,))
-            self.conn = conn
+            with self.send_lock:
+                if not self.running:
+                    conn.close()
+                    return
+                self.conn = conn
             try:
                 self._session(conn)
             except (OSError, struct.error) as ex:
@@ -777,7 +795,12 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
         cmd = privilege_prefix() + [
             sys.executable, os.path.abspath(__file__), '--attach-to',
             unix_path if unix_path is not None else '%s:%u' % (host, port)]
-        return subprocess.run(cmd, check=False).returncode == 0
+        result = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            return False
+        if not re.fullmatch(r'\s*\d+\s*', result.stdout):
+            raise RuntimeError('USB/IP attach did not report its owned vhci port')
+        return int(result.stdout.strip())
     sock, devid, speed = import_device(unix_path, host, port, busid)
     try:
         vhci_port = attach_socket(sock, devid, speed)
@@ -858,6 +881,9 @@ def main():
         except OSError as ex:
             print('attach failed: %s' % ex, file=sys.stderr)
             return 1
+        if vhci_port is False:
+            return 1
+        print(vhci_port)
         print('attached on vhci port %u' % vhci_port, file=sys.stderr)
         return 0
 

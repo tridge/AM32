@@ -22,7 +22,10 @@ def pstring(value):
 
 
 class Configuration:
-    def __init__(self, poles=14, path=None):
+    def __init__(self, poles=14, path=None, motor_count=1):
+        if not 1 <= motor_count <= 8:
+            raise ValueError('motor count must be 1..8')
+        self.motor_count = motor_count
         self.path = Path(path) if path else None
         # Fields irrelevant to an ESC bench are retained so the Motors tab
         # can round-trip them when saving a motor protocol change.
@@ -35,7 +38,10 @@ class Configuration:
             'minthrottle': 1070, 'maxthrottle': 2000, 'mincommand': 1000,
             'registers': {
                 36: pack('I', 0),             # features (no receiver/3D)
-                42: bytes([23, 0]),            # CUSTOM, one output, normal direction
+                # With eight populated MSP_MOTOR slots there is no zero
+                # sentinel. Betaflight then takes its slider count from the
+                # mixer (CUSTOM has zero); use OCTOFLATX for a full bench.
+                42: bytes([13 if motor_count == 8 else 23, 0]),
                 61: bytes([5, 0, 25]),         # arming config, stays disarmed
                 90: advanced,
                 92: bytes(49),                # filters (not used by ESC)
@@ -55,6 +61,10 @@ class Configuration:
             self.values.update(stored)
             self.values['registers'].update(regs)
             self.validate()
+        # The GUI's ESC count defines the outputs, including when reusing
+        # saved FC settings from a bench with a different number of ESCs.
+        mixer = self.values['registers'][42]
+        self.values['registers'][42] = self.defaults['registers'][42][:1] + mixer[1:]
         self.saved = copy.deepcopy(self.values)
 
     def validate(self):
@@ -109,6 +119,8 @@ class Configuration:
             raise ValueError('invalid configuration payload length')
         if get_cmd == 36 and struct.unpack('<I', payload)[0] & ((1 << 12) | (1 << 27)):
             raise ValueError('3D and UART ESC_SENSOR are not emulated')
+        if get_cmd == 42 and payload[0] != self.defaults['registers'][42][0]:
+            raise ValueError('set the ESC count in the simulator GUI')
         self.values['registers'][get_cmd] = payload + (old[-1:] if get_cmd == 90 else b'')
         try:
             self.validate()
@@ -169,10 +181,10 @@ class Configuration:
             130: pack('BHBHHBH', max(1, round(voltage / 4.2)), 1500,
                       min(255, round(voltage * 10)), 0, ca, 0, cv),
             131: pack('HHHBBBB', v['minthrottle'], v['maxthrottle'], v['mincommand'],
-                      1, v['poles'], v['bidir'], 0),
+                      self.motor_count, v['poles'], v['bidir'], 0),
             160: pack('III', 0x414d3332, 0x5349544c, 1),
             240: bytes(4), 254: bytes(8),
-            0x3001: bytes([1, 0]),  # one simulated motor/output
+            0x3001: bytes([self.motor_count]) + bytes(range(self.motor_count)),
             0x300a: bytes([1, 1, 0, 0, 0]),
             0x300c: bytes([255]) + pstring('SITL'),
         }
