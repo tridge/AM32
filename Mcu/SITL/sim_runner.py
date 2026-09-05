@@ -253,9 +253,16 @@ class SimRunner(object):
         self._log('launching: %s' % ' '.join(
             os.path.basename(c) if i == 0 else c
             for i, c in enumerate(cmd)))
+        startupinfo = None
+        if sys.platform.startswith('win'):
+            # As in ESCSim, hide the window while retaining console
+            # semantics for the simulator and its bootloader re-execs.
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
+            text=True, bufsize=1, startupinfo=startupinfo)
         self._requested_stop = None
         if sys.platform.startswith('win'):
             try:
