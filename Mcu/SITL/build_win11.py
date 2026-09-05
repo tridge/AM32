@@ -21,7 +21,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 BOOTLOADER_URL = 'https://github.com/am32-firmware/AM32-bootloader.git'
-BOOTLOADER_REF = 'a340e23f4fe270bf7a767156d3c24b10f22b521a'
+BOOTLOADER_REF = '933805415542eda3651800fba2c0a82f4574eb30'
 
 
 def run(cmd, **kwargs):
@@ -60,31 +60,11 @@ def local_build(args):
     if sys.platform != 'cygwin':
         raise RuntimeError('--local must run under Cygwin Python')
     bootloader = bootloader_source(args.bootloader_source)
-    # The pinned bootloader needs the Cygwin CAN and seeded flash CRC
-    # fixes. Apply them in a disposable copy, never the user's repo.
-    prepared = ROOT / 'build' / 'windows-bootloader-src'
-    if prepared.exists():
-        shutil.rmtree(prepared)
-    shutil.copytree(bootloader, prepared,
-                    ignore=shutil.ignore_patterns('.git', 'obj', 'build', '__pycache__'))
-    patch = HERE / 'windows/bootloader-cygwin.patch'
-    # In CI this directory is inside the firmware Git checkout. Keep git
-    # apply from treating bootloader paths as paths in that parent repo.
-    patch_env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(prepared.parent))
-    already_applied = subprocess.run(['git', 'apply', '--check', '--reverse', str(patch)],
-                                     cwd=prepared, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, env=patch_env).returncode == 0
-    if not already_applied:
-        run(['git', 'apply', patch], cwd=prepared, env=patch_env)
-    bootloader = prepared
     # Separate object directory: never accidentally package Linux/MinGW objects
     # left by another build of this checkout.
     run(['make', '-j', args.jobs, 'AM32_SITL_CAN', 'OBJ=build/windows-obj'], cwd=ROOT)
     run(['make', '-j', args.jobs, 'OS=Linux', 'SHELL=/bin/bash',
-         'AM32_SITL_BOOTLOADER_PB4_CAN', 'OBJ=build/windows-obj',
-         # The bootloader's 32-bit wire addresses include &devinfo. Cygwin
-         # otherwise loads PE executables above 4 GB and truncates it.
-         'LDFLAGS_COMMON_SITL=-Wl,--image-base,0x400000,--disable-dynamicbase'], cwd=bootloader)
+         'AM32_SITL_BOOTLOADER_PB4_CAN', 'OBJ=build/windows-obj'], cwd=bootloader)
     fw = sorted((ROOT / 'build/windows-obj').glob('AM32_AM32_SITL_CAN_*.elf'))
     bl = sorted((bootloader / 'build/windows-obj').glob('AM32_SITL_BOOTLOADER_PB4_CAN_*.elf'))
     if len(fw) != 1 or len(bl) != 1:

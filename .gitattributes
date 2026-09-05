@@ -1,5 +1,3 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 *.bat text eol=crlf
-# Blank context lines in unified patches require a single space.
-*.patch text eol=lf whitespace=-blank-at-eol

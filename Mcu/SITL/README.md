@@ -459,11 +459,10 @@ with the GUI's Browse controls; ARM hardware ELF files cannot execute on the
 host. The packaged defaults include both host executables and their Cygwin
 runtime, so end users do not need development tools.
 
-The pinned bootloader needs `windows/bootloader-cygwin.patch` for Windows
-multicast and to calculate the seeded flash checksum after setting its firmware
-name. The build applies it in a disposable copy and links the bootloader
-below 4 GB without address randomization, because its device-info protocol
-uses 32-bit addresses. The original bootloader checkout is not modified.
+The pinned upstream bootloader includes Windows multicast support, seeded
+flash checksum recovery and the Cygwin linker settings for its 32-bit
+device-info addresses. Both executables use a separate `build/windows-obj`
+directory to keep Windows objects separate from other host builds.
 
 CI runs the same script with `--local` under Cygwin, then uploads the common
 `dist/windows-package` contents as `am32-sitl-gui-windows`. The local ZIP and

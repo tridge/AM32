@@ -5,8 +5,7 @@ AM32 firmware and SITL GUI: GNU GPL version 3 (LICENSE.txt).
 https://github.com/am32-firmware/AM32
 
 AM32 bootloader: GNU GPL version 3. The Windows build uses upstream commit
- a340e23f4fe270bf7a767156d3c24b10f22b521a
-plus Mcu/SITL/windows/bootloader-cygwin.patch in the AM32 source tree.
+ 933805415542eda3651800fba2c0a82f4574eb30
 https://github.com/am32-firmware/AM32-bootloader
 
 Cygwin runtime: GNU LGPL version 3 or later (LGPL-3.0.txt), with the Cygwin
