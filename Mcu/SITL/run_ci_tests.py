@@ -23,6 +23,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sitl_dshot as sd
+import sitl_fourway
 import sitl_params
 import sitl_tones
 from sitl_fourway_server import crc16_xmodem
@@ -844,6 +845,130 @@ def test_fc_fourway(sitl_path, bootloader):
             stub.close()
 
 
+class DirectClient(object):
+    """the configurator side of direct mode: raw bootloader commands on
+    a serial port, each answered by the linker's echo of the command
+    followed by the ESC's reply. Written from the protocol rather than
+    shared with sitl_fourway, so the two implementations have to agree"""
+
+    def __init__(self, path):
+        import tty
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.fd)
+
+    def close(self):
+        os.close(self.fd)
+
+    def _read(self, n, timeout=3.0):
+        out = b''
+        deadline = time.time() + timeout
+        while len(out) < n and time.time() < deadline:
+            ready, _, _ = select.select([self.fd], [], [], 0.1)
+            if ready:
+                out += os.read(self.fd, n - len(out))
+        return out
+
+    def _txn(self, frame, reply_len, timeout=3.0):
+        os.write(self.fd, frame)
+        got = self._read(len(frame) + reply_len, timeout=timeout)
+        if got[:len(frame)] != frame:
+            raise IOError('no echo: %s' % got.hex(' '))
+        return got[len(frame):]
+
+    def connect(self):
+        """the 21 byte init the configurator sends, answered by the 9
+        byte deviceInfo"""
+        init = bytes(12) + bytes([0x0D]) + b'BLHeli' + bytes([0xF4, 0x7D])
+        # the ESC may need resetting into the bootloader first, which the
+        # bridge does for us; allow for that whole window
+        return self._txn(init, 9, timeout=8.0)
+
+    def cmd(self, buf, reply_len):
+        frame = bytes(buf) + struct.pack('<H', sitl_fourway.crc16(bytes(buf)))
+        return self._txn(frame, reply_len)
+
+    def set_address(self, address):
+        return self.cmd([0xFF, 0x00, (address >> 8) & 0xFF, address & 0xFF], 1)
+
+    def read_flash(self, size):
+        """size data bytes, then the CRC16 and the ack"""
+        return self.cmd([0x03, size & 0xFF], size + 3)
+
+
+def test_direct_serial(sitl_path, bootloader):
+    """direct mode: the 1-wire USB linker emulation, which is how a
+    configurator reaches an ESC with no flight controller in between"""
+    if bootloader is None:
+        print('SKIP: direct serial, no --bootloader given')
+        sys.stdout.flush()
+        return
+    try:
+        import pty  # noqa: F401  (POSIX only)
+    except ImportError as ex:
+        print('SKIP: direct serial, %s' % ex)
+        sys.stdout.flush()
+        return
+    import sitl_serial_bridge
+    with Sitl(sitl_path, ['--can-uri', 'none', '--bootloader', bootloader],
+              nosleep=False):
+        bridge = sitl_serial_bridge.SerialBridge(sitl_port=INPUT_PORT,
+                                                 state_port=STATE_PORT)
+        client = None
+        try:
+            client = DirectClient(bridge.slave_path)
+            info = client.connect()
+            check('direct devinfo', info[0:3] == b'471' and info[8] == 0x30,
+                  'info=%s' % info.hex(' '))
+            if info[0:3] != b'471':
+                return
+
+            # the v3 devinfo block through the magic address, as the
+            # configurator reads it to find the eeprom
+            check('direct set devinfo address',
+                  client.set_address(0x0023) == b'\x30', '')
+            block = client.read_flash(27)
+            m1, m2 = struct.unpack('<II', block[0:8])
+            check('direct devinfo block',
+                  (m1, m2) == (0x5925E3DA, 0x4EB863D9) and block[29] == 0x30,
+                  'magic=0x%08x,0x%08x' % (m1, m2))
+            if (m1, m2) != (0x5925E3DA, 0x4EB863D9):
+                return
+            eeprom_start = struct.unpack('<H', block[23:25])[0]
+
+            check('direct set eeprom address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            settings = client.read_flash(48)
+            check('direct eeprom read', settings[50] == 0x30,
+                  'ack=0x%02x' % settings[50])
+
+            # write it back with one byte changed: set address, set
+            # buffer size, send the buffer, program it
+            written = bytearray(settings[:48])
+            written[0] = 0x01
+            written[26] = (written[26] + 1) & 0xFF
+            check('direct set write address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            # cmd_SetBufferSize is the one command with no reply at all
+            client.cmd([0xFE, 0x00, 0x00, len(written)], 0)
+            check('direct send buffer',
+                  client.cmd(written, 1) == b'\x30', '')
+            check('direct write flash',
+                  client.cmd([0x01, 0x00], 1) == b'\x30', '')
+
+            check('direct set readback address',
+                  client.set_address(eeprom_start) == b'\x30', '')
+            back = client.read_flash(48)[:48]
+            # byte 2 is BOOT_LOADER_REVISION, which the bootloader stamps
+            # with its own version as it programs the page
+            check('direct eeprom readback',
+                  back[:2] + back[3:] == bytes(written[:2] + written[3:]),
+                  'back=%s' % back.hex())
+        finally:
+            if client is not None:
+                client.close()
+            bridge.close()
+
+
 def test_fc_reconnect():
     """a configurator may open several passthrough sessions against one
     FC - a browser does it every time you reconnect - and each has to
@@ -1034,6 +1159,7 @@ def main():
     test_dataset_params()
     test_fc_capture(args.sitl)
     test_fc_fourway(args.sitl, args.bootloader)
+    test_direct_serial(args.sitl, args.bootloader)
     test_fc_reconnect()
     test_usbip_device(unix=False)
     test_usbip_device(unix=True)

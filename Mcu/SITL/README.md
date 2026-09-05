@@ -132,12 +132,15 @@ serial output. `sitl_fourway.py` implements the one-wire client side.
 
 ### Configurators against the SITL
 
-A configurator does not talk to an ESC directly: it talks MSP to a
-flight controller, asks it for BLHeli 4-way passthrough, and the FC
-translates each 4-way command into the ESC's one-wire bootloader
-protocol. `msp_stub_fc.py` is that flight controller, so an unmodified
-configurator can read and write the settings and flash of a simulated
-ESC.
+There are two ways a configurator reaches an ESC, and the SITL emulates
+both. Through a flight controller it talks MSP, asks for BLHeli 4-way
+passthrough, and the FC translates each 4-way command into the ESC's
+one-wire bootloader protocol; `msp_stub_fc.py` is that flight
+controller. Direct - what the am32-configurator calls direct mode and
+the Offline-Configurator drives at 19200 baud - it talks the bootloader
+protocol itself, through a 1-wire USB linker soldered onto the signal
+wire; `sitl_serial_bridge.py` is that linker. Either way an unmodified
+configurator reads and writes the settings and flash of a simulated ESC.
 
 The GUI does all of this for you: give the **SITL process** panel a
 bootloader as well as a binary, start it, and tick **USB configurator
@@ -166,6 +169,32 @@ session), and an ESC that is running the application instead of the
 bootloader is reset into it over the state port, the way a real FC
 power cycles one.
 
+#### Direct mode: the 1-wire linker
+
+`sitl_serial_bridge.py` takes the FC out of the picture and pipes the
+serial port straight to the signal wire:
+
+```
+python3 Mcu/SITL/sitl_serial_bridge.py --verbose
+```
+
+It prints a pty the same way, takes the same `--usbip` options, and
+resets a running ESC into the bootloader on the first command just as
+the 4-way path does. Two details make it behave like the hardware
+rather than like a socket:
+
+- a real linker shorts TX to RX, so the host reads back everything it
+  sent before the ESC answers. Both configurators use that echo to find
+  the start of a response and the web one requires it, so the bridge
+  reproduces it. `--no-echo` turns it off for a client that cannot cope.
+- the echo comes back at 19200 baud, not instantly. The bootloader
+  separates a command from the buffer upload that follows it by the
+  line idle in between, and a configurator only sends that buffer once
+  it has read the echo of the command - so echoing early would let the
+  two run together into one frame the bootloader cannot parse. Bytes
+  the host hands over while the wire is still busy continue the current
+  frame; bytes that arrive after it has drained start a new one.
+
 #### A virtual USB serial device
 
 A pty is enough for tools that open a port by path, but not for a
@@ -184,7 +213,8 @@ The device then appears in `dmesg`, as `/dev/ttyACM*` and as
 `/dev/serial/by-id/usb-AM32_AM32_SITL_serial_SITL-if00`, and is
 indistinguishable from hardware to anything above the driver - Chrome
 included. It enumerates as pid.codes `1209:0001`, which the AM32
-configurator accepts as a flight controller.
+configurator accepts as a flight controller. `sitl_serial_bridge.py`
+takes the same options and serves the same device.
 
 vhci_hcd is handed the socket to speak USB/IP over rather than opening
 it itself, and does not care what kind it is, so the export defaults to
@@ -267,6 +297,9 @@ python3 Mcu/SITL/make_gui_env.py
   executable with the SITL bundled (so it runs the simulator out of the
   box); CI builds one for Linux and Windows. The UI backends
   live in `sitl_gui_backend.py`, UI-independent for headless tests
+- `sitl_serial_bridge.py` — 1-wire USB linker emulation: a serial port
+  (a pty, or a virtual USB serial device) piped straight to the signal
+  wire, which is the configurators' direct mode.
 - `msp_stub_fc.py` — fake Betaflight FC: MSP on a pty (or on a virtual
   USB serial device, `sitl_usbip.py`), DShot to the SITL, and BLHeli
   4-way passthrough to the simulated ESC bootloader

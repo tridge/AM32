@@ -233,6 +233,12 @@ class InputPort(object):
             self.serial_rx = b''
         return out
 
+    def drain_serial(self):
+        '''whatever serial reply bytes have arrived, without waiting'''
+        with self.lock:
+            out, self.serial_rx = self.serial_rx, b''
+            return out
+
     def flush_serial(self):
         with self.lock:
             self.serial_rx = b''
