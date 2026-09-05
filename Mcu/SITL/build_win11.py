@@ -21,7 +21,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 BOOTLOADER_URL = 'https://github.com/am32-firmware/AM32-bootloader.git'
-BOOTLOADER_REF = '933805415542eda3651800fba2c0a82f4574eb30'
+BOOTLOADER_BRANCH = 'master'
 
 
 def run(cmd, **kwargs):
@@ -39,16 +39,16 @@ def bootloader_source(explicit):
         if not (path / 'sitlmakefile.mk').is_file():
             raise RuntimeError('not a bootloader SITL checkout: %s' % path)
         return path
-    # Always use the pinned revision unless a developer explicitly overrides it.
+    # Refresh master on every build so upstream regressions reach CI.
     path = ROOT / 'build' / 'windows-bootloader'
     if not path.exists():
         run(['git', 'clone', BOOTLOADER_URL, path])
-    current = output(['git', '-C', path, 'rev-parse', 'HEAD'])
-    if current != BOOTLOADER_REF:
-        if output(['git', '-C', path, 'status', '--porcelain']):
-            raise RuntimeError('bootloader cache has local edits; use --bootloader-source')
-        run(['git', '-C', path, 'fetch', 'origin', BOOTLOADER_REF])
-        run(['git', '-C', path, 'checkout', '--detach', BOOTLOADER_REF])
+    if output(['git', '-C', path, 'status', '--porcelain']):
+        raise RuntimeError('bootloader cache has local edits; use --bootloader-source')
+    run(['git', '-C', path, 'fetch', 'origin', BOOTLOADER_BRANCH])
+    run(['git', '-C', path, 'checkout', '--detach', 'FETCH_HEAD'])
+    print('Bootloader %s: %s' % (BOOTLOADER_BRANCH,
+          output(['git', '-C', path, 'rev-parse', 'HEAD'])), flush=True)
     return path
 
 
@@ -63,6 +63,11 @@ def local_build(args):
     # Separate object directory: never accidentally package Linux/MinGW objects
     # left by another build of this checkout.
     run(['make', '-j', args.jobs, 'AM32_SITL_CAN', 'OBJ=build/windows-obj'], cwd=ROOT)
+    # Master can change linker flags or the versioned ELF name. Rebuild
+    # the bootloader cleanly instead of reusing stale objects or executables.
+    bootloader_obj = bootloader / 'build/windows-obj'
+    if bootloader_obj.exists():
+        shutil.rmtree(bootloader_obj)
     run(['make', '-j', args.jobs, 'OS=Linux', 'SHELL=/bin/bash',
          'AM32_SITL_BOOTLOADER_PB4_CAN', 'OBJ=build/windows-obj'], cwd=bootloader)
     fw = sorted((ROOT / 'build/windows-obj').glob('AM32_AM32_SITL_CAN_*.elf'))
@@ -136,7 +141,7 @@ def main():
     ap.add_argument('--remote-dir', default='am32-sitl-gui-build')
     ap.add_argument('--ssh-config', help='optional ssh -F config path')
     ap.add_argument('--python', help='native Windows Python executable (default py -3.12)')
-    ap.add_argument('--bootloader-source', help='use a local bootloader checkout including edits, instead of the pinned release')
+    ap.add_argument('--bootloader-source', help='use a local bootloader checkout including edits, instead of fetching upstream master')
     ap.add_argument('--jobs', default=str(min(os.cpu_count() or 2, 8)))
     ap.add_argument('--test-usb', action='store_true',
                     help='also test settings read/write over the installed USBip driver')

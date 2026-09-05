@@ -452,17 +452,19 @@ virtual COM port when the bundled USBip driver is installed on the build host.
 Use `--host`, `--remote-dir`, `--python` or
 `--ssh-config` to override the defaults.
 
-The bootloader defaults to the upstream commit pinned in `build_win11.py`.
+The build fetches the latest upstream bootloader `master` on every run and
+logs the selected commit, so upstream regressions are caught by CI.
 Use `--bootloader-source ../AM32-bootloader` to test a different checkout,
 including its local edits. Select another Windows host firmware or bootloader
 with the GUI's Browse controls; ARM hardware ELF files cannot execute on the
 host. The packaged defaults include both host executables and their Cygwin
 runtime, so end users do not need development tools.
 
-The pinned upstream bootloader includes Windows multicast support, seeded
+The upstream bootloader includes Windows multicast support, seeded
 flash checksum recovery and the Cygwin linker settings for its 32-bit
 device-info addresses. Both executables use a separate `build/windows-obj`
-directory to keep Windows objects separate from other host builds.
+directory to keep Windows objects separate from other host builds. The
+bootloader's Windows objects are rebuilt from scratch on every run.
 
 CI runs the same script with `--local` under Cygwin, then uploads the common
 `dist/windows-package` contents as `am32-sitl-gui-windows`. The local ZIP and
