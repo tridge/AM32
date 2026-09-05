@@ -427,3 +427,89 @@ current, and battery voltage sag from internal resistance. The
 comparator compares the floating phase against the virtual neutral with
 configurable noise and hysteresis, so the firmware's blanking and
 filtering logic is genuinely exercised at PWM switching level.
+
+### Building the Windows ZIP locally
+
+From this checkout on Linux, run:
+
+```
+python3 Mcu/SITL/build_win11.py
+```
+
+This copies the current working sources (including uncommitted edits) to
+`win11:am32-sitl-gui-build`, builds there through its Cygwin SSH shell, and
+retrieves `dist/am32-sitl-gui-windows.zip`. It does not commit or push.
+The remote machine needs Cygwin `gcc-core`, `make`, `python3`, `git`, `rsync`
+and native Windows Python 3.12 (`py -3.12`). The Python build environment is
+created automatically from `windows/requirements-build.txt`. The packaged
+GUI is tested before retrieving the ZIP; add `--test-usb` to also test a real
+virtual COM port when the bundled USBip driver is installed on the build host.
+Use `--host`, `--remote-dir`, `--python` or
+`--ssh-config` to override the defaults.
+
+The bootloader defaults to the upstream commit pinned in `build_win11.py`.
+Use `--bootloader-source ../AM32-bootloader` to test a different checkout,
+including its local edits. Select another Windows host firmware or bootloader
+with the GUI's Browse controls; ARM hardware ELF files cannot execute on the
+host. The packaged defaults include both host executables and their Cygwin
+runtime, so end users do not need development tools.
+
+The pinned bootloader needs `windows/bootloader-cygwin.patch` for Windows
+multicast and to calculate the seeded flash checksum after setting its firmware
+name. The build applies it in a disposable copy and links the bootloader
+below 4 GB without address randomization, because its device-info protocol
+uses 32-bit addresses. The original bootloader checkout is not modified.
+
+CI runs the same script with `--local` under Cygwin, then uploads the common
+`dist/windows-package` contents as `am32-sitl-gui-windows`. The local ZIP and
+the CI download have the same layout and packaging inputs; their executable
+bytes and ZIP timestamps can differ with source, compiler and dependency
+versions. `package_windows.py` downloads the checksum-pinned USB/IP installer
+from the ArduPilot mirror and includes it with a CRLF `README.txt`. Install
+that prerequisite and reboot to enable the GUI's Windows COM port support.
+
+### Betaflight App
+
+Betaflight USB mode uses the emulated STM32 VCP ID `0483:5740`, which
+Betaflight's default serial-port chooser accepts. The USB product remains
+`AM32 SITL serial`. After updating the Python sources, restart the GUI and
+select this mode again to re-enumerate the device with the new ID.
+
+Select **USB Betaflight (motor control)** in the GUI, start the simulator
+with **Input: DShot**, and connect [Betaflight App](https://app.betaflight.com)
+to the displayed serial port. The Setup tab reports a stationary, level
+accelerometer and gyro. In Motors, enable motor testing and use motor 1 or
+the master slider. Leave throttle at zero for two seconds after startup.
+RPM, temperature, voltage and current are decoded from the simulated ESC's
+actual bidirectional DShot/EDT replies.
+
+The simulated FC supports MSP API 1.46, MSPv1, native MSPv2 and MSPv2-over-v1.
+Motors can select DSHOT150/300/600, bidirectional DShot and motor pole count,
+then Save and Reboot. Enable Auto-Connect in the app, or reconnect after
+reboot. Changing the DShot rate or polarity also restarts the simulated ESC
+to detect the new signal. The CLI supports `get`, `set`, `save`, `exit`, `version`
+and `status`, with `motor_pwm_protocol`, `dshot_bidir`, `dshot_edt`
+(OFF/ON/FORCE) and `motor_poles`. Betaflight also sends an EDT-enable command
+when motor testing starts, regardless of the saved `dshot_edt` setting.
+DShot direction commands reach AM32 through the simulated signal wire.
+
+GUI DShot and CAN controls are disabled while Betaflight owns motor control.
+The output stops after two seconds without MSP requests; CLI entry, reboot
+and 4-way passthrough also stop motor testing. Disconnect the app before
+switching USB modes. The existing USB 4-way mode remains available for ESC
+configuration and flashing without a motor command stream.
+
+FC settings persist in `<selected EEPROM>.fc.json`, separately from the
+AM32 EEPROM. Standalone `msp_stub_fc.py --config FILE` provides the same
+persistence. Only one motor is driven/reported, even if `--esc-ports` exposes
+additional ESCs for 4-way access. PID/filter fields are retained for Motors
+tab compatibility; there is no flight dynamics or PID loop emulation.
+GPS/barometer/magnetometer, full CLI/configurator coverage, and Betaflight FC
+flashing are unsupported. A bootloader is needed for ESC passthrough, but
+not for Betaflight motor testing.
+
+Run the protocol regressions with:
+
+```sh
+python3 -m unittest discover -s Mcu/SITL -p test_msp_betaflight.py -v
+```

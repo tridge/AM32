@@ -30,6 +30,8 @@ HIDDEN = [
     'pyqtgraph', 'numpy', 'serial', 'serial.tools.list_ports',
     'sitl_dshot', 'sitl_tones', 'sitl_params', 'sitl_gui_backend',
     'sitl_param_dialog', 'sitl_wave_dialog', 'sim_runner', 'model_builder',
+    'sitl_usbip', 'msp_stub_fc', 'sitl_fourway', 'sitl_fourway_server',
+    'sitl_serial_bridge',
 ]
 
 EXCLUDES = [
@@ -58,7 +60,13 @@ def main():
     ap.add_argument('--onedir', action='store_true')
     ap.add_argument('--name', default='am32-sitl-gui')
     ap.add_argument('--sitl', help='SITL binary to bundle (else auto-detect)')
+    ap.add_argument('--bootloader', help='host SITL bootloader executable to bundle')
+    ap.add_argument('--runtime', action='append', default=[],
+                    help='runtime DLL to bundle beside the simulator (repeatable)')
     args = ap.parse_args()
+    for path in [args.sitl, args.bootloader] + args.runtime:
+        if path and not os.path.isfile(path):
+            ap.error('bundle input does not exist: %s' % path)
 
     try:
         import PyInstaller  # noqa: F401
@@ -83,8 +91,8 @@ def main():
         cmd += ['--add-data', '%s%s%s' % (models, sep, 'models')]
 
     # the SITL binary and a default eeprom, under sitl/, where
-    # sim_runner.bundled_* find them. The Windows SITL is a native
-    # MinGW-w64 exe, so no runtime DLL needs bundling
+    # sim_runner.bundled_* find them. --runtime supplies any DLL needed
+    # by the selected host build (the Windows package uses Cygwin).
     sitl_bin = _find_sitl(args.sitl)
     if sitl_bin:
         stage = os.path.join(ROOT, 'build', 'sitl_gui_stage')
@@ -103,6 +111,13 @@ def main():
                 params, os.path.join(stage, 'default_eeprom.bin'))
             cmd += ['--add-data', '%s%s%s' % (ee, sep, 'sitl')]
         print('bundling simulator: %s' % sitl_bin)
+        if args.bootloader:
+            name = 'AM32_SITL_BOOTLOADER' + ('.exe' if sys.platform.startswith('win') else '')
+            staged = os.path.join(stage, name)
+            shutil.copyfile(args.bootloader, staged)
+            cmd += ['--add-binary', '%s%s%s' % (staged, sep, 'sitl')]
+        for runtime in args.runtime:
+            cmd += ['--add-binary', '%s%s%s' % (runtime, sep, 'sitl')]
     else:
         print('no SITL binary found - the SITL panel will need one chosen '
               'with Browse (pass --sitl to bundle it)')

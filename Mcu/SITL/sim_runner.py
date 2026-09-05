@@ -56,7 +56,16 @@ def bundled_eeprom():
     base = _resource_dir()
     packaged = os.path.join(base, 'sitl', 'default_eeprom.bin')
     if os.path.isfile(packaged):
-        return packaged
+        # PyInstaller's onefile directory is temporary. Keep user settings
+        # (and the bootloader flash/backup files alongside them) across runs.
+        import shutil
+        data = os.environ.get('LOCALAPPDATA') if sys.platform.startswith('win') else None
+        data = data or os.path.join(os.path.expanduser('~'), '.local', 'share')
+        out = os.path.join(data, 'AM32-SITL', 'eeprom.bin')
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        if not os.path.exists(out):
+            shutil.copyfile(packaged, out)
+        return out
     here = os.path.dirname(os.path.abspath(__file__))
     params = os.path.join(here, 'data', 'VIMDRONES_NANO_2216', 'sitl.param')
     if not os.path.isfile(params):
@@ -68,6 +77,12 @@ def bundled_eeprom():
         os.makedirs(os.path.dirname(out), exist_ok=True)
         sitl_params.write_eeprom(params, out)
     return out
+
+
+def bundled_bootloader():
+    '''the host bootloader executable shipped with the GUI'''
+    path = os.path.join(_resource_dir(), 'sitl', _exe('AM32_SITL_BOOTLOADER'))
+    return path if os.path.isfile(path) else None
 
 
 # On Windows the SITL emulates an MCU reset by re-exec (execv has no true
@@ -192,6 +207,8 @@ class SimRunner(object):
                                'one with Browse')
         if not eeprom or not os.path.isfile(eeprom):
             raise RuntimeError('no eeprom file for the simulator')
+        if bootloader and not os.path.isfile(bootloader):
+            raise RuntimeError('bootloader file does not exist: %s' % bootloader)
         cmd = [binary,
                '--input-port', str(input_port),
                '--state-port', str(state_port),
@@ -199,7 +216,7 @@ class SimRunner(object):
                '--eeprom', eeprom]
         if model and os.path.isfile(model):
             cmd += ['--config', model]
-        if bootloader and os.path.isfile(bootloader):
+        if bootloader:
             cmd += ['--bootloader', bootloader]
         # force the firmware's input mode (0 auto, 1 dshot, 5 dronecan) so
         # the pane the user drives actually reaches the ESC - a

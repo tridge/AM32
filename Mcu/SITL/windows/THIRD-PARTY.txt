@@ -1,0 +1,24 @@
+AM32 SITL bundled components
+============================
+
+AM32 firmware and SITL GUI: GNU GPL version 3 (LICENSE.txt).
+https://github.com/am32-firmware/AM32
+
+AM32 bootloader: GNU GPL version 3. The Windows build uses upstream commit
+ a340e23f4fe270bf7a767156d3c24b10f22b521a
+plus Mcu/SITL/windows/bootloader-cygwin.patch in the AM32 source tree.
+https://github.com/am32-firmware/AM32-bootloader
+
+Cygwin runtime: GNU LGPL version 3 or later (LGPL-3.0.txt), with the Cygwin
+linking exception. Copyright belongs to the Cygwin authors and contributors.
+Licensing and exception: https://cygwin.com/licensing.html
+Source and build instructions: https://cygwin.com/git.html
+Source releases: https://mirrors.kernel.org/sourceware/cygwin/x86_64/release/cygwin/
+
+PySide6 / Qt: LGPL version 3; https://www.qt.io/licensing/
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+https://code.qt.io/cgit/qt/
+The exact Python dependencies are pinned in
+Mcu/SITL/windows/requirements-build.txt in the AM32 source tree.
+
+USBip: BSD-2-Clause. See USBIP/README.txt and USBIP/usbip-win2-LICENSE.txt.

@@ -21,14 +21,16 @@ that only accept USB serial ports, the browser included.
 '''
 
 import argparse
+import collections
 import os
-import pty
 import select
 import struct
 import sys
 import threading
 import time
 
+import msp_betaflight
+import msp_framing
 import sitl_dshot as sd
 import sitl_fourway_server
 import sitl_usbip
@@ -49,6 +51,7 @@ class PtyEndpoint(object):
     '''the serial link as a pty, opened by the client by path'''
 
     def __init__(self):
+        import pty       # POSIX-only; USB endpoints also work on Windows
         self.master, self.slave = pty.openpty()
         # raw mode now: the default line discipline would echo the
         # client's bytes back at us until pyserial reconfigures it
@@ -91,7 +94,23 @@ class MspStubFC(object):
     def __init__(self, sitl_host='127.0.0.1', sitl_port=57733,
                  poles=14, rate=500.0, esc_ports=None, state_port=57734,
                  esc_reset=True, motor=True, verbose=False, endpoint=None,
-                 trace=False):
+                 trace=False, config_path=None, on_reboot=None):
+        self.on_reboot = on_reboot
+        self.config = msp_betaflight.Configuration(poles, config_path)
+        self.output_protocol = self.config.protocol
+        self.output_bidir = self.config.values['bidir']
+        self.output_lock = threading.RLock()
+        self.reply_version = 1
+        self.cli = False
+        self.cli_line = bytearray()
+        self.parser = msp_framing.Parser()
+        self.commands = collections.deque()
+        self.motor_enabled = motor
+        self.last_request = time.monotonic()
+        self.ready_at = time.monotonic() + 2.0
+        self.edt_override = None
+        self.edt_commanded = None
+        self.last_reply = 0.0
         self.poles = poles
         self.rate = rate
         self.verbose = verbose
@@ -148,6 +167,8 @@ class MspStubFC(object):
               file=sys.stderr, flush=True)
 
     def close(self):
+        with self.output_lock:
+            self._stop_motor()
         self.running = False
         # Do not close a pty descriptor under a blocking read in another
         # thread: close() itself can wait for that read forever on macOS.
@@ -170,31 +191,49 @@ class MspStubFC(object):
         return 48 + int((min(v, 2000) - 1000) * (2047 - 48) / 1000)
 
     def _dshot_loop(self):
-        nxt = time.time()
+        nxt = time.monotonic()
         while self.running:
-            now = time.time()
-            burst = 0
-            while now >= nxt and burst < 10:
-                nxt += 1.0 / self.rate
-                value = self._dshot_value()
-                # maintain EDT while stopped, like a real FC with
-                # dshot_edt on (the firmware ignores commands once
-                # spinning)
-                if (value == 0 and not self.edt_seen
-                        and now - self.last_edt_cmd > 0.5):
-                    self.last_edt_cmd = now
-                    for _ in range(20):
-                        self.port.send_dshot(sd.DSHOT_CMD_EDT_ENABLE,
-                                             ptype=sd.TYPE_DSHOT600,
-                                             telem=True, bidir=True)
-                        burst += 1
-                    continue
-                self.port.send_dshot(value, ptype=sd.TYPE_DSHOT600,
-                                     bidir=True)
-                burst += 1
-            if now - nxt > 0.25:
-                nxt = now
-            self._drain_replies()
+            now = time.monotonic()
+            with self.output_lock:
+                if self.in_fourway or self.cli or self.output_protocol == 9:
+                    nxt = now
+                elif now >= nxt:
+                    # One writer owns the signal wire, including DShot commands.
+                    # Stop after loss of MSP polling (e.g. browser disconnected).
+                    if now - self.last_request > 2.0:
+                        self.motor_value = 1000
+                    cfg = self.config.values
+                    self.poles = cfg['poles']
+                    bidir = self.output_bidir
+                    ptype = {5: sd.TYPE_DSHOT150, 6: sd.TYPE_DSHOT300,
+                             7: sd.TYPE_DSHOT600}[self.output_protocol]
+                    value = self._dshot_value() if now >= self.ready_at else 0
+                    edt = self.edt_override if self.edt_override is not None else cfg['edt'] != 'OFF'
+                    if (bidir and (self.edt_commanded != edt or (edt and not self.edt_seen))
+                            and value == 0
+                            and now >= self.ready_at and not self.commands
+                            and now - self.last_edt_cmd > 0.5):
+                        self.commands.append([13 if edt else 14, 20])
+                        self.edt_commanded = edt
+                        self.last_edt_cmd = now
+                    telem = False
+                    if self.commands and now >= self.ready_at:
+                        value, count = self.commands[0]
+                        telem = True
+                        self.commands[0][1] -= 1
+                        if count == 1:
+                            self.commands.popleft()
+                            # EEPROM save/beeps need time before the next command.
+                            if value == 12:
+                                self.ready_at = now + 0.04
+                            elif 1 <= value <= 5:
+                                self.ready_at = now + 0.3
+                    self.port.send_dshot(value, ptype=ptype, bidir=bidir, telem=telem)
+                    nxt = max(nxt + 1.0 / self.rate, now)
+                self._drain_replies()
+                if now - self.last_reply > 1 and not self.freeze:
+                    self.rpm = 0
+                    self.invalid = 100.0
             time.sleep(0.0005)
 
     def _drain_replies(self):
@@ -203,6 +242,8 @@ class MspStubFC(object):
             return
         for r in self.port.get_replies():
             kind, val = sd.decode_reply(r[3], edt_expected=True)
+            if kind != 'badcrc':
+                self.last_reply = time.monotonic()
             if kind == 'erpm':
                 self.rpm = int(sd.erpm_period_to_rpm(val, self.poles))
                 self.invalid = max(0.0, self.invalid - 1.0)
@@ -222,61 +263,180 @@ class MspStubFC(object):
 
     # -- MSP side ------------------------------------------------------
 
-    def _reply(self, cmd, payload=b''):
-        hdr = struct.pack('<BB', len(payload), cmd)
-        ck = 0
-        for b in hdr + payload:
-            ck ^= b
-        out = b'$M>' + hdr + payload + bytes([ck])
+    def _reply(self, cmd, payload=b'', error=False):
+        out = msp_framing.encode(cmd, payload, self.reply_version,
+                                b'!' if error else b'>')
         self._trace('tx', out)
         self.ep.write(out)
 
+    def _stop_motor(self):
+        self.motor_value = 1000
+        self.commands.clear()
+
+    def _reboot(self, notify=False):
+        self._stop_motor()
+        self.config.reboot()
+        if (self.motor_enabled and
+                (self.output_protocol != self.config.protocol or
+                 self.output_bidir != self.config.values['bidir'])):
+            # AM32 detects the signal rate/polarity at startup. Apply FC
+            # settings on reboot, and restart the simulated ESC to detect
+            # the new wire format without a manual power cycle.
+            self.fourway._reset_esc(0)
+        self.output_protocol = self.config.protocol
+        self.output_bidir = self.config.values['bidir']
+        self.edt_seen = False
+        self.edt_override = None
+        self.edt_commanded = None
+        self.rpm = self.temp = self.volt_raw = self.curr_raw = 0
+        self.ready_at = time.monotonic() + 2.0
+        self.cli = False
+        self.cli_line.clear()
+        if notify and self.on_reboot is not None:
+            self.on_reboot(self)
+
     def _handle(self, cmd, payload):
-        if cmd == MSP_API_VERSION:
-            self._reply(cmd, struct.pack('<BBB', 0, 1, 46))
-        elif cmd == MSP_FC_VARIANT:
-            self._reply(cmd, b'BTFL')
-        elif cmd == MSP_STATUS:
-            # cycletime, i2c errors, sensors, mode flags (disarmed), profile
-            self._reply(cmd, struct.pack('<HHHIB', 125, 0, 0, 0, 0))
-        elif cmd == MSP_BOXIDS:
-            self._reply(cmd, bytes([0]))   # one box: ARM
-        elif cmd == MSP_FEATURE_CONFIG:
-            self._reply(cmd, struct.pack('<I', 0))   # no 3D mode
-        elif cmd == MSP_MOTOR_CONFIG:
-            self._reply(cmd, struct.pack('<HHHBBBB', 1070, 2000, 1000,
-                                         4, self.poles, 1, 0))
-        elif cmd == MSP_MOTOR_TELEMETRY:
-            out = bytes([4])
-            for i in range(4):
-                if i == 0:
-                    # matches Betaflight's DShot telemetry serialisation:
-                    # voltage is the 0.25V-step EDT value >> 2, current
-                    # is the raw EDT byte (msp.c MSP_MOTOR_TELEMETRY)
-                    out += struct.pack('<IHBHHH', self.rpm,
-                                       int(self.invalid * 100), int(self.temp),
-                                       self.volt_raw >> 2,
-                                       self.curr_raw, 0)
-                else:
-                    # unused outputs: no telemetry at all
-                    out += struct.pack('<IHBHHH', 0, 10000, 0, 0, 0, 0)
-            self._reply(cmd, out)
-        elif cmd == MSP_BATTERY_STATE:
-            # cells, capacity, voltage in 0.1V, mAh drawn, current in 0.01A
-            self._reply(cmd, struct.pack('<BHBHH', 4, 1500, 126, 0, 0))
-        elif cmd == MSP_SET_PASSTHROUGH:
+        self.last_request = time.monotonic()
+        with self.output_lock:
+            try:
+                self._dispatch(cmd, payload)
+            except (ValueError, struct.error, OSError) as ex:
+                self._log('MSP %u: %s' % (cmd, ex))
+                self._reply(cmd, error=True)
+
+    def _dispatch(self, cmd, payload):
+        if cmd == MSP_SET_PASSTHROUGH:
+            self._stop_motor()
+            self.in_fourway = True
             self.fourway.begin()
             self._reply(cmd, bytes([self.fourway.esc_count]))
-            self._log('4-way passthrough to %u ESC(s)'
-                      % self.fourway.esc_count)
-            self.in_fourway = True
         elif cmd == MSP_SET_MOTOR:
-            if len(payload) >= 2:
-                self.motor_value = struct.unpack('<H', payload[0:2])[0]
+            if len(payload) < 2 or len(payload) > 16 or len(payload) % 2:
+                raise ValueError('invalid motor values')
+            value = struct.unpack_from('<H', payload)[0]
+            if not 1000 <= value <= 2000:
+                raise ValueError('invalid motor throttle')
+            self.motor_value = value
+            self._reply(cmd)
+        elif cmd == 104:  # MSP_MOTOR: one active output, seven unused
+            self._reply(cmd, struct.pack('<8H', self.motor_value, *([0] * 7)))
+        elif cmd == MSP_MOTOR_TELEMETRY:
+            # Match BF's EDT wire units, including its integer voltage shift.
+            self._reply(cmd, bytes([1]) + struct.pack('<IHBHHH', self.rpm,
+                int(self.invalid * 100), int(self.temp), self.volt_raw >> 2,
+                self.curr_raw, 0))
+        elif cmd == 222:
+            self._stop_motor()
+            self.config.set_motor(payload)
+            self._reply(cmd)
+        elif cmd in (37, 43, 62, 91, 93, 95, 217):
+            self._stop_motor()
+            self.config.set_register(cmd, payload)
+            self._reply(cmd)
+        elif cmd == 250:  # MSP_EEPROM_WRITE
+            self.config.save()
+            self._reply(cmd)
+        elif cmd == 68:   # FC reboot; the ESC is separately powered
+            if payload and payload != b'\0':
+                raise ValueError('only normal FC reboot is supported')
+            self._reply(cmd, b'\0')
+            self._reboot(notify=True)
+        elif cmd == 99:   # MSP_ARMING_DISABLE; never emulate RC arming
+            if len(payload) != 2:
+                raise ValueError('invalid arming request')
+            if payload[0]:
+                self._stop_motor()
+            self._reply(cmd)
+        elif cmd in (205, 246):  # stationary ACC calibration / RTC
+            self._reply(cmd)
+        elif cmd == 0x3003:
+            if (len(payload) < 4 or payload[0] not in (0, 1)
+                    or payload[1] not in (0, 255) or payload[2] != len(payload) - 3
+                    or any(c > 47 for c in payload[3:]) or self.config.protocol == 9):
+                raise ValueError('invalid DShot command')
+            if self.motor_value > 1000 and any(c != 0 for c in payload[3:]):
+                raise ValueError('stop motor before DShot commands')
+            for command in payload[3:]:
+                if command == 0:
+                    self._stop_motor()
+                else:
+                    if command in (13, 14):
+                        self.edt_override = command == 13
+                        self.edt_commanded = self.edt_override
+                        self.edt_seen = False
+                        self.temp = self.volt_raw = self.curr_raw = 0
+                    if len(self.commands) >= 32:
+                        raise ValueError('DShot command queue full')
+                    self.commands.append([command, 20])
+            self._reply(cmd)
+        elif cmd == 0x3002:
+            if payload != bytes([1, 0]):
+                raise ValueError('only motor output 1 exists')
             self._reply(cmd)
         else:
-            self.ep.write(b'$M!' + struct.pack('<BB', 0, cmd)
-                          + bytes([cmd]))
+            data = self.config.read(cmd, payload,
+                                    voltage=self.volt_raw * 0.25 if self.volt_raw else 12.6,
+                                    current=self.curr_raw * 0.5)
+            if data is None:
+                self._log('unsupported MSP %u' % cmd)
+            self._reply(cmd, data or b'', error=data is None)
+
+    def _cli_feed(self, data):
+        for char in data:
+            if char in (10, 13):
+                if not self.cli_line:
+                    continue
+                line = self.cli_line.decode('ascii', errors='replace').strip()
+                self.cli_line.clear()
+                self.ep.write(b'\r\n')
+                self._cli_command(line)
+                if self.cli:
+                    self.ep.write(b'# ')
+            elif char in (8, 127):
+                if self.cli_line:
+                    self.cli_line.pop()
+                    self.ep.write(b'\b \b')
+            elif char == 4:  # Ctrl-D exits without saving
+                self._reboot()
+            elif 32 <= char < 127 and len(self.cli_line) < 256:
+                self.cli_line.append(char)
+                self.ep.write(bytes([char]))
+
+    def _cli_command(self, line):
+        if line.startswith('#'):
+            return  # comments also delimit the app's autocomplete queries
+        try:
+            if line in ('save', 'exit'):
+                if line == 'save':
+                    self.config.save()
+                self.ep.write(b'Rebooting\r\n')
+                self._reboot(notify=True)
+                return
+            if line.startswith('set ') and '=' in line:
+                key, value = [s.strip() for s in line[4:].split('=', 1)]
+                self.config.cli_set(key, value)
+                result = '%s set to %s' % (key, self.config.cli_get()[key])
+            elif line in ('get', 'set', 'dump', 'diff', 'dump all', 'diff all') or line.startswith('get '):
+                needle = line[4:].strip() if line.startswith('get ') else ''
+                values = self.config.cli_get()
+                prefix = 'set ' if line.startswith(('dump', 'diff')) else ''
+                result = '\r\n'.join('%s%s = %s' % (prefix, k, v)
+                                       for k, v in values.items() if needle in k)
+                if not result:
+                    raise ValueError('unknown setting')
+            elif line == 'version':
+                result = '# Betaflight / AM32_SITL 4.6.0 - simulated FC, MSP API: 1.46'
+            elif line == 'status':
+                result = 'AM32 SITL: stationary ACC/GYRO, disarmed, one motor'
+            elif line == 'help':
+                result = 'get\r\nset\r\nsave\r\nexit\r\nversion\r\nstatus\r\ndump\r\ndiff\r\nhelp'
+            elif line == 'mixer list':
+                result = 'Available mixers: CUSTOM'
+            else:
+                raise ValueError('unsupported command')
+            self.ep.write((result + '\r\n').encode('ascii'))
+        except (ValueError, OSError) as ex:
+            self.ep.write(('###ERROR: %s\r\n' % ex).encode('ascii', errors='replace'))
 
     def _fourway(self, chunk):
         '''run the 4-way session until the client exits the interface'''
@@ -295,10 +455,14 @@ class MspStubFC(object):
             self.ep.write(resp)
         if self.fourway.exited:
             self._log('4-way interface exited')
-            self.in_fourway = False
+            with self.output_lock:
+                # Reload ESC settings when returning to motor testing.
+                if self.motor_enabled and self.fourway.connected:
+                    self.fourway._reset_esc(0)
+                self._reboot()
+                self.in_fourway = False
 
     def _msp_loop(self):
-        buf = b''
         while self.running:
             chunk = self.ep.read(0.1)
             if not chunk:
@@ -307,31 +471,29 @@ class MspStubFC(object):
             if self.in_fourway:
                 self._fourway(chunk)
                 continue
-            buf += chunk
+            if self.cli:
+                with self.output_lock:
+                    self._cli_feed(chunk)
+                continue
+            self.parser.buf += chunk
             while True:
-                start = buf.find(b'$M<')
-                if start < 0:
-                    buf = b''
+                frame = self.parser.next()
+                if frame is None:
                     break
-                buf = buf[start:]
-                if len(buf) < 5:
+                cmd, payload, self.reply_version = frame
+                if cmd == 'cli':
+                    with self.output_lock:
+                        self._stop_motor()
+                        self.cli = True
+                        self.ep.write(b'\r\nEntering CLI Mode, type \"exit\" to return\r\n# ')
+                        self._cli_feed(self.parser.buf)
+                        self.parser.buf = b''
                     break
-                size = buf[3]
-                if len(buf) < 6 + size:
-                    break
-                cmd = buf[4]
-                payload = buf[5:5 + size]
-                ck = 0
-                for b in buf[3:5 + size]:
-                    ck ^= b
-                good = ck == buf[5 + size]
-                buf = buf[6 + size:]
-                if good:
-                    self._handle(cmd, payload)
+                self._handle(cmd, payload)
                 if self.in_fourway:
-                    if buf:
-                        self._fourway(buf)
-                    buf = b''
+                    if self.parser.buf:
+                        self._fourway(self.parser.buf)
+                    self.parser.buf = b''
                     break
 
 
@@ -366,6 +528,7 @@ def main():
                              'names its /dev/serial/by-id link')
     parser.add_argument('--attach', action='store_true',
                         help='with --usbip, attach it to vhci_hcd for you')
+    parser.add_argument('--config', help='persistent simulated FC settings JSON')
     parser.add_argument('--poles', type=int, default=14)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--trace', action='store_true',
@@ -378,19 +541,24 @@ def main():
 
     endpoint = None
     if args.usbip:
+        vid, pid = sitl_usbip.VENDOR_ID, sitl_usbip.PRODUCT_ID
+        if not args.no_motor:
+            vid, pid = (sitl_usbip.BETAFLIGHT_VENDOR_ID,
+                        sitl_usbip.BETAFLIGHT_PRODUCT_ID)
         def log(msg):
             if args.verbose:
                 print('usbip: %s' % msg, file=sys.stderr, flush=True)
         endpoint = sitl_usbip.UsbipServer(unix_path=args.usbip_socket,
                                           port=args.usbip_port,
-                                          serial=args.usbip_serial, log=log)
+                                          serial=args.usbip_serial, log=log,
+                                          vid=vid, pid=pid)
 
     stub = MspStubFC(sitl_host=args.host, sitl_port=args.sitl_port,
                      poles=args.poles, esc_ports=ports,
                      state_port=args.state_port,
                      esc_reset=not args.no_esc_reset,
                      motor=not args.no_motor, verbose=args.verbose,
-                     endpoint=endpoint, trace=args.trace)
+                     endpoint=endpoint, trace=args.trace, config_path=args.config)
     if args.usbip:
         print('virtual FC exported on %s' % endpoint.endpoint,
               file=sys.stderr, flush=True)
@@ -407,7 +575,8 @@ def main():
                                                       endpoint.port)),
                   file=sys.stderr, flush=True)
         if sitl_usbip.find_tty(args.usbip_serial,
-                               timeout=10 if args.attach else 60) is None:
+                               timeout=10 if args.attach else 60,
+                               vid=endpoint.vid, pid=endpoint.pid) is None:
             print('no tty appeared, is vhci_hcd loaded?', file=sys.stderr)
     print(stub.slave_path, flush=True)
     try:

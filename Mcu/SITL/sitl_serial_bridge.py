@@ -40,6 +40,7 @@ STATE_CMD_RESET = 9
 # deciding it is running the application, and how long to keep retrying
 # once it has been reset
 PROBE_TIMEOUT = 0.5
+PROBE_RETRY_INTERVAL = 0.1  # shorter than the bootloader's 250 ms fallback
 RESET_WINDOW = 3.0
 
 # one byte at 19200 8N1. The bootloader separates a command from the
@@ -174,7 +175,7 @@ class SerialBridge(object):
             return
         # the bootloader takes a moment to come up after the reset, so
         # keep re-probing until it answers or the window closes
-        if now > self.retry_until or now - self.pending_at < PROBE_TIMEOUT:
+        if now > self.retry_until or now - self.pending_at < PROBE_RETRY_INTERVAL:
             return
         self.port.flush_serial()
         self.port.send_serial(self.pending, gap=True)

@@ -152,7 +152,10 @@ class FourWayServer(object):
             self._reset_esc(target)
             deadline = time.time() + 3.0
             while info is None and time.time() < deadline:
-                info = fw.connect(timeout=0.5)
+                # The bootloader's no-CAN fallback boots a valid app after
+                # 250 ms. Probe faster than that while the process re-execs;
+                # a 500 ms retry can miss the entire configuration window.
+                info = fw.connect(timeout=0.1)
         if info is not None:
             self.connected.add(target)
         return info

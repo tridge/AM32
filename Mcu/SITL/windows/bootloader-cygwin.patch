@@ -1,0 +1,67 @@
+--- a/Mcu/sitl/Src/sys_can_SITL.c
++++ b/Mcu/sitl/Src/sys_can_SITL.c
+@@ -130,7 +130,12 @@
+     }
+     const int one = 1;
+     setsockopt(fd_in, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+-    if (bind(fd_in, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
++    struct sockaddr_in bind_addr = addr;
++#ifdef __CYGWIN__
++    // Windows cannot bind a multicast group address.
++    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++#endif
++    if (bind(fd_in, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) != 0) {
+         perror("SITL: can bind");
+         exit(1);
+     }
+@@ -169,6 +174,9 @@
+       rebinding the sender to 127.0.0.1 if not (see the firmware SITL
+       driver for the routing background)
+      */
++#ifndef __CYGWIN__
++    // Cygwin poll() does not reliably report multicast. Keep Windows on
++    // its normal multicast interface instead of rebinding to loopback.
+     for (int attempt = have_if ? 1 : 0; attempt < 2; attempt++) {
+         uint8_t probe[4] = { 0xde, 0xad, 0xbe, 0xef }; // wrong magic, ignored
+         send(fd_out, probe, sizeof(probe), 0);
+@@ -202,6 +210,8 @@
+         }
+     }
+ 
++#endif
++
+     // after the self test, which may have rebound fd_out
+     socklen_t alen = sizeof(tx_addr);
+     getsockname(fd_out, (struct sockaddr*)&tx_addr, &alen);
+--- a/Mcu/sitl/Src/eeprom.c
++++ b/Mcu/sitl/Src/eeprom.c
+@@ -63,6 +63,14 @@
+     const uint32_t entry = FLASH_BASE_ADDR + APP_OFFSET + 0x101;
+     memcpy(app, &sp, 4);
+     memcpy(app + 4, &entry, 4);
++
++    // firmware name, at the CAN layout's .file_name location: just
++    // after the vector-table region at the start of the app, matching
++    // what devinfo.filename_start now advertises. Without it the
++    // config tool reads erased 0xFF flash and shows a garbage name
++    static const char fwname[] = "AM32_SITL_CAN";
++    memset(flash + APP_OFFSET + 512, 0, 30);
++    memcpy(flash + APP_OFFSET + 512, fwname, sizeof(fwname) - 1);
+ 
+     // app_signature at an aligned offset near the end of the image,
+     // layout from bootloader/DroneCAN/DroneCAN.c
+@@ -83,13 +91,7 @@
+     sig.crc2 = bl_crc32(app + sig_ofs + sizeof(sig), app_len - (sig_ofs + sizeof(sig)));
+     memcpy(app + sig_ofs, &sig, sizeof(sig));
+ 
+-    // firmware name, at the CAN layout's .file_name location: just
+-    // after the vector-table region at the start of the app, matching
+-    // what devinfo.filename_start now advertises. Without it the
+-    // config tool reads erased 0xFF flash and shows a garbage name
+-    static const char fwname[] = "AM32_SITL_CAN";
+-    memset(flash + APP_OFFSET + 512, 0, 30);
+-    memcpy(flash + APP_OFFSET + 512, fwname, sizeof(fwname) - 1);
++
+ }
+ 
+ void sitl_bl_flash_init(void)

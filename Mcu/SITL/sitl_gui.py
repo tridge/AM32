@@ -23,7 +23,7 @@ actual UI paths:
   can_value X, can_rate N, param NAME VALUE, rpm_graph 0|1,
   rpm_window SECONDS, i_window MS, v_window MS,
   wave sine|square FREQ AMP BASE [dshot|can], wave off,
-  usb 0|1|2 (or none|fourway|serial), usb_status,
+  usb 0|1|2|3 (or none|fourway|serial|betaflight), usb_status,
   snap FILE [rpm], status, quit
 responses go back to the client prefixed with OK/STATUS/ERR. A client
 disconnect leaves the GUI running.
@@ -528,9 +528,11 @@ class EditModelDialog(QDialog):
 USB_OFF = 0
 USB_FOURWAY = 1
 USB_SERIAL = 2
+USB_BETAFLIGHT = 3
 USB_MODE_NAMES = {'none': USB_OFF, 'off': USB_OFF,
                   'fourway': USB_FOURWAY, '4way': USB_FOURWAY,
-                  'serial': USB_SERIAL, 'direct': USB_SERIAL}
+                  'serial': USB_SERIAL, 'direct': USB_SERIAL,
+                  'betaflight': USB_BETAFLIGHT}
 
 
 def main():
@@ -593,7 +595,7 @@ def main():
     # Ctrl-C only interrupts this process and the child is shut down
     # through node.close() instead of dying with a traceback
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    can = CanPanel(args.can_uri) if HAVE_DRONECAN else None
+    can = CanPanel(args.can_uri) if HAVE_DRONECAN and args.can_uri != 'none' else None
     if can is not None:
         can.started.wait(5.0)
 
@@ -1797,7 +1799,7 @@ def main():
     gl = QGridLayout(fl)
     sim_bin_edit = QLineEdit(sim_runner.bundled_sitl() or '')
     sim_ee_edit = QLineEdit(sim_runner.bundled_eeprom() or '')
-    sim_bl_edit = QLineEdit('')
+    sim_bl_edit = QLineEdit(sim_runner.bundled_bootloader() or '')
 
     def _browse(edit, title, filt='All files (*)'):
         def go():
@@ -1809,7 +1811,7 @@ def main():
     for r, (lab, edit, filt) in enumerate((
             ('SITL binary', sim_bin_edit, 'All files (*)'),
             ('EEPROM', sim_ee_edit, 'EEPROM (*.bin);;All files (*)'),
-            ('Bootloader (optional)', sim_bl_edit, 'All files (*)'))):
+            ('Bootloader (required for USB)', sim_bl_edit, 'All files (*)'))):
         gl.addWidget(QLabel(lab), r, 0)
         gl.addWidget(edit, r, 1)
         b = QPushButton('Browse...')
@@ -1848,20 +1850,24 @@ def main():
     gl.addWidget(sim_launch_status, 4, 0, 1, 2)
     usb_mode = QComboBox()
     usb_mode.addItems(['No USB device', 'USB 4-way (fake FC)',
-                       'USB serial (direct)'])
+                       'USB serial (direct)', 'USB Betaflight (motor control)'])
     usb_mode.setToolTip(
         'Present the simulated ESC to configurators the way hardware\n'
         'does, as a virtual USB serial device, so the AM32 configurator\n'
         '(a browser included) and the Offline-Configurator can read\n'
         'settings and flash firmware with no hardware and no changes.\n\n'
+        'USB Betaflight: connect app.betaflight.com to control motor 1,\n'
+        'set DShot/BDShot/EDT, and read telemetry. GUI motor controls\n'
+        'are disabled while the app owns the output.\n\n'
         'USB 4-way: the device answers MSP as a flight controller and\n'
         'passes BLHeli 4-way through to the ESC, the way a configurator\n'
         'reaches an ESC that is wired to an FC.\n'
         'USB serial: the device is the 1-wire USB linker soldered onto\n'
         'the signal wire, which is the configurator\'s direct mode.\n\n'
-        'Needs the SITL to be running with a bootloader (the field\n'
-        'above) and, for the attach, root - which it asks for.\n'
-        'The DShot input is stopped while either is on: the\n'
+        'ESC configuration/flashing needs a bootloader (the field\n'
+        'above). On Windows install the bundled USBip package first.\n'
+        'On Linux attaching needs root permission.\n'
+        'The GUI DShot input is stopped while USB is on: the\n'
         'configurator session and the DShot stream share one signal wire.')
     gl.addWidget(usb_mode, 5, 0)
     usb_status = QLabel('off')
@@ -1918,43 +1924,57 @@ def main():
 
     def usb_start(mode):
         import sitl_usbip
+        vid, pid = sitl_usbip.VENDOR_ID, sitl_usbip.PRODUCT_ID
+        if mode == USB_BETAFLIGHT:
+            vid, pid = (sitl_usbip.BETAFLIGHT_VENDOR_ID,
+                        sitl_usbip.BETAFLIGHT_PRODUCT_ID)
         # per process socket and, off the default port, a per port usb
         # serial number, so a second GUI gets its own device and its own
         # /dev/serial/by-id link rather than colliding with this one
-        endpoint = sitl_usbip.UsbipServer(
-            unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(), os.getpid()),
-            serial=usb_serial)
-        if mode == USB_FOURWAY:
+        if sys.platform.startswith('win'):
+            endpoint = sitl_usbip.UsbipServer(host='127.0.0.1', port=0,
+                                             serial=usb_serial, vid=vid, pid=pid)
+        else:
+            endpoint = sitl_usbip.UsbipServer(
+                unix_path='@am32-sitl-usbip.%u.%u' % (os.getuid(), os.getpid()),
+                serial=usb_serial, vid=vid, pid=pid)
+        if mode in (USB_FOURWAY, USB_BETAFLIGHT):
             import msp_stub_fc
             stub = msp_stub_fc.MspStubFC(
                 sitl_host=args.host, sitl_port=args.port,
-                state_port=args.state_port, motor=False, poles=args.poles,
-                endpoint=endpoint)
+                state_port=args.state_port, motor=mode == USB_BETAFLIGHT,
+                poles=args.poles, endpoint=endpoint,
+                config_path=(sim_ee_edit.text().strip() + '.fc.json')
+                if mode == USB_BETAFLIGHT and sim_ee_edit.text().strip() else None,
+                on_reboot=lambda fc: usb['q'].put(('reboot', fc)))
         else:
             import sitl_serial_bridge
             stub = sitl_serial_bridge.SerialBridge(
                 sitl_host=args.host, sitl_port=args.port,
                 state_port=args.state_port, endpoint=endpoint)
         usb['stub'] = stub
-        vhci_port = sitl_usbip.attach(unix_path=endpoint.unix_path)
+        vhci_port = sitl_usbip.attach(unix_path=endpoint.unix_path,
+                                     host=endpoint.host, port=endpoint.port)
         if vhci_port is False:
             raise RuntimeError('attach refused (is vhci_hcd loaded?)')
         usb['attached'] = True
         usb['port'] = None if vhci_port is True else vhci_port
-        tty = sitl_usbip.find_tty(usb_serial, timeout=10)
+        tty = sitl_usbip.find_tty(usb_serial, timeout=10, vid=vid, pid=pid)
         if tty is None:
             raise RuntimeError('attached but no tty appeared')
         return tty
 
     def usb_stop():
         import sitl_usbip
-        if usb['stub'] is not None:
-            usb['stub'].close()
-            usb['stub'] = None
+        # Detach while the exporter still exists. With usbip-win2 --once,
+        # closing it first removes the device and makes detach fail.
         if usb['attached']:
             sitl_usbip.detach(usb['port'])
             usb['attached'] = False
         usb['port'] = None
+        if usb['stub'] is not None:
+            usb['stub'].close()
+            usb['stub'] = None
 
     def usb_changed():
         mode = usb_mode.currentIndex()
@@ -1965,10 +1985,18 @@ def main():
         except Exception as ex:
             usb_status.setText('stop failed: %s' % ex)
             return
+        ds_enable.setEnabled(mode == USB_OFF)
+        if can is not None:
+            can_enable.setEnabled(mode != USB_BETAFLIGHT)
+            can_dna.setEnabled(mode != USB_BETAFLIGHT)
+            if mode == USB_BETAFLIGHT:
+                can_enable.setChecked(False)
+                can_dna.setChecked(False)
         if mode == USB_OFF:
             usb_status.setText('off')
             return
-        if runner.is_running() and not sim_bl_edit.text().strip():
+        if (mode != USB_BETAFLIGHT and runner.is_running()
+                and not sim_bl_edit.text().strip()):
             # both modes end up at the ESC bootloader, and the
             # application answers neither protocol. Only worth refusing
             # for a simulator this GUI started: one running elsewhere
@@ -1978,6 +2006,7 @@ def main():
             usb_mode.blockSignals(True)
             usb_mode.setCurrentIndex(USB_OFF)
             usb_mode.blockSignals(False)
+            ds_enable.setEnabled(True)
             return
         if ds_enable.isChecked():
             # one signal wire: DShot frames would collide with the
@@ -2002,6 +2031,15 @@ def main():
             kind, detail = usb['q'].get_nowait()
         except queue.Empty:
             return
+        if kind == 'reboot':
+            # Let the MSP acknowledgement reach the host, then emulate
+            # the FC's USB re-enumeration so Betaflight reconnects. Ignore
+            # a late event from a device the user has already replaced.
+            def reconnect():
+                if detail is usb['stub'] and usb_mode.currentIndex() == USB_BETAFLIGHT:
+                    usb_changed()
+            QTimer.singleShot(300, reconnect)
+            return
         usb_mode.setEnabled(True)
         if kind == 'ok':
             usb_status.setText(detail)
@@ -2012,9 +2050,13 @@ def main():
             usb_mode.blockSignals(True)
             usb_mode.setCurrentIndex(USB_OFF)
             usb_mode.blockSignals(False)
+            ds_enable.setEnabled(True)
+            if can is not None:
+                can_enable.setEnabled(True)
+                can_dna.setEnabled(True)
             usb_status.setText('failed: %s' % detail)
 
-    if sys.platform.startswith('linux'):
+    if sys.platform.startswith(('linux', 'win')):
         usb_mode.currentIndexChanged.connect(usb_changed)
     else:
         usb_mode.setEnabled(False)
@@ -2094,6 +2136,8 @@ def main():
             return
         cmd, cargs = parts[0], parts[1:]
         if cmd == 'ds_enable':
+            if int(cargs[0]) and usb_mode.currentIndex() != USB_OFF:
+                raise ValueError('USB owns the signal wire')
             ds_enable.setChecked(bool(int(cargs[0])))
         elif cmd == 'ds_type':
             ds_type.setCurrentText(cargs[0])
@@ -2112,6 +2156,8 @@ def main():
         elif cmd == 'edt_disable':
             ds_edt.setChecked(False)
         elif cmd == 'can_enable' and can is not None:
+            if int(cargs[0]) and usb_mode.currentIndex() == USB_BETAFLIGHT:
+                raise ValueError('Betaflight owns motor control')
             can_enable.setChecked(bool(int(cargs[0])))
         elif cmd == 'can_dna' and can is not None:
             can_dna.setChecked(bool(int(cargs[0])))

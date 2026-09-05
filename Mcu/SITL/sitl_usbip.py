@@ -20,7 +20,9 @@ attach the usbip way.
 
 The device enumerates as pid.codes 1209:0001 (their test ID, which the
 AM32 configurator accepts as a flight controller) with a CDC-ACM
-interface: one bulk pair carrying the serial bytes and an unused
+interface. Betaflight motor mode emulates STM32 VCP 0483:5740 so it passes
+Betaflight's Web Serial device filter, retaining the AM32 SITL strings.
+There is one bulk pair carrying the serial bytes and an unused
 interrupt endpoint for the notifications a real ACM device would send.
 
 USB/IP protocol: an op phase (OP_REQ_DEVLIST / OP_REQ_IMPORT, both
@@ -33,8 +35,9 @@ what a real device does with a queued read.
 '''
 
 import argparse
-import errno
 import glob
+import json
+import re
 import os
 import shutil
 import socket
@@ -44,6 +47,10 @@ import sys
 import tempfile
 import threading
 import time
+
+# Windows support follows ESCSim's usbip-win2 integration.
+IS_WINDOWS = os.name == 'nt'
+WINDOWS_USBIP_TIMEOUT = 15
 
 USBIP_VERSION = 0x0111
 
@@ -67,8 +74,9 @@ EP_BULK = 1
 EP_INTR = 2
 
 ST_OK = 0
-ST_STALL = -errno.EPIPE
-ST_UNLINKED = -errno.ECONNRESET
+# USB/IP carries Linux errno numbers, even when exported on Windows.
+ST_STALL = -32          # EPIPE
+ST_UNLINKED = -104      # ECONNRESET (Windows errno.ECONNRESET is 10054)
 
 # USB requests
 REQ_GET_STATUS = 0x00
@@ -87,6 +95,9 @@ REQ_SET_CONTROL_LINE_STATE = 0x22
 
 VENDOR_ID = 0x1209
 PRODUCT_ID = 0x0001
+# Betaflight's default Web Serial filters include the STM32 virtual COM port.
+BETAFLIGHT_VENDOR_ID = 0x0483
+BETAFLIGHT_PRODUCT_ID = 0x5740
 BUSID = '1-1'
 BUSNUM = 1
 DEVNUM = 1
@@ -129,17 +140,66 @@ def tty_glob(serial=DEFAULT_SERIAL):
     return '/dev/serial/by-id/usb-%s-if00' % name
 
 
-def find_tty(serial=DEFAULT_SERIAL, timeout=10.0):
-    '''wait for the attached device to show up as a serial port'''
+def find_tty(serial=DEFAULT_SERIAL, timeout=10.0, vid=VENDOR_ID, pid=PRODUCT_ID):
+    """wait for the attached device to show up as a serial port"""
     deadline = time.time() + timeout
     while True:
-        hits = sorted(glob.glob(tty_glob(serial)))
+        if IS_WINDOWS:
+            try:
+                from serial.tools import list_ports
+            except ImportError as ex:
+                raise RuntimeError(
+                    "pyserial is required to discover the Windows COM port"
+                ) from ex
+            ports = [p for p in list_ports.comports() if p.vid == vid and p.pid == pid]
+            hits = sorted(
+                p.device for p in ports if serial is None or p.serial_number == serial
+            )
+            # usbip-win2 exposes the USB serial in the PnP instance ID, but
+            # pyserial 3.5 reports an empty serial_number for that device.
+            # Query the native Windows inventory as an exact-identity
+            # fallback; VID/PID alone is ambiguous when simulators coexist.
+            if not hits and serial is not None and ports:
+                candidates = {p.device.upper() for p in ports}
+                wanted = ("USB\\VID_%04X&PID_%04X\\%s" % (vid, pid, serial)).upper()
+                command = (
+                    "$ErrorActionPreference='Stop'; "
+                    "Get-CimInstance Win32_SerialPort | "
+                    "Select-Object DeviceID,PNPDeviceID | "
+                    "ConvertTo-Json -Compress"
+                )
+                result = subprocess.run(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        command,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    try:
+                        inventory = json.loads(result.stdout)
+                    except (TypeError, ValueError):
+                        inventory = []
+                    if isinstance(inventory, dict):
+                        inventory = [inventory]
+                    hits = sorted(
+                        item.get("DeviceID", "")
+                        for item in inventory
+                        if item.get("DeviceID", "").upper() in candidates
+                        and item.get("PNPDeviceID", "").upper() == wanted
+                    )
+        else:
+            hits = sorted(glob.glob(tty_glob(serial)))
         if hits:
             return hits[0]
         if time.time() >= deadline:
             return None
         time.sleep(0.2)
-
 
 def default_socket_name():
     '''an abstract socket by default on Linux, with a temporary filesystem
@@ -169,10 +229,15 @@ class UsbipServer(object):
     '''
 
     def __init__(self, unix_path=None, host='127.0.0.1', port=None,
-                 serial=DEFAULT_SERIAL, log=None, rx_max=65536):
+                 serial=DEFAULT_SERIAL, log=None, rx_max=65536,
+                 vid=VENDOR_ID, pid=PRODUCT_ID):
         self.log = log or (lambda s: None)
         self.rx_max = rx_max
         self.serial = serial
+        self.vid, self.pid = vid, pid
+        self.device_descriptor = (DEVICE_DESCRIPTOR[:8]
+                                  + struct.pack('<HH', vid, pid)
+                                  + DEVICE_DESCRIPTOR[12:])
         self.strings = [MANUFACTURER, PRODUCT, serial]
         self.rx = b''
         self.rx_lock = threading.Condition()
@@ -369,7 +434,7 @@ class UsbipServer(object):
         return struct.pack('>256s32sIIIHHHBBBBBB',
                            path.encode(), BUSID.encode(),
                            BUSNUM, DEVNUM, SPEED_FULL,
-                           VENDOR_ID, PRODUCT_ID, 0x0100,
+                           self.vid, self.pid, 0x0100,
                            0x02, 0x00, 0x00,   # device class/subclass/proto
                            1, 1, 2)            # config value, configs, ifaces
 
@@ -378,10 +443,12 @@ class UsbipServer(object):
         return (bytes([0x02, 0x02, 0x01, 0]) +   # communication
                 bytes([0x0A, 0x00, 0x00, 0]))    # data
 
-    def _ret_submit(self, seqnum, status, data=b''):
+    def _ret_submit(self, seqnum, status, data=b'', actual_length=None):
         '''caller must hold send_lock'''
         hdr = (struct.pack('>IIIII', RET_SUBMIT, seqnum, 0, 0, 0)
-               + struct.pack('>iiiii8s', status, len(data), 0, 0, 0, b''))
+               + struct.pack('>iiiii8s', status,
+                             len(data) if actual_length is None else actual_length,
+                             0, 0, 0, b''))
         conn = self.conn
         if conn is None:
             return
@@ -394,7 +461,9 @@ class UsbipServer(object):
         if ep == 0:
             with self.send_lock:
                 status, reply = self._control(setup, data, length)
-                self._ret_submit(seqnum, status, reply)
+                self._ret_submit(seqnum, status, reply,
+                                 actual_length=(len(data) if direction == DIR_OUT
+                                                else len(reply)))
             return
 
         if ep == EP_INTR:
@@ -417,7 +486,8 @@ class UsbipServer(object):
                     self.log('rx overflow, dropping %u bytes' % len(data))
                 self.rx_lock.notify_all()
             with self.send_lock:
-                self._ret_submit(seqnum, ST_OK)
+                # OUT completions carry no payload but must acknowledge its length.
+                self._ret_submit(seqnum, ST_OK, actual_length=len(data))
             return
 
         # a read: complete it now if we are holding bytes, else queue it
@@ -463,7 +533,7 @@ class UsbipServer(object):
         if recipient_std and request == REQ_GET_DESCRIPTOR:
             dtype, dindex = value >> 8, value & 0xFF
             if dtype == 1:
-                return ST_OK, DEVICE_DESCRIPTOR[:wlength]
+                return ST_OK, self.device_descriptor[:wlength]
             if dtype == 2:
                 return ST_OK, CONFIG_DESCRIPTOR[:wlength]
             if dtype == 3:
@@ -568,6 +638,132 @@ def privilege_prefix():
     return ['sudo']
 
 
+def _windows_creationflags():
+    """Keep short-lived usbip.exe helpers invisible from the GUI process."""
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
+def windows_usbip_executable():
+    """Find usbip-win2's command-line client without relying on PATH."""
+    override = os.environ.get("USBIP_EXE")
+    candidates = [override, shutil.which("usbip.exe"), shutil.which("usbip")]
+    for env_name in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        root = os.environ.get(env_name)
+        if root:
+            candidates.append(os.path.join(root, "USBip", "usbip.exe"))
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return os.path.abspath(path)
+    raise RuntimeError(
+        "usbip-win2 is not installed (usbip.exe was not found; "
+        "set USBIP_EXE to its full path)"
+    )
+
+def windows_usbip_version(executable=None):
+    """Return usbip-win2's four-part file version as a tuple."""
+    executable = executable or windows_usbip_executable()
+    result = subprocess.run(
+        [executable, "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        creationflags=_windows_creationflags(),
+    )
+    output = "\n".join((result.stdout, result.stderr)).strip()
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)\.(\d+)(?!\d)", output)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError(
+            "could not determine usbip-win2 version from %s: %s"
+            % (executable, output or "no output")
+        )
+    return tuple(int(part) for part in match.groups())
+
+def _windows_usbip_checked():
+    executable = windows_usbip_executable()
+    version = windows_usbip_version(executable)
+    if version < (0, 9, 7, 7):
+        raise RuntimeError(
+            "usbip-win2 %s cannot enumerate the full-speed "
+            "USB descriptors used here; version 0.9.7.7 or "
+            "newer is required" % ".".join(map(str, version))
+        )
+    if version == (0, 9, 7, 8):
+        raise RuntimeError(
+            "usbip-win2 0.9.7.8 is unsafe and may corrupt "
+            "memory or crash Windows; uninstall it"
+        )
+    return executable, version
+
+def _windows_attach(host, port, busid):
+    executable, _version = _windows_usbip_checked()
+    command = [
+        executable,
+        "--tcp-port",
+        str(port),
+        "attach",
+        "--remote",
+        host,
+        "--bus-id",
+        busid,
+        "--terse",
+        "--once",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=WINDOWS_USBIP_TIMEOUT,
+            creationflags=_windows_creationflags(),
+        )
+    except subprocess.TimeoutExpired as ex:
+        raise RuntimeError(
+            "usbip-win2 attach timed out after %u seconds" % WINDOWS_USBIP_TIMEOUT
+        ) from ex
+    output = "\n".join((result.stdout, result.stderr)).strip()
+    # --terse prints exactly the owned UDE port. Keep the parsing strict:
+    # detaching an incorrectly guessed machine-wide port would be harmful.
+    match = re.fullmatch(r"\s*(\d+)\s*", result.stdout)
+    if result.returncode != 0 or match is None:
+        if "VHCI device not found" in output:
+            raise RuntimeError(
+                "usbip-win2 host controller is unavailable; reboot Windows "
+                "after installing or upgrading the USBIP driver"
+            )
+        raise RuntimeError(
+            "usbip-win2 attach failed: %s" % (output or "no diagnostic output")
+        )
+    return int(match.group(1))
+
+def _windows_detach(port):
+    if port is None or isinstance(port, bool):
+        raise RuntimeError(
+            "refusing to detach without the owned Windows USB/IP port number"
+        )
+    executable, _version = _windows_usbip_checked()
+    try:
+        result = subprocess.run(
+            [executable, "detach", "--port", str(port)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=WINDOWS_USBIP_TIMEOUT,
+            creationflags=_windows_creationflags(),
+        )
+    except subprocess.TimeoutExpired as ex:
+        raise RuntimeError(
+            "usbip-win2 detach of port %s timed out after "
+            "%u seconds" % (port, WINDOWS_USBIP_TIMEOUT)
+        ) from ex
+    if result.returncode != 0:
+        output = "\n".join((result.stdout, result.stderr)).strip()
+        raise RuntimeError(
+            "usbip-win2 detach of port %s failed: %s"
+            % (port, output or "no diagnostic output")
+        )
+    return True
+
+
 def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
     """import and attach, re-running ourselves as root when needed.
 
@@ -575,6 +771,8 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
     has to belong to the process doing the write, so the whole import
     runs in the privileged child.
     """
+    if IS_WINDOWS:
+        return _windows_attach(host, port, busid)
     if os.geteuid() != 0:
         cmd = privilege_prefix() + [
             sys.executable, os.path.abspath(__file__), '--attach-to',
@@ -591,6 +789,8 @@ def attach(unix_path=None, host='127.0.0.1', port=3240, busid=BUSID):
 
 def detach(port=None):
     """detach one vhci port, or every port that has a device on it"""
+    if IS_WINDOWS:
+        return _windows_detach(port)
     if os.geteuid() != 0:
         cmd = privilege_prefix() + [sys.executable, os.path.abspath(__file__),
                                     '--detach']
