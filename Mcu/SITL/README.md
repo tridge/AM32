@@ -36,5 +36,5 @@ AM32_ROOT=$PWD python3 ESCSim/SITL/run_ci_tests.py
 
 which is what the SITL CI jobs do. See `ESCSim/SITL/README.md` for the
 runtime options, the UDP PWM/DShot input protocol, the GUI, gdb use and
-the simulator architecture, and `TIMING-DESIGN.md` here for the design
-of the host-timing-immune scheduler in `Src/sitl_sched.c`.
+the simulator architecture, and `ESCSim/SITL/TIMING-DESIGN.md` for the
+design of the host-timing-immune scheduler in `Src/sitl_sched.c`.
