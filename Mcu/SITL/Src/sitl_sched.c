@@ -552,7 +552,10 @@ void sitl_exec_bootloader(const char* cause)
         argv[n++] = sitl_cfg.uid;
     }
     argv[n++] = "--reset-cause";
-    argv[n++] = cause;
+    // The state-port reset used by configurators is a software reset.
+    // Passing its diagnostic label would make the bootloader interpret it
+    // as power-on and jump back to the application before the probe arrives.
+    argv[n++] = strcmp(cause, "state port") == 0 ? "software" : cause;
     argv[n++] = "--";
     for (int i = 0; sitl_saved_argv[i] != NULL && n < (int)(sizeof(argv) / sizeof(argv[0])) - 1; i++) {
         argv[n++] = sitl_saved_argv[i];
