@@ -14,6 +14,7 @@
 #define RELOAD_WATCHDOG_COUNTER() sitl_watchdog_reload()
 #define DISABLE_COM_TIMER_INT() sitl_com_int_disable()
 #define ENABLE_COM_TIMER_INT() sitl_com_int_enable()
+#define COM_TIMER_CLEAR_PENDING() sitl_irq_clear(SITL_IRQ_COM)
 #define SET_AND_ENABLE_COM_INT(time) sitl_com_int_arm(time)
 #define SET_INTERVAL_TIMER_COUNT(intertime) sitl_interval_timer_set(intertime)
 #define SET_PRESCALER_PWM(presc) sitl_tim1_set_psc(presc)
