@@ -958,6 +958,9 @@ void PeriodElapsedCallback()
         thiszctime = INTERVAL_TIMER_COUNT;
         SET_INTERVAL_TIMER_COUNT(0);
     }
+    // no deadline after a crossing earlier than half an interval, likely
+    // noise: the next real crossing comes later than the shortened interval
+    const uint8_t arm = zero_crosses >= ZC_DEADLINE_MIN_ZC && thiszctime > (commutation_interval >> 1);
     commutate();
     commutation_interval = ((commutation_interval)+((lastzctime + thiszctime) >> 1))>>1;
   	if (!eepromBuffer.auto_advance) {
@@ -968,7 +971,7 @@ void PeriodElapsedCallback()
     waitTime = (commutation_interval >> 1) - advance;
     if (!old_routine) {
         // arm before enabling the comparator so a crossing can't be overwritten
-        if (zero_crosses >= ZC_DEADLINE_MIN_ZC) {
+        if (arm) {
             // expected crossing (interval - waitTime) plus half an interval
             uint32_t deadline = commutation_interval + advance;
             if (deadline > 65535) {
