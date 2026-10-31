@@ -952,11 +952,12 @@ void PeriodElapsedCallback()
         blind = 1;
         zc_blind_steps++;
         zc_miss_bucket += ZC_MISS_BUCKET_INC;
-        // use the elapsed time as a late crossing, the 45000 bemf timeout
-        // in the main loop keeps it in 16 bits
+        // time from where the missed crossing was expected, so the next
+        // real one is not inside the comparator blanking of the next step
+        const uint32_t elapsed = INTERVAL_TIMER_COUNT;
         lastzctime = thiszctime;
-        thiszctime = INTERVAL_TIMER_COUNT;
-        SET_INTERVAL_TIMER_COUNT(0);
+        thiszctime = commutation_interval;
+        SET_INTERVAL_TIMER_COUNT(elapsed - commutation_interval);
     }
     // no deadline after a crossing earlier than half an interval, likely
     // noise: the next real crossing comes later than the shortened interval
