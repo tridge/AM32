@@ -569,6 +569,21 @@ volatile uint16_t duty_cycle = 0;
 char step = 1;
 volatile uint32_t commutation_interval = 12500;
 volatile uint16_t waitTime = 0;
+
+/*
+  missed zero-crossing handling: once the interrupt closed loop is
+  established, COM_TIMER is armed after each commutation as a deadline at
+  the expected crossing plus 50%. If it fires, commutate blind using the
+  elapsed time as the interval instead of falling back to polling mode.
+ */
+#define ZC_DEADLINE_MIN_ZC 100   // zero crosses before the deadline is armed
+#define ZC_BLIND_STEP_LIMIT 8    // consecutive blind steps before giving up
+#define ZC_MISS_BUCKET_INC 3     // miss rate bucket: +3 per blind step, -1 per crossing
+#define ZC_MISS_BUCKET_LIMIT 24
+volatile uint8_t zc_deadline_armed;
+volatile uint8_t zc_blind_steps;
+volatile uint8_t zc_miss_bucket;
+uint8_t slow_avg_revs;  // electrical revs with a slow average in closed loop
 uint16_t signaltimeout = 0;
 uint8_t ubAnalogWatchdogStatus = RESET;
 
@@ -895,9 +910,11 @@ void commutate()
     __enable_irq();
     changeCompInput();
 #ifndef NO_POLLING_START
-	if (average_interval > polling_mode_changeover + 500) {
-      old_routine = 1;
-   }
+    // poll re-entry only while starting, an established loop rides
+    // through missed crossings with blind steps
+    if (zero_crosses < ZC_DEADLINE_MIN_ZC && average_interval > polling_mode_changeover + 500) {
+        old_routine = 1;
+    }
 #endif
     bemfcounter = 0;
     zcfound = 0;
@@ -918,7 +935,29 @@ void commutate()
  */
 void PeriodElapsedCallback()
 {
+    uint8_t blind = 0;
     DISABLE_COM_TIMER_INT(); // disable interrupt
+    if (zc_deadline_armed) {
+        zc_deadline_armed = 0;
+        if (!running || old_routine) {
+            // stale deadline after a stop or a change to polling mode
+            return;
+        }
+        maskPhaseInterrupts();
+        if (zc_blind_steps >= ZC_BLIND_STEP_LIMIT || zc_miss_bucket >= ZC_MISS_BUCKET_LIMIT) {
+            // lost for too long, let the bemf timeout in the main loop restart
+            SET_INTERVAL_TIMER_COUNT(46000);
+            return;
+        }
+        blind = 1;
+        zc_blind_steps++;
+        zc_miss_bucket += ZC_MISS_BUCKET_INC;
+        // use the elapsed time as a late crossing, the 45000 bemf timeout
+        // in the main loop keeps it in 16 bits
+        lastzctime = thiszctime;
+        thiszctime = INTERVAL_TIMER_COUNT;
+        SET_INTERVAL_TIMER_COUNT(0);
+    }
     commutate();
     commutation_interval = ((commutation_interval)+((lastzctime + thiszctime) >> 1))>>1;
   	if (!eepromBuffer.auto_advance) {
@@ -928,9 +967,19 @@ void PeriodElapsedCallback()
     }
     waitTime = (commutation_interval >> 1) - advance;
     if (!old_routine) {
+        // arm before enabling the comparator so a crossing can't be overwritten
+        if (zero_crosses >= ZC_DEADLINE_MIN_ZC) {
+            // expected crossing (interval - waitTime) plus half an interval
+            uint32_t deadline = commutation_interval + advance;
+            if (deadline > 65535) {
+                deadline = 65535;
+            }
+            zc_deadline_armed = 1;
+            SET_AND_ENABLE_COM_INT(deadline);
+        }
         enableCompInterrupts(); // enable comp interrupt
     }
-    if (zero_crosses < 10000) {
+    if (!blind && zero_crosses < 10000) {
         zero_crosses++;
     }
 }
@@ -968,6 +1017,14 @@ void interruptRoutine()
     lastzctime = thiszctime;
     thiszctime = INTERVAL_TIMER_COUNT;  
     SET_INTERVAL_TIMER_COUNT(0);
+    // cancel a deadline, including an already pending interrupt
+    DISABLE_COM_TIMER_INT();
+    COM_TIMER_CLEAR_PENDING();
+    zc_deadline_armed = 0;
+    zc_blind_steps = 0;
+    if (zc_miss_bucket) {
+        zc_miss_bucket--;
+    }
     SET_AND_ENABLE_COM_INT(waitTime+1); // enable COM_TIMER interrupt
     __enable_irq();
 }
@@ -975,6 +1032,10 @@ void interruptRoutine()
 void startMotor()
 {
     if (running == 0) {
+        DISABLE_COM_TIMER_INT();
+        zc_deadline_armed = 0;
+        zc_blind_steps = 0;
+        zc_miss_bucket = 0;
         commutate();
         commutation_interval = 10000;
         SET_INTERVAL_TIMER_COUNT(5000);
@@ -1347,6 +1408,19 @@ if (!stepper_sine && armed) {
             }
         }
     }
+    // cut power while commutating blind, the rotor position is unknown
+    if (!old_routine && running && zc_blind_steps >= 2) {
+        uint16_t blind_cap = (zc_blind_steps >= 4) ? 250 : 500;
+        if (blind_cap < min_startup_duty) {
+            blind_cap = min_startup_duty;
+        }
+        if (duty_cycle_setpoint > blind_cap) {
+            duty_cycle_setpoint = blind_cap;
+        }
+        if (last_duty_cycle > blind_cap) {
+            last_duty_cycle = blind_cap;
+        }
+    }
 #endif
 }
 
@@ -1681,6 +1755,12 @@ void zcfoundroutine()
         }
     }
  #endif
+    if (!old_routine) {
+        // fresh closed loop run
+        zc_deadline_armed = 0;
+        zc_blind_steps = 0;
+        zc_miss_bucket = 0;
+    }
 }
 #ifdef BRUSHED_MODE
 void runBrushedLoop()
@@ -2069,8 +2149,26 @@ if(zero_crosses < 5){
         }
 #endif
         average_interval = e_com_time / 3;
+        if (zero_crosses <= 10) {
+            slow_avg_revs = 0;
+        }
         if (desync_check && zero_crosses > 10) {
+#ifndef NO_POLLING_START
+            // the closed loop no longer drops to polling mode on a slow
+            // commutation, do it on a slow average over several revs to
+            // catch a false lock on noise
+            if (!old_routine && running && average_interval > polling_mode_changeover + 500) {
+                slow_avg_revs++;
+                if (slow_avg_revs >= ((duty_cycle > 500) ? 2 : 4)) {
+                    slow_avg_revs = 0;
+                    old_routine = 1;
+                }
+            } else {
+                slow_avg_revs = 0;
+            }
+#endif
             if ((getAbsDif(last_average_interval, average_interval) > average_interval >> 1) && (average_interval < 2000)) { // throttle resitricted before zc 20.
+                slow_avg_revs = 0;
                 zero_crosses = 0;
                 desync_happened++;
                 if ((!eepromBuffer.bi_direction && (input > 47)) || commutation_interval > 1000) {
